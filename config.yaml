@@ -1,0 +1,51 @@
+apify:
+  token_env_var: "APIFY_API_TOKEN"
+  proxy:
+    use_apify_proxy: true
+
+  actors:
+    universal: "apify/instagram-scraper"       # поиск юзеров, посты по directUrls
+    comments: "apify/instagram-comment-scraper" # комментарии к посту/рилсу
+    profile: "apify/instagram-profile-scraper"  # инфо профиля (аватарка, bio)
+    hashtag: "apify/instagram-hashtag-scraper"  # посты/рилсы по хештегу
+    posts: "apify/instagram-post-scraper"       # посты конкретного аккаунта
+
+  test_limits:
+    search_limit: 5       # макс. результатов поиска юзеров
+    results_limit: 10     # макс. постов на хештег/аккаунт
+    comments_limit: 15    # макс. комментов на пост
+
+search:
+  # Method 1: поиск по хештегам (через instagram-hashtag-scraper)
+  hashtags:
+    - "квартираспб"
+    - "недвижимостьспб"
+    - "новостройкиспб"
+    - "купитьквартируспб"
+    - "жильеспб"
+
+  # Method 2: список аккаунтов риелторов СПБ (найдены в предыдущих тестах)
+  realtor_accounts:
+    - "oxana.realtor.spb"
+    - "stasya_agent_spb"
+    - "efimova_realtor"
+    - "realon_an"
+    - "gubanova_estate"
+
+filters:
+  min_views: 1000
+  min_comments: 2
+  min_post_age_hours: 6
+  max_post_age_days: 14
+
+cycle:
+  interval_hours: 12
+  max_apify_requests_per_cycle: 50
+  max_accounts_per_cycle: 200
+
+db:
+  path: "data/leads.db"
+
+logging:
+  level: "INFO"
+  pipeline_log_dir: "logs"

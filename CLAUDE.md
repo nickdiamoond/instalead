@@ -1,0 +1,156 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Instagram lead checker for real estate buyers (SPB focus). The system collects Instagram accounts of people interested in buying property (based on their comments on realtor reels/posts), then finds their contact information via Telegram.
+
+**Two main modules:**
+- **Module 1 (Instagram Collector):** Finds potential lead Instagram accounts by monitoring realtor accounts, collecting their posts/reels, scoring relevance via AI, and extracting commenters as leads.
+- **Module 2 (Contact Finder):** *(future)* Resolves Instagram accounts to phone numbers/Telegram contacts using Telegram SearchGlobalRequest and a face-recognition bot ("Sherlock bot").
+
+## Tech Stack
+
+- Python 3.11+
+- Apify API — Instagram data via multiple actors (see below)
+- DeepSeek API (OpenAI-compatible) — relevance scoring of post captions
+- structlog — logging
+- SQLite — deduplication, state, lead storage (`data/leads.db`)
+- Pipeline JSON logs — every API call logged to `logs/` for cost analysis
+- MediaPipe + OpenCV — local face detection on downloaded avatars
+
+Future (not yet implemented):
+- Yandex SpeechKit — audio transcription for reels with empty captions
+- Telethon — Telegram client (SearchGlobalRequest)
+- Aiogram — Telegram bot for notifications
+- InsightFace / ArcFace — face embeddings for Sherlock-bot (same-person search)
+- replicate.com — avatar upscaling
+
+## Apify Actors Used
+
+| Actor | Purpose | Price |
+|---|---|---|
+| `apify/instagram-profile-scraper` | Profile info, relatedProfiles, latestPosts | ~$0.0023/profile |
+| `apify/instagram-post-scraper` | Posts/reels from accounts (batch, date filter) | ~$0.0017/post |
+| `apify/instagram-hashtag-scraper` | Posts/reels by hashtag | ~$0.0023/post |
+| `louisdeconinck/instagram-comments-scraper` | Comments for posts (best pagination) | ~$0.50/1K comments |
+
+**Important:** `louisdeconinck` is the preferred comment scraper — other actors (`apidojo/*`, `apify/*`) have severe pagination/dedup issues. `media_id` from comments loses precision (JS float64) — use shortcode fuzzy matching (±1000 tolerance).
+
+## Pipeline Architecture
+
+Daily pipeline (`scripts/pipeline.py`):
+
+```
+Step 1: Fetch posts from tracked_realtors (batch, last 7 days)
+        Actor: instagram-post-scraper
+        Skip posts already in DB, update comments_count for existing
+        Filter: commentsCount >= 10
+
+Step 2: Score new posts via DeepSeek
+        Only posts with relevance=NULL
+        Output: relevant / irrelevant / unknown + CTA type
+
+Step 3: Fetch comments (with cost confirmation prompt)
+        Posts where: relevant + CTA=comment + (never scanned OR comments grew 5%+)
+        Actor: louisdeconinck/instagram-comments-scraper
+        Dedup leads by user_id (not username — usernames can change)
+
+Step 4: Fetch profiles for new leads (batches of 50)
+        Extract contacts from bio (phone, telegram, whatsapp, email)
+        Save latest_media_urls for future face recognition
+        Download avatar -> data/avatars/<user_id>.jpg
+        Run MediaPipe face detection -> faces_count
+        Actor: instagram-profile-scraper
+```
+
+**Avatar face detection note:** Instagram CDN URLs are signed and expire
+in ~1-2 days, so avatars are downloaded immediately during Step 4.
+MediaPipe Face Detection (short-range model) counts faces locally on CPU.
+Leads with `faces_count = 1` are candidates for the future Sherlock-bot
+(same-person search by face).
+
+## Database Schema (SQLite)
+
+**`tracked_realtors`** — monitored realtor accounts (source of posts)
+- `username` PK, `full_name`, `followers_count`, `found_via`, `is_active`
+
+**`processed_posts`** — all posts with 10+ comments
+- `post_id` PK (shortcode), `post_url`, `owner_username`, `comments_count`
+- `relevance` (relevant/irrelevant/unknown), `cta_type` (comment/direct/none)
+- `last_comments_count`, `last_scanned_at` — for 5% growth detection
+
+**`lead_accounts`** — collected leads (commenters)
+- `username` PK, `user_id` (numeric, permanent), profile data
+- `phone`, `email`, `telegram_username`, `whatsapp` — contacts
+- `profile_fetched` (0/1), `contact_found` (0/1) — processing state
+- `latest_media_urls` — JSON array of photo/video URLs from posts
+- `avatar_path` — local path to downloaded avatar (`data/avatars/<user_id>.jpg`)
+- `faces_count` — number of faces detected by MediaPipe (NULL = not processed)
+
+**`lead_post_links`** — which lead commented on which post
+- `username`, `user_id`, `post_url`, `post_shortcode`, `comment_text`
+
+**`apify_runs`** — cost tracking for every API call
+
+## Development Commands
+
+```bash
+# Virtual environment
+python -m venv .venv
+.venv/Scripts/activate     # Windows
+source .venv/bin/activate  # Linux/Mac
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run tests
+python -m pytest tests/ -v
+
+# Run the daily pipeline
+python scripts/pipeline.py
+
+# Individual test scripts (for exploration/debugging)
+python scripts/test_related_realtors.py    # Find realtor accounts via relatedProfiles
+python scripts/test_batch_posts.py         # Fetch posts from realtors
+python scripts/test_score_posts.py         # Score posts via DeepSeek
+python scripts/test_fetch_comments.py      # Fetch comments for relevant posts
+python scripts/test_fetch_profiles.py      # Fetch lead profiles + extract contacts
+python scripts/test_cost_analysis.py       # Analyze costs from pipeline logs
+
+# Backfill avatars + face detection for existing leads
+python scripts/backfill_avatars.py              # refetch profiles (Apify $$)
+python scripts/backfill_avatars.py --no-refetch # try stale URLs only (most 403)
+python scripts/backfill_avatars.py --limit 100  # cap leads processed
+```
+
+## Configuration
+
+- `config.yaml` — search parameters, Apify actor IDs, limits, filters
+- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`
+- Realtor accounts stored in DB table `tracked_realtors` (not config)
+
+## Key Source Files
+
+- `src/db.py` — SQLite DB with all tables, dedup logic, lead lifecycle methods
+- `src/apify_client_wrapper.py` — Apify wrapper with logging and cost tracking
+- `src/pipeline_logger.py` — JSON pipeline logs (every API call → `logs/*.json`)
+- `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
+- `src/avatar_downloader.py` — download avatar URL → `data/avatars/<user_id>.jpg`
+- `src/face_detector.py` — MediaPipe face count (lazy-loaded, CPU)
+- `src/logger.py` — structlog configuration
+- `src/config.py` — config.yaml + .env loader
+- `docs/apify_api_schemas.md` — detailed API schemas for all actors
+
+## Architecture Principles
+
+- **Cost awareness:** Apify requests cost money. Always deduplicate — check DB before making API calls. Track and log costs per cycle.
+- **Dedup by user_id:** Instagram usernames can change. Always check `user_id` (numeric pk) for deduplication, not just username.
+- **Budget controls:** Pipeline shows estimated cost before expensive operations and asks for confirmation.
+- **Incremental:** Each pipeline run only processes new/changed data. Safe to run repeatedly.
+- **5% comment growth threshold:** Don't re-scan comments on a post unless comment count grew by at least 5% since last scan.
+
+## Language
+
+The project spec and communication are in Russian. Code, comments, variable names, and logs should be in English.

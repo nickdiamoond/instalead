@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -m pytest tests/test_db.py -v)",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-hashtag-scraper/input-schema)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-post-scraper/input-schema)",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-scraper)",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-comment-scraper)",
+      "WebFetch(domain:apify.com)",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-scraper/builds/latest?waitForFinish=0)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\(''''data'''',{}\\).get\\(''''inputSchema'''',''''''''\\), indent=2\\)\\)\")",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-scraper/builds/latest)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(list\\(d.get\\(''''data'''',{}\\).keys\\(\\)\\)\\)\")",
+      "Bash(curl -sL https://raw.githubusercontent.com/nicktoptier/instagram-scraper/master/INPUT_SCHEMA.json)",
+      "WebFetch(domain:docs.apify.com)",
+      "Bash(curl -sL https://api.apify.com/v2/acts/apify~instagram-scraper/versions/0.0)",
+      "Bash(python3 -c ':*)",
+      "Bash(curl -sL https://apify.com/apify/instagram-scraper)",
+      "Bash(.venv/Scripts/python scripts/test_related_realtors.py)",
+      "Bash(curl -s https://api.apify.com/v2/acts/apidojo~instagram-comments-scraper-api/builds?limit=1)",
+      "Bash(python -m json.tool)"
+    ]
+  }
+}
