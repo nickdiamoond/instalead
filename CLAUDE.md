@@ -19,12 +19,12 @@ Instagram lead checker for real estate buyers (SPB focus). The system collects I
 - SQLite — deduplication, state, lead storage (`data/leads.db`)
 - Pipeline JSON logs — every API call logged to `logs/` for cost analysis
 - MediaPipe + OpenCV — local face detection on downloaded avatars
+- InsightFace + onnxruntime — ArcFace 512-d embeddings for same-person search
 
 Future (not yet implemented):
 - Yandex SpeechKit — audio transcription for reels with empty captions
 - Telethon — Telegram client (SearchGlobalRequest)
 - Aiogram — Telegram bot for notifications
-- InsightFace / ArcFace — face embeddings for Sherlock-bot (same-person search)
 - replicate.com — avatar upscaling
 
 ## Apify Actors Used
@@ -102,7 +102,13 @@ python -m venv .venv
 .venv/Scripts/activate     # Windows
 source .venv/bin/activate  # Linux/Mac
 
-# Install dependencies
+# Install dependencies (Linux/Mac — straight from PyPI)
+pip install -r requirements.txt
+
+# Install dependencies (Windows + Python 3.12) — PyPI ships insightface
+# only as sdist on Windows, which needs MSVC Build Tools. Easier path:
+# install the prebuilt community wheel first, then the rest.
+pip install https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl
 pip install -r requirements.txt
 
 # Run tests
@@ -123,6 +129,10 @@ python scripts/test_cost_analysis.py       # Analyze costs from pipeline logs
 python scripts/backfill_avatars.py              # refetch profiles (Apify $$)
 python scripts/backfill_avatars.py --no-refetch # try stale URLs only (most 403)
 python scripts/backfill_avatars.py --limit 100  # cap leads processed
+
+# Face matching smoke test (dev, uses facetest/ folder)
+python scripts/test_face_matcher.py
+python scripts/test_face_matcher.py --threshold 0.45
 ```
 
 ## Configuration
@@ -139,9 +149,15 @@ python scripts/backfill_avatars.py --limit 100  # cap leads processed
 - `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
 - `src/avatar_downloader.py` — download avatar URL → `data/avatars/<user_id>.jpg`
 - `src/face_detector.py` — MediaPipe face count (lazy-loaded, CPU)
+- `src/face_embedder.py` — InsightFace ArcFace 512-d embeddings (lazy-loaded, CPU)
+- `src/face_matcher.py` — pure-Python greedy clustering by cosine similarity
 - `src/logger.py` — structlog configuration
 - `src/config.py` — config.yaml + .env loader
 - `docs/apify_api_schemas.md` — detailed API schemas for all actors
+- `models/` — vendored ML weights (InsightFace `buffalo_s`, MediaPipe
+  BlazeFace); committed to the repo so Ubuntu deploys don't re-download
+  ~155 MB on first use. See `models/README.md` for layout and Git LFS tips.
+- `facetest/` — dev-only sandbox for `scripts/test_face_matcher.py`
 
 ## Architecture Principles
 

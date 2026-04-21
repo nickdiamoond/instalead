@@ -6,3 +6,9 @@ __pycache__/
 .venv/
 .mypy_cache/
 .pytest_cache/
+facetest/
+.cursor/
+
+# InsightFace leaves the bundle zip next to the extracted folder;
+# only the ONNX files matter, the zip is >100 MB and breaks GitHub push.
+models/*.zip

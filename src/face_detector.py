@@ -11,6 +11,7 @@ on first use to `data/models/blaze_face_short_range.tflite`.
 
 from __future__ import annotations
 
+import shutil
 import urllib.request
 from pathlib import Path
 
@@ -22,8 +23,16 @@ MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_detector/"
     "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
 )
-MODEL_DIR = Path("data/models")
+
+# Project-local models dir so the weights travel with the repo
+# (and Ubuntu deployments don't need to re-download them).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR = PROJECT_ROOT / "models" / "mediapipe"
 MODEL_PATH = MODEL_DIR / "blaze_face_short_range.tflite"
+
+# Legacy location (pre-``models/`` migration): kept for silent migration
+# of existing checkouts that already downloaded the weights locally.
+_LEGACY_MODEL_PATH = PROJECT_ROOT / "data" / "models" / "blaze_face_short_range.tflite"
 
 
 def _ensure_model() -> Path:
@@ -31,7 +40,12 @@ def _ensure_model() -> Path:
     if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0:
         return MODEL_PATH
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("face_model_downloading", url=MODEL_URL)
+    if _LEGACY_MODEL_PATH.exists() and _LEGACY_MODEL_PATH.stat().st_size > 0:
+        shutil.copy(_LEGACY_MODEL_PATH, MODEL_PATH)
+        log.info("face_model_migrated",
+                 src=str(_LEGACY_MODEL_PATH), dst=str(MODEL_PATH))
+        return MODEL_PATH
+    log.info("face_model_downloading", url=MODEL_URL, dst=str(MODEL_PATH))
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
     log.info("face_model_downloaded", path=str(MODEL_PATH),
              size=MODEL_PATH.stat().st_size)
