@@ -1,28 +1,45 @@
-"""Local face detection wrapper around MediaPipe.
+"""Local face detection wrapper around MediaPipe Tasks API.
 
-Uses MediaPipe Face Detection short-range model (model_selection=0),
-optimized for selfie-like images within ~2 meters — a good fit for
-Instagram avatars (typically 320x320 or 1080x1080 portraits).
+Uses BlazeFace short-range model, optimized for selfie-like images
+within ~2 meters — a good fit for Instagram avatars (typically 320x320
+or 1080x1080 portraits).
 
-MediaPipe and OpenCV are imported lazily so the rest of the codebase
-(and tests) does not pay the startup cost unless face detection is used.
+The MediaPipe Tasks API replaced the legacy `mp.solutions` API in
+mediapipe >= 0.10.20. Model is a ~230KB .tflite file auto-downloaded
+on first use to `data/models/blaze_face_short_range.tflite`.
 """
 
 from __future__ import annotations
 
+import urllib.request
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from src.logger import get_logger
 
-if TYPE_CHECKING:
-    import mediapipe as mp  # noqa: F401
-
 log = get_logger("face_detector")
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+)
+MODEL_DIR = Path("data/models")
+MODEL_PATH = MODEL_DIR / "blaze_face_short_range.tflite"
+
+
+def _ensure_model() -> Path:
+    """Download the BlazeFace short-range model if missing. Returns path."""
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0:
+        return MODEL_PATH
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("face_model_downloading", url=MODEL_URL)
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    log.info("face_model_downloaded", path=str(MODEL_PATH),
+             size=MODEL_PATH.stat().st_size)
+    return MODEL_PATH
 
 
 class FaceDetector:
-    """Counts faces on local images using MediaPipe Face Detection."""
+    """Counts faces on local images using MediaPipe Tasks FaceDetector."""
 
     def __init__(self, min_confidence: float = 0.5) -> None:
         self.min_confidence = min_confidence
@@ -31,13 +48,16 @@ class FaceDetector:
     def _ensure_loaded(self) -> None:
         if self._detector is not None:
             return
-        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
 
-        self._detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=0,
+        model_path = _ensure_model()
+        options = mp_vision.FaceDetectorOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             min_detection_confidence=self.min_confidence,
         )
-        log.info("face_detector_loaded", model=0, min_confidence=self.min_confidence)
+        self._detector = mp_vision.FaceDetector.create_from_options(options)
+        log.info("face_detector_loaded", min_confidence=self.min_confidence)
 
     def count_faces(self, image_path: str | Path) -> int:
         """Return number of detected faces. Returns 0 on any failure."""
@@ -47,17 +67,12 @@ class FaceDetector:
             return 0
 
         try:
-            import cv2
+            import mediapipe as mp
 
-            image = cv2.imread(str(path))
-            if image is None:
-                log.warning("face_detect_unreadable", path=str(path))
-                return 0
-
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             self._ensure_loaded()
             assert self._detector is not None
-            result = self._detector.process(rgb)
+            image = mp.Image.create_from_file(str(path))
+            result = self._detector.detect(image)
             detections = result.detections or []
             return len(detections)
         except Exception as e:
