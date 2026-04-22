@@ -65,6 +65,11 @@ class LeadDB:
                     avatar_path         TEXT,
                     faces_count         INTEGER,
 
+                    -- canonical single-face photo to send to Sherlock bot
+                    -- (the avatar itself if faces_count == 1, else a photo
+                    -- picked from the last N posts via cluster-leader search).
+                    face_photo_path     TEXT,
+
                     -- contacts (filled by bio parsing or Module 2)
                     phone               TEXT,
                     email               TEXT,
@@ -132,6 +137,7 @@ class LeadDB:
             "lead_accounts": [
                 ("avatar_path", "TEXT"),
                 ("faces_count", "INTEGER"),
+                ("face_photo_path", "TEXT"),
             ],
         }
         for table, columns in required.items():
@@ -284,6 +290,19 @@ class LeadDB:
                 (avatar_path, faces_count, username),
             )
 
+    def update_lead_face(self, username: str, face_photo_path: str) -> None:
+        """Persist the canonical single-face photo for a lead.
+
+        This is the photo we'll forward to the external Sherlock bot — the
+        avatar itself if it has exactly one face, otherwise a photo chosen
+        from the last N posts via the face-leader search.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE lead_accounts SET face_photo_path = ? WHERE username = ?",
+                (face_photo_path, username),
+            )
+
     def get_leads_needing_avatar(self, limit: int = 1000) -> list[dict]:
         """Leads that have profile data but no avatar processed yet."""
         with self._conn() as conn:
@@ -307,16 +326,58 @@ class LeadDB:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def get_leads_without_profile(self, limit: int = 100, max_age_days: int = 30) -> list[dict]:
+    def get_leads_needing_face_fallback(self, limit: int = 1000) -> list[dict]:
+        """Leads whose avatar face count is not 1 and canonical face is unresolved.
+
+        Candidates for the last-N-posts fallback. Skips private profiles and
+        rows without stored ``latest_media_urls`` (we'd have nothing to probe
+        anyway — a fresh Apify refetch is needed, which the dev script does).
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT username, user_id, profile_pic_url_hd, profile_pic_url, "
+                "       faces_count, latest_media_urls "
+                "FROM lead_accounts "
+                "WHERE profile_fetched = 1 "
+                "  AND faces_count IS NOT NULL AND faces_count != 1 "
+                "  AND face_photo_path IS NULL "
+                "  AND COALESCE(is_private, 0) = 0 "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_leads_with_non_single_face(self, limit: int = 10000) -> list[dict]:
+        """Leads that were face-detected but not exactly one face (0 or >1).
+
+        Useful for re-running detection with tweaked parameters or a new
+        model without touching leads that already look clean.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT username, user_id, profile_pic_url_hd, "
+                "       profile_pic_url, faces_count "
+                "FROM lead_accounts "
+                "WHERE faces_count IS NOT NULL AND faces_count != 1 "
+                "  AND COALESCE(is_private, 0) = 0 "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_leads_without_profile(self, limit: int = 100) -> list[dict]:
+        """Leads that have never had their profile scraped.
+
+        Once a profile is fetched we never re-poll it — contact info
+        (phone / telegram / email in bio) doesn't meaningfully change
+        for most people, and re-scraping costs Apify money per lead.
+        """
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT username FROM lead_accounts "
-                "WHERE is_private = 0 AND ("
-                "  profile_fetched = 0 "
-                "  OR (profile_fetched_at IS NOT NULL "
-                "      AND profile_fetched_at < datetime('now', ?)) "
-                ") LIMIT ?",
-                (f"-{max_age_days} days", limit),
+                "WHERE is_private = 0 AND profile_fetched = 0 "
+                "LIMIT ?",
+                (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -419,6 +480,9 @@ class LeadDB:
             leads_with_single_face = conn.execute(
                 "SELECT COUNT(*) FROM lead_accounts WHERE faces_count = 1"
             ).fetchone()[0]
+            leads_with_face_photo = conn.execute(
+                "SELECT COUNT(*) FROM lead_accounts WHERE face_photo_path IS NOT NULL"
+            ).fetchone()[0]
             realtors = conn.execute(
                 "SELECT COUNT(*) FROM tracked_realtors WHERE is_active = 1"
             ).fetchone()[0]
@@ -435,6 +499,7 @@ class LeadDB:
             "leads_with_contacts": leads_with_contacts,
             "leads_with_avatar": leads_with_avatar,
             "leads_with_single_face": leads_with_single_face,
+            "leads_with_face_photo": leads_with_face_photo,
             "processed_posts": posts,
             "post_links": post_links,
             "apify_runs": runs,

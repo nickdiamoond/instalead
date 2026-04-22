@@ -21,10 +21,17 @@ from apify_client import ApifyClient
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from src.avatar_downloader import download_avatar
+from src.avatar_downloader import (
+    cleanup_lead_photos,
+    download_avatar,
+    download_post_photos,
+)
+from src.config import load_config
 from src.contact_extractor import extract_contacts
 from src.db import LeadDB
 from src.face_detector import FaceDetector
+from src.face_embedder import FaceEmbedder
+from src.face_leader import resolve_face_leader
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 
@@ -67,6 +74,46 @@ def caption_is_empty(caption: str | None) -> bool:
     return len(without_hashtags.strip()) < 15
 
 
+def _pick_post_images(
+    latest_posts: list[dict] | None,
+    limit: int,
+    *,
+    skip_videos: bool = True,
+) -> list[str]:
+    """Pick at most one representative image URL from each of the first
+    ``limit`` posts in ``latestPosts``.
+
+    We intentionally take one image per post (not every carousel slide)
+    so that clustering counts *distinct post appearances* — if the same
+    person posts a 10-slide carousel of themselves, it shouldn't drown
+    out four separate posts showing someone else.
+
+    Preference per post:
+      1. ``images[0]`` — carousel cover / first slide (always a photo).
+      2. ``displayUrl`` — the single photo of a photo post.
+      3. Otherwise skip (videos, empties).
+    """
+    if not latest_posts:
+        return []
+
+    urls: list[str] = []
+    for post in latest_posts[:limit]:
+        images = post.get("images") or []
+        if images and images[0]:
+            urls.append(images[0])
+            continue
+        display_url = post.get("displayUrl")
+        video_url = post.get("videoUrl")
+        if not display_url:
+            continue
+        if skip_videos and video_url:
+            # Pure video post: displayUrl is just a cover frame, often
+            # low-quality / motion-blurred. Skip.
+            continue
+        urls.append(display_url)
+    return urls
+
+
 def score_caption(client: OpenAI, caption: str) -> dict:
     try:
         resp = client.chat.completions.create(
@@ -91,6 +138,7 @@ def score_caption(client: OpenAI, caption: str) -> dict:
 
 def main():
     load_dotenv()
+    cfg = load_config()
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
     deepseek = OpenAI(
         api_key=os.environ["DEEPSEEK_API_KEY"],
@@ -99,6 +147,14 @@ def main():
     db = LeadDB("data/leads.db")
     pipeline = PipelineLogger("logs", "pipeline")
     face_detector = FaceDetector()
+    face_embedder = FaceEmbedder()
+
+    fb_cfg = cfg.get("face_fallback") or {}
+    fb_limit = int(fb_cfg.get("latest_posts_limit", 5))
+    fb_min_cluster = int(fb_cfg.get("min_cluster_size", 2))
+    fb_threshold = float(fb_cfg.get("cluster_threshold", 0.5))
+    fb_skip_videos = bool(fb_cfg.get("skip_videos", True))
+    fb_keep_photos = bool(fb_cfg.get("keep_photos", False))
 
     stats_before = db.get_stats()
     log.info("pipeline_start", **stats_before)
@@ -326,6 +382,8 @@ def main():
         profiles_fetched = 0
         avatars_downloaded = 0
         single_face_new = 0
+        fallback_resolved = 0
+        fallback_skipped = 0
 
         for i in range(0, len(usernames), PROFILE_BATCH_SIZE):
             batch = usernames[i:i + PROFILE_BATCH_SIZE]
@@ -381,17 +439,52 @@ def main():
                 if not p.get("private"):
                     avatar_url = p.get("profilePicUrlHD") or p.get("profilePicUrl")
                     uid = p.get("id") or p.get("pk")
+                    uid_str = str(uid) if uid else None
                     avatar_path = download_avatar(
                         avatar_url,
-                        user_id=str(uid) if uid else None,
+                        user_id=uid_str,
                         username=username,
                     )
                     if avatar_path:
                         avatars_downloaded += 1
                         faces_count = face_detector.count_faces(avatar_path)
                         db.update_lead_avatar(username, avatar_path, faces_count)
+
                         if faces_count == 1:
                             single_face_new += 1
+                            # Avatar itself is a clean single-face photo.
+                            db.update_lead_face(username, avatar_path)
+                        elif uid_str:
+                            # Fallback: probe the last N posts, pick the
+                            # dominant face if there's an unambiguous leader.
+                            post_urls = _pick_post_images(
+                                p.get("latestPosts"),
+                                limit=fb_limit,
+                                skip_videos=fb_skip_videos,
+                            )
+                            local_paths = download_post_photos(
+                                post_urls, user_id=uid_str
+                            )
+                            result = resolve_face_leader(
+                                local_paths,
+                                face_detector,
+                                face_embedder,
+                                min_cluster_size=fb_min_cluster,
+                                cluster_threshold=fb_threshold,
+                            )
+                            if result:
+                                fallback_resolved += 1
+                                db.update_lead_face(
+                                    username, str(result.photo_path)
+                                )
+                            else:
+                                fallback_skipped += 1
+
+                            if not fb_keep_photos:
+                                cleanup_lead_photos(
+                                    uid_str,
+                                    keep=(result.photo_path if result else None),
+                                )
 
                 contacts = extract_contacts(
                     bio=p.get("biography"),
@@ -403,7 +496,9 @@ def main():
                     contacts_found += 1
 
         log.info("step4_done", profiles=profiles_fetched, contacts_from_bio=contacts_found,
-                 avatars=avatars_downloaded, single_face=single_face_new)
+                 avatars=avatars_downloaded, single_face=single_face_new,
+                 fallback_resolved=fallback_resolved,
+                 fallback_skipped=fallback_skipped)
 
     # ============================================================
     # SUMMARY
@@ -420,12 +515,14 @@ def main():
     print(f"  with contacts:      {stats_after['leads_with_contacts']}")
     print(f"  with avatar:        {stats_after['leads_with_avatar']}")
     print(f"  single-face:        {stats_after['leads_with_single_face']}")
+    print(f"  face photo ready:   {stats_after['leads_with_face_photo']}")
     print(f"Processed posts:      {stats_after['processed_posts']}")
     print(f"Post links:           {stats_after['post_links']}")
     print(f"Total API cost:       ${ps['total_cost_usd']:.4f}")
     print(f"Pipeline log:         {pipeline.file_path}")
 
     face_detector.close()
+    face_embedder.close()
 
 
 if __name__ == "__main__":

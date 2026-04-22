@@ -62,14 +62,28 @@ Step 4: Fetch profiles for new leads (batches of 50)
         Save latest_media_urls for future face recognition
         Download avatar -> data/avatars/<user_id>.jpg
         Run MediaPipe face detection -> faces_count
+        If faces_count == 1: avatar becomes face_photo_path
+        If faces_count != 1: fall back to last N post photos (face leader)
         Actor: instagram-profile-scraper
 ```
 
 **Avatar face detection note:** Instagram CDN URLs are signed and expire
 in ~1-2 days, so avatars are downloaded immediately during Step 4.
 MediaPipe Face Detection (short-range model) counts faces locally on CPU.
-Leads with `faces_count = 1` are candidates for the future Sherlock-bot
-(same-person search by face).
+
+**Face leader fallback (Step 4 extension):** when the avatar has 0 or
+\>1 faces, the pipeline probes the last N posts from the same Apify
+response (no extra cost). For each post the carousel cover (or
+`displayUrl` of photo posts; videos skipped) is downloaded to
+`data/lead_photos/<user_id>/`. Photos with exactly one face are
+ArcFace-embedded and greedy-clustered by cosine similarity. If the
+largest cluster covers at least M photos, the best-scoring member is
+promoted to `lead_accounts.face_photo_path` — the single canonical
+photo we later forward to the external Sherlock Telegram bot (which
+does the actual cross-profile matching itself). Otherwise the lead is
+skipped. Embeddings are used internally for clustering and discarded
+afterwards. All knobs live under `face_fallback:` in `config.yaml`.
+Downloaded post photos are removed except the chosen one (configurable).
 
 ## Database Schema (SQLite)
 
@@ -88,6 +102,7 @@ Leads with `faces_count = 1` are candidates for the future Sherlock-bot
 - `latest_media_urls` — JSON array of photo/video URLs from posts
 - `avatar_path` — local path to downloaded avatar (`data/avatars/<user_id>.jpg`)
 - `faces_count` — number of faces detected by MediaPipe (NULL = not processed)
+- `face_photo_path` — canonical single-face photo sent to the Sherlock bot (avatar if single-face, else post-fallback winner)
 
 **`lead_post_links`** — which lead commented on which post
 - `username`, `user_id`, `post_url`, `post_shortcode`, `comment_text`
@@ -133,6 +148,11 @@ python scripts/backfill_avatars.py --limit 100  # cap leads processed
 # Face matching smoke test (dev, uses facetest/ folder)
 python scripts/test_face_matcher.py
 python scripts/test_face_matcher.py --threshold 0.45
+
+# Face leader fallback test (last-N posts for leads with faces_count != 1)
+python scripts/test_face_leader.py
+python scripts/test_face_leader.py --limit 20
+python scripts/test_face_leader.py --keep-photos
 ```
 
 ## Configuration
@@ -151,6 +171,7 @@ python scripts/test_face_matcher.py --threshold 0.45
 - `src/face_detector.py` — MediaPipe face count (lazy-loaded, CPU)
 - `src/face_embedder.py` — InsightFace ArcFace 512-d embeddings (lazy-loaded, CPU)
 - `src/face_matcher.py` — pure-Python greedy clustering by cosine similarity
+- `src/face_leader.py` — last-N-photos leader resolution (MediaPipe filter + ArcFace + cluster)
 - `src/logger.py` — structlog configuration
 - `src/config.py` — config.yaml + .env loader
 - `docs/apify_api_schemas.md` — detailed API schemas for all actors
