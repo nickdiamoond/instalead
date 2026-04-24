@@ -9,15 +9,18 @@ weights on a fresh machine (e.g. when shipping to an Ubuntu server).
 
 ```
 models/
-├── buffalo_s/                # InsightFace ArcFace bundle (trimmed)
-│   ├── det_500m.onnx         # ~2.5 MB   face detector
-│   └── w600k_mbf.onnx        # ~13.6 MB  ArcFace recognition (512-d)
-└── mediapipe/
-    └── blaze_face_short_range.tflite   # ~230 KB — face counting
+└── buffalo_s/                # InsightFace SCRFD + ArcFace bundle (trimmed)
+    ├── det_500m.onnx         # ~2.5 MB   SCRFD face detector
+    └── w600k_mbf.onnx        # ~13.6 MB  ArcFace recognition (512-d)
 ```
 
 **Total footprint: ~16 MB** — small enough to commit to git directly
 without LFS.
+
+SCRFD handles both "count the faces" (avatars) and "per-face embedding"
+(post-photo clustering) roles. The previous MediaPipe BlazeFace model
+was removed in favor of a single detector — see
+[`src/face_embedder.py`](../src/face_embedder.py) for the unified API.
 
 ### What about the other InsightFace files?
 
@@ -40,9 +43,9 @@ re-download everything.
 
 ## How this folder gets populated
 
-Nothing manual — both [`src/face_embedder.py`](../src/face_embedder.py)
-and [`src/face_detector.py`](../src/face_detector.py) point here and
-download missing files on first use. Once downloaded, commit them:
+Nothing manual — [`src/face_embedder.py`](../src/face_embedder.py)
+points here and downloads missing files on first use. Once downloaded,
+commit them:
 
 ```bash
 git add models/
@@ -66,7 +69,6 @@ For bundles larger than ~50 MB, prefer Git LFS:
 ```bash
 git lfs install
 git lfs track "models/**/*.onnx"
-git lfs track "models/**/*.tflite"
 git add .gitattributes models/
 git commit -m "chore: vendor face models via LFS"
 ```

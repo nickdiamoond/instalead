@@ -46,12 +46,22 @@ cycle:
 db:
   path: "data/leads.db"
 
+# Face detection (SCRFD via InsightFace). Same detector is used for both
+# avatar face-count and post-photo leader resolution. Faces with det_score
+# below this threshold are dropped as false positives / background faces.
+# 0.7 is strict enough to reject "faces on posters in the background"
+# while keeping real profile / side-view detections (observed 0.78-0.85
+# on mixed test data). Raise to 0.8 if you see residual background
+# false positives; lower cautiously if SCRFD misses real faces.
+face_detection:
+  min_det_score: 0.7
+
 # Face leader fallback: when avatar face count is not exactly 1, probe the
 # last N post photos, keep only single-face ones, cluster them by cosine
 # similarity, and promote the largest cluster (if it covers >= M photos)
 # to the canonical face for the lead.
 face_fallback:
-  latest_posts_limit: 5       # N: how many of the most recent posts to probe
+  latest_posts_limit: 10       # N: how many of the most recent posts to probe
   min_cluster_size: 2         # M: leader cluster must cover at least this many photos
   cluster_threshold: 0.5      # cosine-similarity threshold for cluster_faces
   skip_videos: true           # ignore post items that are videoUrl-only

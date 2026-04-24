@@ -18,8 +18,9 @@ Instagram lead checker for real estate buyers (SPB focus). The system collects I
 - structlog — logging
 - SQLite — deduplication, state, lead storage (`data/leads.db`)
 - Pipeline JSON logs — every API call logged to `logs/` for cost analysis
-- MediaPipe + OpenCV — local face detection on downloaded avatars
-- InsightFace + onnxruntime — ArcFace 512-d embeddings for same-person search
+- InsightFace + onnxruntime — SCRFD face detection + ArcFace 512-d
+  embeddings for same-person search (single detector across avatars and
+  post photos)
 
 Future (not yet implemented):
 - Yandex SpeechKit — audio transcription for reels with empty captions
@@ -61,7 +62,7 @@ Step 4: Fetch profiles for new leads (batches of 50)
         Extract contacts from bio (phone, telegram, whatsapp, email)
         Save latest_media_urls for future face recognition
         Download avatar -> data/avatars/<user_id>.jpg
-        Run MediaPipe face detection -> faces_count
+        Run SCRFD face detection -> faces_count
         If faces_count == 1: avatar becomes face_photo_path
         If faces_count != 1: fall back to last N post photos (face leader)
         Actor: instagram-profile-scraper
@@ -69,16 +70,21 @@ Step 4: Fetch profiles for new leads (batches of 50)
 
 **Avatar face detection note:** Instagram CDN URLs are signed and expire
 in ~1-2 days, so avatars are downloaded immediately during Step 4.
-MediaPipe Face Detection (short-range model) counts faces locally on CPU.
+SCRFD (from InsightFace's ``buffalo_s`` bundle) counts faces locally on
+CPU. The ``min_det_score`` threshold is tuned to 0.7 by default to
+reject background / false-positive faces common on Instagram
+full-body / studio shots; override via ``face_detection.min_det_score``
+in ``config.yaml``.
 
 **Face leader fallback (Step 4 extension):** when the avatar has 0 or
 \>1 faces, the pipeline probes the last N posts from the same Apify
 response (no extra cost). For each post the carousel cover (or
 `displayUrl` of photo posts; videos skipped) is downloaded to
-`data/lead_photos/<user_id>/`. Photos with exactly one face are
-ArcFace-embedded and greedy-clustered by cosine similarity. If the
-largest cluster covers at least M photos, the best-scoring member is
-promoted to `lead_accounts.face_photo_path` — the single canonical
+`data/lead_photos/<user_id>/`. The same SCRFD + ArcFace pass both counts
+faces and produces the 512-d embedding — photos with exactly one face
+(above ``min_det_score``) are greedy-clustered by cosine similarity. If
+the largest cluster covers at least M photos, the best-scoring member
+is promoted to `lead_accounts.face_photo_path` — the single canonical
 photo we later forward to the external Sherlock Telegram bot (which
 does the actual cross-profile matching itself). Otherwise the lead is
 skipped. Embeddings are used internally for clustering and discarded
@@ -101,7 +107,7 @@ Downloaded post photos are removed except the chosen one (configurable).
 - `profile_fetched` (0/1), `contact_found` (0/1) — processing state
 - `latest_media_urls` — JSON array of photo/video URLs from posts
 - `avatar_path` — local path to downloaded avatar (`data/avatars/<user_id>.jpg`)
-- `faces_count` — number of faces detected by MediaPipe (NULL = not processed)
+- `faces_count` — number of faces detected by SCRFD above `min_det_score` (NULL = not processed)
 - `face_photo_path` — canonical single-face photo sent to the Sherlock bot (avatar if single-face, else post-fallback winner)
 
 **`lead_post_links`** — which lead commented on which post
@@ -168,16 +174,18 @@ python scripts/test_face_leader.py --keep-photos
 - `src/pipeline_logger.py` — JSON pipeline logs (every API call → `logs/*.json`)
 - `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
 - `src/avatar_downloader.py` — download avatar URL → `data/avatars/<user_id>.jpg`
-- `src/face_detector.py` — MediaPipe face count (lazy-loaded, CPU)
-- `src/face_embedder.py` — InsightFace ArcFace 512-d embeddings (lazy-loaded, CPU)
+- `src/face_embedder.py` — InsightFace SCRFD + ArcFace wrapper: exposes
+  both `count_faces()` (avatars) and `embed_faces()` (post-photo
+  clustering), with a shared `min_det_score` threshold
 - `src/face_matcher.py` — pure-Python greedy clustering by cosine similarity
-- `src/face_leader.py` — last-N-photos leader resolution (MediaPipe filter + ArcFace + cluster)
+- `src/face_leader.py` — last-N-photos leader resolution (SCRFD single-pass
+  filter + ArcFace + cluster)
 - `src/logger.py` — structlog configuration
 - `src/config.py` — config.yaml + .env loader
 - `docs/apify_api_schemas.md` — detailed API schemas for all actors
-- `models/` — vendored ML weights (InsightFace `buffalo_s`, MediaPipe
-  BlazeFace); committed to the repo so Ubuntu deploys don't re-download
-  ~155 MB on first use. See `models/README.md` for layout and Git LFS tips.
+- `models/` — vendored ML weights (InsightFace `buffalo_s` only);
+  committed to the repo so Ubuntu deploys don't re-download ~155 MB on
+  first use. See `models/README.md` for layout and Git LFS tips.
 - `facetest/` — dev-only sandbox for `scripts/test_face_matcher.py`
 
 ## Architecture Principles

@@ -26,8 +26,9 @@ from apify_client import ApifyClient
 from dotenv import load_dotenv
 
 from src.avatar_downloader import download_avatar
+from src.config import load_config
 from src.db import LeadDB
-from src.face_detector import FaceDetector
+from src.face_embedder import FaceEmbedder
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 
@@ -38,7 +39,7 @@ PROFILE_BATCH_SIZE = 50
 COST_PER_PROFILE = 0.0023
 
 
-def process_profile(db: LeadDB, face_detector: FaceDetector, profile: dict) -> tuple[bool, int]:
+def process_profile(db: LeadDB, face_embedder: FaceEmbedder, profile: dict) -> tuple[bool, int]:
     """Download avatar + detect faces. Returns (success, faces_count)."""
     username = profile.get("username")
     if not username:
@@ -58,7 +59,7 @@ def process_profile(db: LeadDB, face_detector: FaceDetector, profile: dict) -> t
     if not avatar_path:
         return False, 0
 
-    faces_count = face_detector.count_faces(avatar_path)
+    faces_count = face_embedder.count_faces(avatar_path)
     db.update_lead_avatar(username, avatar_path, faces_count)
     return True, faces_count
 
@@ -67,7 +68,7 @@ def run_refetch(
     db: LeadDB,
     apify: ApifyClient,
     pipeline: PipelineLogger,
-    face_detector: FaceDetector,
+    face_embedder: FaceEmbedder,
     leads: list[dict],
 ) -> None:
     usernames = [l["username"] for l in leads]
@@ -106,7 +107,7 @@ def run_refetch(
         )
 
         for p in items:
-            ok, faces = process_profile(db, face_detector, p)
+            ok, faces = process_profile(db, face_embedder, p)
             if ok:
                 downloaded += 1
                 if faces == 1:
@@ -117,7 +118,7 @@ def run_refetch(
 
 def run_stale(
     db: LeadDB,
-    face_detector: FaceDetector,
+    face_embedder: FaceEmbedder,
     leads: list[dict],
 ) -> None:
     print(f"\nTrying {len(leads)} stale CDN URLs (expect most to 403)...")
@@ -135,7 +136,7 @@ def run_stale(
         )
         if not avatar_path:
             continue
-        faces_count = face_detector.count_faces(avatar_path)
+        faces_count = face_embedder.count_faces(avatar_path)
         db.update_lead_avatar(lead["username"], avatar_path, faces_count)
         downloaded += 1
         if faces_count == 1:
@@ -160,15 +161,19 @@ def main() -> None:
     args = parser.parse_args()
 
     load_dotenv()
+    cfg = load_config()
+    fd_cfg = cfg.get("face_detection") or {}
+    min_det_score = float(fd_cfg.get("min_det_score", 0.7))
+
     db = LeadDB("data/leads.db")
-    face_detector = FaceDetector()
+    face_embedder = FaceEmbedder(min_det_score=min_det_score)
 
     if args.no_refetch:
         leads = db.get_leads_needing_avatar(limit=args.limit)
         if not leads:
             print("No leads need avatar backfill.")
             return
-        run_stale(db, face_detector, leads)
+        run_stale(db, face_embedder, leads)
     else:
         leads_dicts = db.get_leads_needing_avatar(limit=args.limit)
         if not leads_dicts:
@@ -176,9 +181,9 @@ def main() -> None:
             return
         apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
         pipeline = PipelineLogger("logs", "backfill_avatars")
-        run_refetch(db, apify, pipeline, face_detector, leads_dicts)
+        run_refetch(db, apify, pipeline, face_embedder, leads_dicts)
 
-    face_detector.close()
+    face_embedder.close()
 
     stats = db.get_stats()
     print(f"\nLeads with avatar:    {stats['leads_with_avatar']}")

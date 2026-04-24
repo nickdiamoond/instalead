@@ -8,7 +8,7 @@ Two modes:
                       the detector or swapping models.
 
 Each picked lead is re-fetched via Apify (CDN URLs expire in 1-2 days),
-avatar is downloaded, MediaPipe counts faces, result is written back to
+avatar is downloaded, SCRFD counts faces, result is written back to
 `faces_count` in the DB, and the photo is deleted. A per-run summary is
 also saved as JSON under `logs/`.
 
@@ -37,8 +37,9 @@ from apify_client import ApifyClient
 from dotenv import load_dotenv
 
 from src.avatar_downloader import AVATARS_DIR, download_avatar
+from src.config import load_config
 from src.db import LeadDB
-from src.face_detector import FaceDetector
+from src.face_embedder import FaceEmbedder
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 
@@ -146,14 +147,18 @@ def main() -> None:
             print("Cancelled.")
             return
 
+    cfg = load_config()
+    fd_cfg = cfg.get("face_detection") or {}
+    min_det_score = float(fd_cfg.get("min_det_score", 0.7))
+
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
     pipeline = PipelineLogger("logs", "test_avatar_batch")
-    face_detector = FaceDetector()
+    face_embedder = FaceEmbedder(min_det_score=min_det_score)
 
     total_start = time.perf_counter()
-    print("\nLoading MediaPipe model...")
+    print(f"\nLoading SCRFD model (min_det_score={min_det_score})...")
     t0 = time.perf_counter()
-    face_detector._ensure_loaded()
+    face_embedder._ensure_loaded()
     print(f"Model loaded in {(time.perf_counter() - t0) * 1000:.1f} ms\n")
 
     usernames = [l["username"] for l in leads]
@@ -232,7 +237,7 @@ def main() -> None:
             continue
 
         t0 = time.perf_counter()
-        faces = face_detector.count_faces(avatar_path)
+        faces = face_embedder.count_faces(avatar_path)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         detect_times.append(elapsed_ms)
         face_counts[faces] += 1
@@ -260,7 +265,7 @@ def main() -> None:
         print(f"{idx:>4} {username:<30} {'no':>4} {faces:>6}  "
               f"{elapsed_ms:>5.1f}  {verdict(faces)}{suffix}")
 
-    face_detector.close()
+    face_embedder.close()
     total_time = time.perf_counter() - total_start
 
     print("-" * 70)

@@ -1,7 +1,19 @@
-"""InsightFace wrapper for ArcFace embedding extraction.
+"""InsightFace wrapper for SCRFD detection + ArcFace embedding.
 
-Wraps ``insightface.app.FaceAnalysis`` and returns per-face records with
-L2-normalized 512-d embeddings suitable for cosine-similarity matching.
+Wraps ``insightface.app.FaceAnalysis`` and exposes two entry points:
+
+* :py:meth:`FaceEmbedder.count_faces` — just the face count on an image
+  (used by the pipeline to decide whether an avatar / post photo has
+  exactly one recognizable face).
+* :py:meth:`FaceEmbedder.embed_faces` — per-face records with
+  L2-normalized 512-d embeddings suitable for cosine-similarity matching.
+
+Both methods apply a post-hoc ``min_det_score`` filter on top of SCRFD's
+internal gate: SCRFD's default threshold is ~0.5, which is permissive
+enough to pick up low-confidence faces from image backgrounds. We
+override with ``0.7`` by default — strict enough to reject background
+faces on Instagram post photos while keeping real profile / side-view
+detections (observed scores 0.78–0.85 on mixed test data).
 
 The model bundle (default ``buffalo_s``, ~155 MB) is auto-downloaded on
 first use into ``<project>/models/<name>/`` — kept inside the repo so the
@@ -11,6 +23,7 @@ Ubuntu deploys don't re-download). Detection + embed runs on CPU via
 
 Usage:
     embedder = FaceEmbedder()
+    n = embedder.count_faces(Path("data/avatars/123.jpg"))
     faces = embedder.embed_faces(Path("data/avatars/123.jpg"))
     for f in faces:
         print(f.embedding.shape, f.bbox, f.det_score)
@@ -58,10 +71,15 @@ class FaceEmbedder:
         self,
         model_name: str = "buffalo_s",
         det_size: tuple[int, int] = (640, 640),
+        min_det_score: float = 0.7,
         models_root: Path | str | None = None,
     ) -> None:
         self.model_name = model_name
         self.det_size = det_size
+        # Post-hoc filter on SCRFD det_score. Anything below this is treated
+        # as "not a real face" and dropped before downstream consumers see it.
+        # See module docstring for the rationale behind the 0.7 default.
+        self.min_det_score = min_det_score
         # ``models_root`` is the directory that *contains* the ``models/``
         # subfolder where InsightFace keeps its ONNX bundles. Defaults to the
         # project root so weights live at ``<project>/models/<name>/``.
@@ -95,7 +113,13 @@ class FaceEmbedder:
         log.info("face_embedder_loaded", model=self.model_name, det_size=self.det_size)
 
     def embed_faces(self, image_path: str | Path) -> list[FaceEmb]:
-        """Detect and embed every face on the image. Returns [] on failure."""
+        """Detect + embed every face on the image above ``min_det_score``.
+
+        Returns ``[]`` on any failure (missing file, unreadable image,
+        InsightFace crash). Faces below the score threshold are silently
+        dropped, so callers can treat ``len(result)`` as the "real" face
+        count without a second filter.
+        """
         import numpy as np
 
         path = Path(image_path)
@@ -123,6 +147,9 @@ class FaceEmbedder:
 
         out: list[FaceEmb] = []
         for f in faces:
+            det_score = float(getattr(f, "det_score", 0.0))
+            if det_score < self.min_det_score:
+                continue
             emb = getattr(f, "normed_embedding", None)
             if emb is None:
                 emb = getattr(f, "embedding", None)
@@ -139,10 +166,22 @@ class FaceEmbedder:
                 FaceEmb(
                     embedding=emb,
                     bbox=bbox,  # type: ignore[arg-type]
-                    det_score=float(getattr(f, "det_score", 0.0)),
+                    det_score=det_score,
                 )
             )
         return out
+
+    def count_faces(self, image_path: str | Path) -> int:
+        """Return the number of faces above ``min_det_score``.
+
+        Thin wrapper around :py:meth:`embed_faces` — currently runs the
+        full detection + ArcFace pass and just discards the embeddings.
+        The extra ArcFace cost is ~30-50 ms per detected face on CPU,
+        negligible for typical Instagram avatars (0-1 faces). If this
+        ever shows up in a profile we can split out a detection-only
+        ``FaceAnalysis`` instance.
+        """
+        return len(self.embed_faces(image_path))
 
     def close(self) -> None:
         self._app = None
