@@ -46,15 +46,29 @@ cycle:
 db:
   path: "data/leads.db"
 
-# Face detection (SCRFD via InsightFace). Same detector is used for both
-# avatar face-count and post-photo leader resolution. Faces with det_score
-# below this threshold are dropped as false positives / background faces.
-# 0.7 is strict enough to reject "faces on posters in the background"
-# while keeping real profile / side-view detections (observed 0.78-0.85
-# on mixed test data). Raise to 0.8 if you see residual background
-# false positives; lower cautiously if SCRFD misses real faces.
+# Face detection (SCRFD via InsightFace).
+#
+# We run TWO FaceEmbedder instances with different det_size canvases —
+# avatars and post photos have very different recall characteristics:
+#
+#   * avatar_det_size: Instagram avatars come back as 320x320 thumbnails.
+#     Running them through 640 upscales 2x and pushes "face fills frame"
+#     selfies past SCRFD's largest anchor (~256 px), where recall drops.
+#     320 = native size, no upscale, faces stay in the anchor sweet
+#     spot. Confirmed via test_avatar_sort.py: ~zero false negatives on
+#     1000+ real avatars at this size.
+#   * post_det_size: feed photos can be 1080x1080+ with multiple smaller
+#     faces (group shots, distant subjects). 640 gives wider anchor
+#     coverage for those.
+#
+# min_det_score is shared. 0.6 was tuned via test_avatar_sort.py's
+# threshold sweep — strict enough to drop background faces / posters
+# in the frame, loose enough to keep real profile / side-view
+# detections (typical confidence on real faces: 0.78-0.92).
 face_detection:
-  min_det_score: 0.7
+  min_det_score: 0.6
+  avatar_det_size: 320
+  post_det_size: 640
 
 # Face leader fallback: when avatar face count is not exactly 1, probe the
 # last N post photos, keep only single-face ones, cluster them by cosine

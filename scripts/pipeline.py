@@ -29,7 +29,7 @@ from src.avatar_downloader import (
 from src.config import load_config
 from src.contact_extractor import extract_contacts
 from src.db import LeadDB
-from src.face_embedder import FaceEmbedder
+from src.face_embedder import make_face_embedder
 from src.face_leader import resolve_face_leader
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -146,9 +146,12 @@ def main():
     db = LeadDB("data/leads.db")
     pipeline = PipelineLogger("logs", "pipeline")
 
-    fd_cfg = cfg.get("face_detection") or {}
-    min_det_score = float(fd_cfg.get("min_det_score", 0.7))
-    face_embedder = FaceEmbedder(min_det_score=min_det_score)
+    # Two SCRFD instances with different det_size:
+    #   * avatar_embedder (320x320) for the avatar single-face check
+    #   * post_embedder (640x640) for the last-N-posts leader fallback
+    # See make_face_embedder docstring / config.yaml for the rationale.
+    avatar_embedder = make_face_embedder(cfg, kind="avatar")
+    post_embedder = make_face_embedder(cfg, kind="post")
 
     fb_cfg = cfg.get("face_fallback") or {}
     fb_limit = int(fb_cfg.get("latest_posts_limit", 5))
@@ -448,7 +451,7 @@ def main():
                     )
                     if avatar_path:
                         avatars_downloaded += 1
-                        faces_count = face_embedder.count_faces(avatar_path)
+                        faces_count = avatar_embedder.count_faces(avatar_path)
                         db.update_lead_avatar(username, avatar_path, faces_count)
 
                         if faces_count == 1:
@@ -468,7 +471,7 @@ def main():
                             )
                             result = resolve_face_leader(
                                 local_paths,
-                                face_embedder,
+                                post_embedder,
                                 min_cluster_size=fb_min_cluster,
                                 cluster_threshold=fb_threshold,
                             )
@@ -521,7 +524,8 @@ def main():
     print(f"Total API cost:       ${ps['total_cost_usd']:.4f}")
     print(f"Pipeline log:         {pipeline.file_path}")
 
-    face_embedder.close()
+    avatar_embedder.close()
+    post_embedder.close()
 
 
 if __name__ == "__main__":

@@ -365,6 +365,34 @@ class LeadDB:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_all_face_detection_candidates(self, limit: int = 10000) -> list[dict]:
+        """Every lead eligible for face detection, regardless of its
+        current ``faces_count`` / ``avatar_path`` state.
+
+        Unlike :py:meth:`get_leads_needing_avatar` (which skips already
+        processed leads) and :py:meth:`get_leads_with_non_single_face`
+        (which skips clean single-face leads), this one returns the
+        full superset. Useful for wholesale re-detection after swapping
+        models — e.g. the MediaPipe → SCRFD migration — where every
+        stored ``faces_count`` should be overwritten with the new
+        detector's verdict.
+
+        Excludes private accounts (their avatars aren't accessible).
+        ``faces_count`` and ``avatar_path`` are returned so callers can
+        log before/after diffs.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT username, user_id, profile_pic_url_hd, "
+                "       profile_pic_url, faces_count, avatar_path "
+                "FROM lead_accounts "
+                "WHERE profile_fetched = 1 "
+                "  AND COALESCE(is_private, 0) = 0 "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_leads_without_profile(self, limit: int = 100) -> list[dict]:
         """Leads that have never had their profile scraped.
 

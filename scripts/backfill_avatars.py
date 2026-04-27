@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 from src.avatar_downloader import download_avatar
 from src.config import load_config
 from src.db import LeadDB
-from src.face_embedder import FaceEmbedder
+from src.face_embedder import FaceEmbedder, make_face_embedder
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 
@@ -162,11 +162,10 @@ def main() -> None:
 
     load_dotenv()
     cfg = load_config()
-    fd_cfg = cfg.get("face_detection") or {}
-    min_det_score = float(fd_cfg.get("min_det_score", 0.7))
 
     db = LeadDB("data/leads.db")
-    face_embedder = FaceEmbedder(min_det_score=min_det_score)
+    # Avatar-only script — single 320x320 SCRFD instance is enough.
+    face_embedder = make_face_embedder(cfg, kind="avatar")
 
     if args.no_refetch:
         leads = db.get_leads_needing_avatar(limit=args.limit)

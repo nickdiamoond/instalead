@@ -11,9 +11,15 @@ Wraps ``insightface.app.FaceAnalysis`` and exposes two entry points:
 Both methods apply a post-hoc ``min_det_score`` filter on top of SCRFD's
 internal gate: SCRFD's default threshold is ~0.5, which is permissive
 enough to pick up low-confidence faces from image backgrounds. We
-override with ``0.7`` by default — strict enough to reject background
-faces on Instagram post photos while keeping real profile / side-view
-detections (observed scores 0.78–0.85 on mixed test data).
+override with ``0.6`` by default — tuned via the threshold sweep in
+``scripts/test_avatar_sort.py`` to reject background faces / posters
+while keeping real profile / side-view detections (typical confidence
+on real faces: 0.78–0.92).
+
+The pipeline uses TWO instances of this class with different
+``det_size`` canvases — see :py:func:`make_face_embedder` — because
+Instagram avatars (320x320 native) and feed photos (1080x1080+ with
+multiple smaller faces) hit very different anchor sweet spots.
 
 The model bundle (default ``buffalo_s``, ~155 MB) is auto-downloaded on
 first use into ``<project>/models/<name>/`` — kept inside the repo so the
@@ -22,11 +28,15 @@ Ubuntu deploys don't re-download). Detection + embed runs on CPU via
 ``onnxruntime``.
 
 Usage:
-    embedder = FaceEmbedder()
-    n = embedder.count_faces(Path("data/avatars/123.jpg"))
-    faces = embedder.embed_faces(Path("data/avatars/123.jpg"))
-    for f in faces:
-        print(f.embedding.shape, f.bbox, f.det_score)
+    from src.config import load_config
+    from src.face_embedder import make_face_embedder
+
+    cfg = load_config()
+    avatar_embedder = make_face_embedder(cfg, kind="avatar")
+    post_embedder = make_face_embedder(cfg, kind="post")
+
+    n = avatar_embedder.count_faces(Path("data/avatars/123.jpg"))
+    faces = post_embedder.embed_faces(Path("data/lead_photos/.../1.jpg"))
 """
 
 from __future__ import annotations
@@ -71,14 +81,14 @@ class FaceEmbedder:
         self,
         model_name: str = "buffalo_s",
         det_size: tuple[int, int] = (640, 640),
-        min_det_score: float = 0.7,
+        min_det_score: float = 0.6,
         models_root: Path | str | None = None,
     ) -> None:
         self.model_name = model_name
         self.det_size = det_size
         # Post-hoc filter on SCRFD det_score. Anything below this is treated
         # as "not a real face" and dropped before downstream consumers see it.
-        # See module docstring for the rationale behind the 0.7 default.
+        # See module docstring for the rationale behind the 0.6 default.
         self.min_det_score = min_det_score
         # ``models_root`` is the directory that *contains* the ``models/``
         # subfolder where InsightFace keeps its ONNX bundles. Defaults to the
@@ -185,3 +195,47 @@ class FaceEmbedder:
 
     def close(self) -> None:
         self._app = None
+
+
+def make_face_embedder(cfg: dict, *, kind: str) -> FaceEmbedder:
+    """Build a FaceEmbedder calibrated for either avatars or post photos.
+
+    Two distinct calibrations are needed because the inputs have very
+    different recall characteristics:
+
+    * ``kind="avatar"`` — Instagram avatars are tiny 320x320 thumbnails.
+      Running them through ``det_size=640`` upscales 2x and pushes
+      "face fills frame" selfies past SCRFD's largest anchor (~256 px),
+      where recall drops sharply. ``det_size=320`` (default) keeps the
+      image at native size and large faces stay in the anchor sweet
+      spot. Single-face oriented.
+    * ``kind="post"`` — feed photos can be 1080x1080+ with multiple
+      smaller faces (group shots, distant subjects). ``det_size=640``
+      (default) gives wider anchor coverage for those.
+
+    Both kinds share ``min_det_score`` from the same config key. Sizes
+    are configurable via ``face_detection.avatar_det_size`` and
+    ``face_detection.post_det_size`` in ``config.yaml``.
+
+    Args:
+        cfg: parsed config dict (output of ``load_config()``).
+        kind: ``"avatar"`` or ``"post"``.
+
+    Returns:
+        A new FaceEmbedder. The ONNX model is NOT loaded yet; the first
+        detection call triggers the lazy load.
+    """
+    fd = cfg.get("face_detection") or {}
+    min_score = float(fd.get("min_det_score", 0.6))
+    if kind == "avatar":
+        size = int(fd.get("avatar_det_size", 320))
+    elif kind == "post":
+        size = int(fd.get("post_det_size", 640))
+    else:
+        raise ValueError(
+            f"FaceEmbedder kind must be 'avatar' or 'post', got {kind!r}"
+        )
+    return FaceEmbedder(
+        min_det_score=min_score,
+        det_size=(size, size),
+    )

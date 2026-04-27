@@ -1,22 +1,46 @@
 """Test: take N leads from DB, refetch profiles, run face detection.
 
-Two modes:
-  default:            leads that never had face detection
-                      (profile_fetched=1, avatar_path IS NULL, not private)
+Three modes (mutually exclusive):
+  default (all):      EVERY non-private lead with a fetched profile,
+                      regardless of current faces_count / avatar_path.
+                      Overwrites stale counts — this is what you want
+                      after a detector migration (e.g. MediaPipe → SCRFD)
+                      or whenever you're doing a full re-validation pass.
+  --only-new:         leads that never had face detection
+                      (profile_fetched=1, avatar_path IS NULL, not private).
+                      Useful for incremental daily runs when the rest of
+                      the base is already verified.
   --retest-nonsingle: leads already scanned whose faces_count != 1
-                      (i.e. 0 faces or group photos) — useful when tuning
-                      the detector or swapping models.
+                      (i.e. 0 faces or group photos) — narrow re-check
+                      without touching clean single-face leads.
 
 Each picked lead is re-fetched via Apify (CDN URLs expire in 1-2 days),
 avatar is downloaded, SCRFD counts faces, result is written back to
-`faces_count` in the DB, and the photo is deleted. A per-run summary is
-also saved as JSON under `logs/`.
+`faces_count` in the DB. A per-run summary is saved as JSON under `logs/`.
+
+Unlike the main pipeline (which stores avatars at
+``data/avatars/<user_id>.jpg`` — a numeric Instagram pk — so that
+username changes don't break dedup), this test script downloads to
+``data/avatars_review/<username>.jpg``. That way the filenames line up
+with the console output and the JSON log, making manual spot-checking
+straightforward. The DB's ``avatar_path`` field will point at the
+review folder after the test — on the next full pipeline run
+``download_avatar`` will simply re-download into the canonical
+``data/avatars/`` location (cheap, no Apify re-fetch for the image).
+
+By default downloaded avatars are kept on disk so you can manually
+eyeball edge cases. Pass ``--delete-photos`` to wipe them per-lead,
+``--clean-start`` to wipe the review folder before the run. Downloads
+are idempotent — re-running without ``--clean-start`` reuses existing
+files (useful for re-detecting with a different SCRFD threshold).
 
 Usage:
-    python scripts/test_avatar_batch.py                   # all new leads
+    python scripts/test_avatar_batch.py                   # re-detect every lead, keep photos
     python scripts/test_avatar_batch.py --limit 20        # cap
     python scripts/test_avatar_batch.py --yes             # skip prompt
-    python scripts/test_avatar_batch.py --keep-photos     # don't delete
+    python scripts/test_avatar_batch.py --delete-photos   # wipe per-lead after detect
+    python scripts/test_avatar_batch.py --clean-start     # wipe review folder first
+    python scripts/test_avatar_batch.py --only-new        # only leads without avatar_path
     python scripts/test_avatar_batch.py --retest-nonsingle
 """
 
@@ -36,10 +60,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from apify_client import ApifyClient
 from dotenv import load_dotenv
 
-from src.avatar_downloader import AVATARS_DIR, download_avatar
+from src.avatar_downloader import download_avatar
 from src.config import load_config
 from src.db import LeadDB
-from src.face_embedder import FaceEmbedder
+from src.face_embedder import make_face_embedder
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 
@@ -49,6 +73,11 @@ log = get_logger("test_avatar_batch")
 PROFILE_BATCH_SIZE = 50
 COST_PER_PROFILE = 0.0023
 LOGS_DIR = Path("logs")
+# Dedicated review folder for this test: filenames are username-based
+# (human-readable) so you can cross-reference the console table and JSON
+# log against the actual image files. Separate from the main pipeline's
+# ``data/avatars/`` which uses numeric user_id-based names.
+REVIEW_DIR = Path("data/avatars_review")
 
 
 def verdict(faces: int) -> str:
@@ -59,13 +88,13 @@ def verdict(faces: int) -> str:
     return f"{faces} faces"
 
 
-def cleanup_avatars_dir() -> tuple[int, int]:
-    """Remove every file in data/avatars/. Returns (deleted, failed)."""
-    if not AVATARS_DIR.exists():
+def cleanup_review_dir() -> tuple[int, int]:
+    """Remove every file in ``REVIEW_DIR``. Returns (deleted, failed)."""
+    if not REVIEW_DIR.exists():
         return 0, 0
     deleted = 0
     failed = 0
-    for f in AVATARS_DIR.iterdir():
+    for f in REVIEW_DIR.iterdir():
         if not f.is_file():
             continue
         try:
@@ -89,14 +118,34 @@ def main() -> None:
     parser.add_argument("--yes", action="store_true",
                         help="Skip cost confirmation prompt.")
     parser.add_argument(
-        "--keep-photos",
+        "--delete-photos",
         action="store_true",
-        help="Don't delete downloaded avatars after detection.",
+        help="Delete each avatar right after its face count is written "
+             "to the DB. Default is to keep them for manual review.",
     )
     parser.add_argument(
+        "--clean-start",
+        action="store_true",
+        help=f"Wipe {REVIEW_DIR} before the run. Default is to leave "
+             "existing files in place (download_avatar is idempotent, "
+             "so unchanged usernames won't be re-fetched).",
+    )
+    # Default mode = "all" (process every eligible lead, overwriting
+    # stale faces_count). The two narrow modes below are opt-in.
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--only-new",
+        action="store_true",
+        help="Narrow scope: only leads that never had face detection "
+             "(avatar_path IS NULL). Default is to re-process EVERY "
+             "non-private lead with a fetched profile.",
+    )
+    mode_group.add_argument(
         "--retest-nonsingle",
         action="store_true",
-        help="Only process leads whose faces_count != 1 (re-detect).",
+        help="Narrow scope: only leads whose faces_count != 1 "
+             "(0 faces or group photos). Default is to re-process "
+             "every non-private lead.",
     )
     args = parser.parse_args()
 
@@ -106,20 +155,40 @@ def main() -> None:
     db_stats = db.get_stats()
 
     effective_limit = args.limit if args.limit > 0 else 10**9
-    mode = "retest-nonsingle" if args.retest_nonsingle else "needing"
-    if args.retest_nonsingle:
+    if args.only_new:
+        mode = "only-new"
+        leads = db.get_leads_needing_avatar(limit=effective_limit)
+    elif args.retest_nonsingle:
+        mode = "retest-nonsingle"
         leads = db.get_leads_with_non_single_face(limit=effective_limit)
     else:
-        leads = db.get_leads_needing_avatar(limit=effective_limit)
+        mode = "all"
+        leads = db.get_all_face_detection_candidates(limit=effective_limit)
 
     if not leads:
-        msg = ("No leads with faces_count != 1."
-               if args.retest_nonsingle
-               else "No leads need avatar processing.")
+        if args.only_new:
+            msg = "No leads need avatar processing."
+        elif args.retest_nonsingle:
+            msg = "No leads with faces_count != 1."
+        else:
+            msg = "No non-private leads with a fetched profile in the DB."
         print(f"{msg} Nothing to do.")
         return
 
-    cleaned_pre, cleaned_pre_failed = cleanup_avatars_dir()
+    # In the default ("all") mode we overwrite stale faces_count values
+    # from a previous detector run. Snapshot prior values so the summary
+    # can show how many leads flipped verdict.
+    prior_counts: dict[str, int | None] = {}
+    if mode == "all":
+        prior_counts = {
+            l["username"]: l.get("faces_count")
+            for l in leads
+        }
+
+    if args.clean_start:
+        cleaned_pre, cleaned_pre_failed = cleanup_review_dir()
+    else:
+        cleaned_pre, cleaned_pre_failed = 0, 0
 
     estimated_cost = len(leads) * COST_PER_PROFILE
     print(f"\n{'='*60}")
@@ -130,16 +199,20 @@ def main() -> None:
     print(f"  profile fetched:      {db_stats['leads_with_profile']}")
     print(f"  with avatar already:  {db_stats['leads_with_avatar']}")
     print(f"  single-face so far:   {db_stats['leads_with_single_face']}")
-    print(f"Pre-cleanup:")
-    print(f"  files removed:        {cleaned_pre}"
-          + (f" (failed: {cleaned_pre_failed})"
-             if cleaned_pre_failed else ""))
+    print(f"Review folder:          {REVIEW_DIR} (filenames: <username>.jpg)")
+    if args.clean_start:
+        print(f"Pre-cleanup:")
+        print(f"  files removed:        {cleaned_pre}"
+              + (f" (failed: {cleaned_pre_failed})"
+                 if cleaned_pre_failed else ""))
+    else:
+        print(f"Pre-cleanup:            skipped (pass --clean-start to wipe)")
     print(f"Leads to process:       {len(leads)}"
           + ("" if args.limit == 0 else f" (capped at --limit {args.limit})"))
     print(f"Apify (profile):        ~${estimated_cost:.3f}")
     print(f"Photos:                 "
-          + ("KEEP on disk" if args.keep_photos
-             else "DELETE after detection"))
+          + ("DELETE after detection" if args.delete_photos
+             else "KEEP on disk for manual review"))
     print(f"{'='*60}")
     if not args.yes:
         confirm = input("Proceed? (y/n): ").strip().lower()
@@ -148,15 +221,16 @@ def main() -> None:
             return
 
     cfg = load_config()
-    fd_cfg = cfg.get("face_detection") or {}
-    min_det_score = float(fd_cfg.get("min_det_score", 0.7))
 
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
     pipeline = PipelineLogger("logs", "test_avatar_batch")
-    face_embedder = FaceEmbedder(min_det_score=min_det_score)
+    # Avatar-only test — single 320x320 SCRFD instance is enough.
+    face_embedder = make_face_embedder(cfg, kind="avatar")
 
     total_start = time.perf_counter()
-    print(f"\nLoading SCRFD model (min_det_score={min_det_score})...")
+    print(f"\nLoading SCRFD model "
+          f"(min_det_score={face_embedder.min_det_score}, "
+          f"det_size={face_embedder.det_size[0]})...")
     t0 = time.perf_counter()
     face_embedder._ensure_loaded()
     print(f"Model loaded in {(time.perf_counter() - t0) * 1000:.1f} ms\n")
@@ -200,6 +274,12 @@ def main() -> None:
     deleted_files = 0
     delete_failed = 0
     per_lead: list[dict] = []
+    # Only populated in --all mode: how many leads' faces_count changed
+    # compared to what was stored from the previous detector run.
+    flipped_total = 0
+    flipped_1_to_multi = 0
+    flipped_multi_to_1 = 0
+    flipped_examples: list[dict] = []
 
     for idx, profile in enumerate(all_profiles, start=1):
         username = profile.get("username") or "?"
@@ -219,10 +299,14 @@ def main() -> None:
             continue
 
         avatar_url = profile.get("profilePicUrlHD") or profile.get("profilePicUrl")
+        # Force username-based filename by passing user_id=None, and route
+        # to the review-only folder so the main pipeline's canonical
+        # ``data/avatars/`` store stays pristine.
         avatar_path = download_avatar(
             avatar_url,
-            user_id=str(uid) if uid else None,
+            user_id=None,
             username=username,
+            avatars_dir=REVIEW_DIR,
         )
         if not avatar_path:
             download_fail += 1
@@ -242,10 +326,27 @@ def main() -> None:
         detect_times.append(elapsed_ms)
         face_counts[faces] += 1
 
+        # Track prior vs new verdict BEFORE writing — otherwise
+        # ``prior`` would be whatever we just wrote.
+        prior = prior_counts.get(username) if mode == "all" else None
+
         db.update_lead_avatar(username, avatar_path, faces)
 
+        if mode == "all" and prior is not None and prior != faces:
+            flipped_total += 1
+            if prior == 1 and faces != 1:
+                flipped_1_to_multi += 1
+            elif prior != 1 and faces == 1:
+                flipped_multi_to_1 += 1
+            if len(flipped_examples) < 20:
+                flipped_examples.append({
+                    "username": username,
+                    "prior": prior,
+                    "new": faces,
+                })
+
         suffix = ""
-        if not args.keep_photos:
+        if args.delete_photos:
             try:
                 Path(avatar_path).unlink(missing_ok=True)
                 deleted_files += 1
@@ -290,16 +391,37 @@ def main() -> None:
     print(f"  Download + detect:  {total_time - refetch_time:.1f}s")
     print(f"Apify cost (actual):  ${apify_cost:.4f}")
 
-    if not args.keep_photos:
+    if args.delete_photos or args.clean_start:
         print(f"\nPhoto cleanup:")
-        print(f"  pre-run deleted:    {cleaned_pre}")
-        print(f"  per-lead deleted:   {deleted_files}")
+        print(f"  pre-run deleted:    {cleaned_pre}"
+              + ("" if args.clean_start else " (skipped)"))
+        print(f"  per-lead deleted:   {deleted_files}"
+              + ("" if args.delete_photos else " (skipped — kept for review)"))
         if delete_failed:
             print(f"  delete failed:      {delete_failed}")
+    else:
+        print(f"\nPhotos kept in:       {REVIEW_DIR} (one <username>.jpg per lead)")
 
     single_face = face_counts.get(1, 0)
     detected_total = sum(face_counts.values())
     print(f"\nSherlock candidates (single-face): {single_face}/{detected_total}")
+
+    flipped_other = 0
+    if mode == "all":
+        # How many previously-stored faces_count values were overwritten
+        # by the new detector. "flipped_other" = changes that aren't a
+        # simple {1 <-> not 1} swap (e.g. 2 -> 3, 0 -> 2).
+        flipped_other = flipped_total - flipped_1_to_multi - flipped_multi_to_1
+        print(f"\nDetector diff vs previous run:")
+        print(f"  total flipped:            {flipped_total}")
+        print(f"    1 -> not 1 (lost):      {flipped_1_to_multi}")
+        print(f"    not 1 -> 1 (gained):    {flipped_multi_to_1}")
+        print(f"    other shifts:           {flipped_other}")
+        if flipped_examples:
+            shown = min(10, len(flipped_examples))
+            print(f"  sample (first {shown}):")
+            for ex in flipped_examples[:shown]:
+                print(f"    {ex['username']:<30} {ex['prior']} -> {ex['new']}")
 
     LOGS_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -308,7 +430,9 @@ def main() -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "limit": args.limit,
-        "keep_photos": args.keep_photos,
+        "delete_photos": args.delete_photos,
+        "clean_start": args.clean_start,
+        "review_dir": str(REVIEW_DIR),
         "db_stats": db_stats,
         "leads_requested": len(leads),
         "profiles_returned": len(all_profiles),
@@ -333,6 +457,13 @@ def main() -> None:
             "per_lead_deleted": deleted_files,
             "per_lead_delete_failed": delete_failed,
         },
+        "detector_diff": ({
+            "flipped_total": flipped_total,
+            "flipped_1_to_not1": flipped_1_to_multi,
+            "flipped_not1_to_1": flipped_multi_to_1,
+            "flipped_other": flipped_other,
+            "examples": flipped_examples,
+        } if mode == "all" else None),
         "leads": per_lead,
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),

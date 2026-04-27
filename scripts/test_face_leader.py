@@ -37,7 +37,7 @@ from src.avatar_downloader import (
 )
 from src.config import load_config
 from src.db import LeadDB
-from src.face_embedder import FaceEmbedder
+from src.face_embedder import make_face_embedder
 from src.face_leader import resolve_face_leader
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -79,8 +79,6 @@ def main() -> None:
     fb_threshold = float(fb_cfg.get("cluster_threshold", 0.5))
     fb_skip_videos = bool(fb_cfg.get("skip_videos", True))
     fb_keep_photos = args.keep_photos or bool(fb_cfg.get("keep_photos", False))
-    fd_cfg = cfg.get("face_detection") or {}
-    min_det_score = float(fd_cfg.get("min_det_score", 0.7))
 
     db = LeadDB("data/leads.db")
     stats_before = db.get_stats()
@@ -120,11 +118,19 @@ def main() -> None:
 
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
     pipeline = PipelineLogger("logs", "test_face_leader")
-    face_embedder = FaceEmbedder(min_det_score=min_det_score)
+    # Two SCRFD instances: avatar (320) for the single-face check,
+    # post (640) for the multi-face leader resolution.
+    avatar_embedder = make_face_embedder(cfg, kind="avatar")
+    post_embedder = make_face_embedder(cfg, kind="post")
+    min_det_score = avatar_embedder.min_det_score
 
-    print(f"\nLoading SCRFD + ArcFace (min_det_score={min_det_score})...")
+    print(f"\nLoading SCRFD + ArcFace "
+          f"(min_det_score={min_det_score}, "
+          f"avatar_det_size={avatar_embedder.det_size[0]}, "
+          f"post_det_size={post_embedder.det_size[0]})...")
     t0 = time.perf_counter()
-    face_embedder._ensure_loaded()
+    avatar_embedder._ensure_loaded()
+    post_embedder._ensure_loaded()
     print(f"Models loaded in {_fmt_s(time.perf_counter() - t0)}")
 
     usernames = [l["username"] for l in leads]
@@ -189,7 +195,7 @@ def main() -> None:
             avatar_url, user_id=uid_str, username=username,
         )
         if avatar_path:
-            avatar_faces = face_embedder.count_faces(avatar_path)
+            avatar_faces = avatar_embedder.count_faces(avatar_path)
             db.update_lead_avatar(username, avatar_path, avatar_faces)
             if avatar_faces == 1:
                 db.update_lead_face(username, avatar_path)
@@ -211,7 +217,7 @@ def main() -> None:
         t0 = time.perf_counter()
         result = resolve_face_leader(
             local_paths,
-            face_embedder,
+            post_embedder,
             min_cluster_size=fb_min_cluster,
             cluster_threshold=fb_threshold,
         )
@@ -252,7 +258,8 @@ def main() -> None:
             )
 
     total_time = time.perf_counter() - total_start
-    face_embedder.close()
+    avatar_embedder.close()
+    post_embedder.close()
 
     stats_after = db.get_stats()
 
