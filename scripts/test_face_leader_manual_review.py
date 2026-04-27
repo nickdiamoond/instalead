@@ -6,19 +6,20 @@ the last-N-posts face-leader algorithm on them — but instead of writing
 the decision back to the DB and deleting the candidate photos, it lays
 everything out on disk for eyeball verification.
 
-Per processed lead the script produces:
+Per processed lead the script produces a single self-contained folder:
 
     data/manual_review/<username>/
         _avatar.jpg   # the owner's current avatar (context)
+        _winner.jpg   # <-- the algorithm's chosen winner
         00.jpg        # candidate photo #1 from latestPosts
         01.jpg        # candidate photo #2
         ...           # all candidates are kept, nothing is deleted
-    data/manual_review/<username>.jpg   # <-- the algorithm's winner
 
-That layout lets you open a folder, see every photo the algorithm saw,
-and compare it against the single ``<username>.jpg`` file sitting next
-to the folder. If the winner file is missing, the algorithm returned
-"no unambiguous leader" for that lead.
+That layout lets you open a folder and see, side by side, every photo
+the algorithm saw, the current avatar for context, and ``_winner.jpg``
+— the candidate the algorithm picked (highest SCRFD det_score inside
+the largest cosine-similarity cluster). If ``_winner.jpg`` is missing,
+the algorithm returned "no unambiguous leader" for that lead.
 
 Side-effects:
   * Apify profile refetch (paid, ~$0.0023 per lead — confirmation prompt).
@@ -281,7 +282,7 @@ def main() -> None:
         winner_copy_path: Path | None = None
         if result:
             decisions["fallback_resolved"] += 1
-            winner_copy_path = REVIEW_DIR / f"{slug}.jpg"
+            winner_copy_path = lead_dir / "_winner.jpg"
             try:
                 shutil.copy2(result.photo_path, winner_copy_path)
             except OSError as e:
@@ -343,8 +344,9 @@ def main() -> None:
     print(f"  Download + resolve: {_fmt_s(total_time - refetch_time)}")
     print(f"Apify cost (actual):  ${apify_cost:.4f}")
     print(f"\nReview artifacts in:  {REVIEW_DIR.resolve()}")
-    print("  <username>/        folder with all candidate photos + _avatar.jpg")
-    print("  <username>.jpg     algorithm's chosen winner (missing = no leader)")
+    print("  <username>/_avatar.jpg   current avatar (context)")
+    print("  <username>/_winner.jpg   algorithm's chosen winner (missing = no leader)")
+    print("  <username>/00.jpg, ...   all candidate photos from latest posts")
 
     LOGS_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

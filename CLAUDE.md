@@ -15,15 +15,17 @@ Instagram lead checker for real estate buyers (SPB focus). The system collects I
 - Python 3.11+
 - Apify API — Instagram data via multiple actors (see below)
 - DeepSeek API (OpenAI-compatible) — relevance scoring of post captions
+- Nexara API (`/audio/transcriptions`) — Whisper-style transcription of
+ Reels audio when the caption is missing or DeepSeek-on-caption returns
+ `unknown`
 - structlog — logging
 - SQLite — deduplication, state, lead storage (`data/leads.db`)
 - Pipeline JSON logs — every API call logged to `logs/` for cost analysis
 - InsightFace + onnxruntime — SCRFD face detection + ArcFace 512-d
-  embeddings for same-person search (single detector across avatars and
-  post photos)
+ embeddings for same-person search (single detector across avatars and
+ post photos)
 
 Future (not yet implemented):
-- Yandex SpeechKit — audio transcription for reels with empty captions
 - Telethon — Telegram client (SearchGlobalRequest)
 - Aiogram — Telegram bot for notifications
 - replicate.com — avatar upscaling
@@ -49,9 +51,17 @@ Step 1: Fetch posts from tracked_realtors (batch, last 7 days)
         Skip posts already in DB, update comments_count for existing
         Filter: commentsCount >= 10
 
-Step 2: Score new posts via DeepSeek
-        Only posts with relevance=NULL
-        Output: relevant / irrelevant / unknown + CTA type
+Step 2: Score new posts via DeepSeek (with Nexara video fallback)
+ Only posts with relevance=NULL
+ First pass: run RELEVANCE_PROMPT on caption.
+ Fallback: if caption is empty OR DeepSeek returned `is_real_estate=null`,
+ AND the post has a fresh `videoUrl` from Step 1's in-memory pass,
+ download the video, transcribe via Nexara, then re-run
+ RELEVANCE_PROMPT on the transcript alone (caption is not combined).
+ IG video URLs are signed and expire in ~1-2 days, so transcription
+ only fires for posts fetched in the *current* run — `relevance IS NULL`
+ leftovers from older runs stay "unknown" until a fresh fetch.
+ Output: relevant / irrelevant / unknown + CTA type
 
 Step 3: Fetch comments (with cost confirmation prompt)
         Posts where: relevant + CTA=comment + (never scanned OR comments grew 5%+)
@@ -164,7 +174,7 @@ python scripts/test_face_leader.py --keep-photos
 ## Configuration
 
 - `config.yaml` — search parameters, Apify actor IDs, limits, filters
-- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`
+- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`
 - Realtor accounts stored in DB table `tracked_realtors` (not config)
 
 ## Key Source Files
@@ -174,6 +184,10 @@ python scripts/test_face_leader.py --keep-photos
 - `src/pipeline_logger.py` — JSON pipeline logs (every API call → `logs/*.json`)
 - `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
 - `src/avatar_downloader.py` — download avatar URL → `data/avatars/<user_id>.jpg`
+- `src/transcriber.py` — `NexaraTranscriber`: downloads IG videoUrl to a
+ temp file and POSTs it to Nexara `/audio/transcriptions`; degrades
+ gracefully when `NEXARA_API_KEY` is missing (returns `None`, pipeline
+ falls back to legacy `relevance="unknown"`)
 - `src/face_embedder.py` — InsightFace SCRFD + ArcFace wrapper: exposes
   both `count_faces()` (avatars) and `embed_faces()` (post-photo
   clustering), with a shared `min_det_score` threshold

@@ -33,6 +33,7 @@ from src.face_embedder import make_face_embedder
 from src.face_leader import resolve_face_leader
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
+from src.transcriber import NexaraTranscriber
 
 setup_logging()
 log = get_logger("pipeline")
@@ -135,6 +136,49 @@ def score_caption(client: OpenAI, caption: str) -> dict:
         return {"error": str(e)}
 
 
+def _apply_score(db: LeadDB, post_id: str, score: dict | None) -> str:
+    """Persist a DeepSeek score result. Returns the resolved relevance.
+
+    Centralizes the upsert mapping so step 2 can call it from any branch
+    (caption-only, transcript fallback, terminal-unknown).
+    """
+    if not score or "error" in score:
+        db.upsert_post(
+            post_id, relevance="unknown", has_cta=0, cta_type="none"
+        )
+        return "unknown"
+    has_cta = 1 if score.get("has_call_to_action") else 0
+    cta_type = score.get("call_to_action_type") or "none"
+    is_re = score.get("is_real_estate")
+    if is_re is None:
+        db.upsert_post(
+            post_id, relevance="unknown", has_cta=has_cta, cta_type=cta_type
+        )
+        return "unknown"
+    relevance = "relevant" if is_re else "irrelevant"
+    db.upsert_post(
+        post_id, relevance=relevance, has_cta=has_cta, cta_type=cta_type
+    )
+    return relevance
+
+
+def _score_via_transcript(
+    transcriber: NexaraTranscriber,
+    deepseek: OpenAI,
+    video_url: str,
+) -> dict | None:
+    """Transcribe a video URL and DeepSeek-score the resulting transcript.
+
+    Returns ``None`` if transcription itself failed (no key, download
+    error, Nexara non-2xx, empty body) — caller should treat as
+    "transcript fallback unavailable".
+    """
+    transcript = transcriber.transcribe(video_url)
+    if not transcript:
+        return None
+    return score_caption(deepseek, transcript)
+
+
 def main():
     load_dotenv()
     cfg = load_config()
@@ -145,6 +189,10 @@ def main():
     )
     db = LeadDB("data/leads.db")
     pipeline = PipelineLogger("logs", "pipeline")
+    transcriber = NexaraTranscriber(
+        os.environ.get("NEXARA_API_KEY"),
+        pipeline=pipeline,
+    )
 
     # Two SCRFD instances with different det_size:
     #   * avatar_embedder (320x320) for the avatar single-face check
@@ -195,6 +243,10 @@ def main():
     # Filter by min comments and register in DB
     new_posts = 0
     updated_posts = 0
+    # In-memory bridge to step 2: shortcode -> fresh IG videoUrl. Used by
+    # the transcription fallback. Stored only for the lifetime of this
+    # run because IG CDN URLs are signed and expire in ~1-2 days.
+    post_videos: dict[str, str] = {}
     for p in all_posts:
         shortcode = p.get("shortCode", "")
         comments_count = p.get("commentsCount") or 0
@@ -203,6 +255,10 @@ def main():
 
         is_reel = p.get("type") == "Video" or p.get("productType") == "clips"
         existing = db.get_post(shortcode)
+
+        video_url = p.get("videoUrl")
+        if shortcode and video_url:
+            post_videos[shortcode] = video_url
 
         if existing:
             # Update comments_count if changed
@@ -225,7 +281,7 @@ def main():
             new_posts += 1
 
     log.info("step1_done", total_posts=len(all_posts), new=new_posts, updated=updated_posts,
-             cost=detail.get("usageTotalUsd", 0))
+             videos=len(post_videos), cost=detail.get("usageTotalUsd", 0))
 
     # ============================================================
     # STEP 2: Score new posts via DeepSeek
@@ -236,28 +292,66 @@ def main():
         ).fetchall()
         unscored = [dict(r) for r in unscored]
 
-    log.info("step2_score_posts", count=len(unscored))
+    log.info(
+        "step2_score_posts", count=len(unscored), with_videos=len(post_videos)
+    )
+
+    transcribed = 0
+    transcribe_failed = 0
+    rescored_via_transcript = 0
 
     for p in unscored:
+        post_id = p["post_id"]
         caption = p.get("caption")
+        video_url = post_videos.get(post_id)
+
         if caption_is_empty(caption):
-            db.upsert_post(p["post_id"], relevance="unknown", has_cta=0, cta_type="none")
+            # No caption to analyze. Try the video transcript first.
+            if video_url:
+                t_score = _score_via_transcript(transcriber, deepseek, video_url)
+                if t_score is not None:
+                    transcribed += 1
+                    relevance = _apply_score(db, post_id, t_score)
+                    if relevance != "unknown":
+                        rescored_via_transcript += 1
+                    continue
+                transcribe_failed += 1
+            # No fresh video URL or transcribe failed -> legacy unknown.
+            _apply_score(db, post_id, None)
             continue
 
-        score = score_caption(deepseek, caption)
-        if "error" in score:
-            db.upsert_post(p["post_id"], relevance="unknown", has_cta=0, cta_type="none")
-        elif score.get("is_real_estate") is None:
-            db.upsert_post(p["post_id"], relevance="unknown",
-                           has_cta=1 if score.get("has_call_to_action") else 0,
-                           cta_type=score.get("call_to_action_type", "none"))
-        else:
-            relevance = "relevant" if score["is_real_estate"] else "irrelevant"
-            db.upsert_post(p["post_id"], relevance=relevance,
-                           has_cta=1 if score.get("has_call_to_action") else 0,
-                           cta_type=score.get("call_to_action_type", "none"))
+        # Caption present — score it first.
+        caption_score = score_caption(deepseek, caption)
+        caption_unknown = (
+            "error" in caption_score
+            or caption_score.get("is_real_estate") is None
+        )
+        if not caption_unknown:
+            _apply_score(db, post_id, caption_score)
+            continue
 
-    log.info("step2_done", scored=len(unscored))
+        # Caption analysis returned nothing — try transcript fallback.
+        if video_url:
+            t_score = _score_via_transcript(transcriber, deepseek, video_url)
+            if t_score is not None:
+                transcribed += 1
+                relevance = _apply_score(db, post_id, t_score)
+                if relevance != "unknown":
+                    rescored_via_transcript += 1
+                continue
+            transcribe_failed += 1
+
+        # Final fallback: persist the caption-based unknown (keeps any CTA
+        # info DeepSeek did manage to extract).
+        _apply_score(db, post_id, caption_score)
+
+    log.info(
+        "step2_done",
+        scored=len(unscored),
+        transcribed=transcribed,
+        transcribe_failed=transcribe_failed,
+        rescored_via_transcript=rescored_via_transcript,
+    )
 
     # ============================================================
     # STEP 3: Fetch comments
