@@ -37,9 +37,26 @@ Future (not yet implemented):
 | `apify/instagram-profile-scraper` | Profile info, relatedProfiles, latestPosts | ~$0.0023/profile |
 | `apify/instagram-post-scraper` | Posts/reels from accounts (batch, date filter) | ~$0.0017/post |
 | `apify/instagram-hashtag-scraper` | Posts/reels by hashtag | ~$0.0023/post |
-| `louisdeconinck/instagram-comments-scraper` | Comments for posts (best pagination) | ~$0.50/1K comments |
+| `louisdeconinck/instagram-comments-scraper` | Comments for posts (Step 3 primary) | ~$1/1K comments |
+| `apidojo/instagram-comments-scraper-api` | Comments for posts (Step 3 fallback) | $0.0075/post + $0.0005/comment (15 free per post) |
 
-**Important:** `louisdeconinck` is the preferred comment scraper — other actors (`apidojo/*`, `apify/*`) have severe pagination/dedup issues. `media_id` from comments loses precision (JS float64) — use shortcode fuzzy matching (±1000 tolerance).
+**Comment scraper preference:** `louisdeconinck` is the **primary** because its
+snake_case Instagram-raw schema (`user.full_name`, `is_private`, `created_at_utc`,
+`media_id`) maps 1:1 to `lead_accounts` columns and to `apify/instagram-profile-scraper`
+(Step 4) — no field remapping needed downstream. `media_id` from louisdeconinck
+loses precision (JS float64), so the pipeline matches it back to `processed_posts.shortcode`
+via `shortcode_to_id()` with a ±1000 tolerance window.
+
+`apidojo/instagram-comments-scraper-api` is the **fallback** that fires when the
+primary returns 0 items per URL with `status=SUCCEEDED` (a recent failure mode).
+Its camelCase output (`message`, `createdAt`, `userId`, `user.fullName`, ...) is
+remapped to louisdeconinck's shape via `src.comment_normalizer.normalize_apidojo_api`
+before saving, so the rest of Step 3 is actor-agnostic. Apidojo also exposes
+`postId` directly (= shortcode), so the synthesized `media_id` is exact and the
+fuzzy match is a no-op for fallback items. Other historical alternatives
+(`apify/instagram-comment-scraper`, `apidojo/instagram-comments-scraper` w/o
+`-api` suffix) had pagination / dedup issues — see `scripts/test_comment_scrapers.py`
+for the side-by-side comparison harness used to vet them.
 
 ## Pipeline Architecture
 
@@ -65,8 +82,19 @@ Step 2: Score new posts via DeepSeek (with Nexara video fallback)
 
 Step 3: Fetch comments (with cost confirmation prompt)
         Posts where: relevant + CTA=comment + (never scanned OR comments grew 5%+)
-        Actor: louisdeconinck/instagram-comments-scraper
-        Dedup leads by user_id (not username — usernames can change)
+        Primary actor:  louisdeconinck/instagram-comments-scraper
+        Fallback actor: apidojo/instagram-comments-scraper-api
+            -- triggers automatically when the primary returns 0 items
+               for the entire batch (with status=SUCCEEDED). Apidojo's
+               camelCase output is normalized to louisdeconinck's shape
+               via src.comment_normalizer.normalize_apidojo_api, so the
+               dedup / save loop stays agnostic to the source actor.
+            -- if BOTH primary and fallback return empty, posts stay
+               unscanned in the queue (don't mark last_scanned_at) so
+               the next pipeline run retries them.
+        Actor IDs are configurable via apify.actors.comments_primary /
+        apify.actors.comments_fallback in config.yaml.
+        Dedup leads by user_id (not username -- usernames can change)
 
 Step 4: Fetch profiles for new leads (batches of 50)
         Extract contacts from bio (phone, telegram, whatsapp, email)
@@ -155,6 +183,8 @@ python scripts/test_score_posts.py         # Score posts via DeepSeek
 python scripts/test_fetch_comments.py      # Fetch comments for relevant posts
 python scripts/test_fetch_profiles.py      # Fetch lead profiles + extract contacts
 python scripts/test_cost_analysis.py       # Analyze costs from pipeline logs
+python scripts/test_comment_scrapers.py    # Side-by-side compare comment scrapers (interactive picker)
+python scripts/reset_failed_scans.py --apply  # Recover posts marked scanned but with 0 leads
 
 # Backfill avatars + face detection for existing leads
 python scripts/backfill_avatars.py              # refetch profiles (Apify $$)
@@ -183,6 +213,12 @@ python scripts/test_face_leader.py --keep-photos
 - `src/apify_client_wrapper.py` — Apify wrapper with logging and cost tracking
 - `src/pipeline_logger.py` — JSON pipeline logs (every API call → `logs/*.json`)
 - `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
+- `src/comment_normalizer.py` — `normalize_apidojo_api()` remaps the
+  apidojo-api fallback's camelCase output (`message`, `createdAt`,
+  `userId`, `user.fullName`, ...) to louisdeconinck's snake_case shape
+  so Step 3's dedup / save loop is actor-agnostic. Also synthesizes
+  `media_id` from `postId` so the existing shortcode fuzzy lookup
+  matches without code changes.
 - `src/avatar_downloader.py` — download avatar URL → `data/avatars/<user_id>.jpg`
 - `src/transcriber.py` — `NexaraTranscriber`: downloads IG videoUrl to a
  temp file and POSTs it to Nexara `/audio/transcriptions`; degrades

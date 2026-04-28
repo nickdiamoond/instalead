@@ -5,7 +5,25 @@ apify:
 
   actors:
     universal: "apify/instagram-scraper"       # поиск юзеров, посты по directUrls
-    comments: "apify/instagram-comment-scraper" # комментарии к посту/рилсу
+    # ``comments`` is the legacy actor used by ``src.apify_client_wrapper``
+    # ``ApifyWrapper.get_comments()`` and the ad-hoc test scripts. It points
+    # at the official ``apify/instagram-comment-scraper`` (small/medium runs).
+    # The daily pipeline (``scripts/pipeline.py``) does NOT read this field --
+    # it uses ``comments_primary`` / ``comments_fallback`` below to enable
+    # the louisdeconinck -> apidojo-api fallback path. Keep ``comments``
+    # so existing dev tooling stays working.
+    comments: "apify/instagram-comment-scraper"
+    # Step 3 primary: louisdeconinck mirrors Instagram's snake_case raw
+    # schema (``user.full_name``, ``is_private``, ``created_at_utc``, ...)
+    # which maps 1:1 to ``lead_accounts`` columns and to the
+    # ``apify/instagram-profile-scraper`` output used in Step 4.
+    comments_primary: "louisdeconinck/instagram-comments-scraper"
+    # Step 3 fallback: triggers when the primary returns 0 items per URL
+    # with status=SUCCEEDED (a recent failure mode). apidojo-api emits
+    # camelCase output that the pipeline normalizes via
+    # ``src.comment_normalizer.normalize_apidojo_api`` so downstream code
+    # stays oblivious to which actor produced the data.
+    comments_fallback: "apidojo/instagram-comments-scraper-api"
     profile: "apify/instagram-profile-scraper"  # инфо профиля (аватарка, bio)
     hashtag: "apify/instagram-hashtag-scraper"  # посты/рилсы по хештегу
     posts: "apify/instagram-post-scraper"       # посты конкретного аккаунта
