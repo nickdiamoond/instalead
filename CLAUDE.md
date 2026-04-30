@@ -47,16 +47,40 @@ snake_case Instagram-raw schema (`user.full_name`, `is_private`, `created_at_utc
 loses precision (JS float64), so the pipeline matches it back to `processed_posts.shortcode`
 via `shortcode_to_id()` with a ±1000 tolerance window.
 
+**louisdeconinck input contract (mandatory fields):** the actor silently
+returns `0 items` with `status=SUCCEEDED` if its `run_input` is missing
+either of these — bisected via `scripts/test_comment_scrapers.py`:
+
+* `proxy: { useApifyProxy: true }` — without it, requests go from raw
+  Apify infra IPs and Instagram blocks them within seconds.
+* `resultsLimit` + `maxComments` — the actor refuses to commit to a run
+  without a per-post comment cap. The pipeline passes
+  `LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000`. Actor returns only
+  comments that actually exist on the post, so a higher cap does NOT
+  raise our bill -- it just protects against truncating the tail on
+  a viral post. Current peak in DB is `~2200` (avg `~130`), so this
+  gives ~5x headroom without any cost downside.
+
+Both fields are applied **only on the primary call** in
+`_fetch_comments_with_fallback`. The fallback (`apidojo-api`) does not
+need them and intentionally keeps an uncapped shape.
+
 `apidojo/instagram-comments-scraper-api` is the **fallback** that fires when the
-primary returns 0 items per URL with `status=SUCCEEDED` (a recent failure mode).
-Its camelCase output (`message`, `createdAt`, `userId`, `user.fullName`, ...) is
-remapped to louisdeconinck's shape via `src.comment_normalizer.normalize_apidojo_api`
-before saving, so the rest of Step 3 is actor-agnostic. Apidojo also exposes
-`postId` directly (= shortcode), so the synthesized `media_id` is exact and the
-fuzzy match is a no-op for fallback items. Other historical alternatives
-(`apify/instagram-comment-scraper`, `apidojo/instagram-comments-scraper` w/o
-`-api` suffix) had pagination / dedup issues — see `scripts/test_comment_scrapers.py`
-for the side-by-side comparison harness used to vet them.
+primary returns 0 items per URL with `status=SUCCEEDED` (the historical failure
+mode -- now rare since we honor the input contract above, but kept as a safety
+net). Its camelCase output (`message`, `createdAt`, `userId`, `user.fullName`,
+...) is remapped to louisdeconinck's shape via
+`src.comment_normalizer.normalize_apidojo_api` before saving, so the rest of
+Step 3 is actor-agnostic. Apidojo also exposes `postId` directly (= shortcode),
+so the synthesized `media_id` is exact and the fuzzy match is a no-op for
+fallback items. Other historical alternatives (`apify/instagram-comment-scraper`,
+`apidojo/instagram-comments-scraper` w/o `-api` suffix) had pagination / dedup
+issues — see `scripts/test_comment_scrapers.py` for the side-by-side comparison
+harness used to vet them. The harness includes a `HARDCODE_OVERRIDES` dict at
+the top of the file with named bisection recipes (`mimic-pipeline`, per-rail
+toggles for `proxy` / `input_limit` / SDK `max_items` / SDK `timeout_secs`,
+batch-vs-per-url) so future regressions can be reproduced without editing the
+test code -- just swap the dict.
 
 ## Pipeline Architecture
 
@@ -85,12 +109,20 @@ Step 2: Score new posts via DeepSeek (caption + transcript combined)
 Step 3: Fetch comments (with cost confirmation prompt)
         Posts where: relevant + CTA=comment + (never scanned OR comments grew 5%+)
         Primary actor:  louisdeconinck/instagram-comments-scraper
+            -- run_input MUST include proxy: useApifyProxy AND
+               resultsLimit/maxComments=LOUISDECONINCK_COMMENTS_CAP_PER_POST
+               (=10_000). Either field missing -> actor returns 0 items
+               with status=SUCCEEDED. See "louisdeconinck input contract"
+               above for the bisection.
         Fallback actor: apidojo/instagram-comments-scraper-api
             -- triggers automatically when the primary returns 0 items
                for the entire batch (with status=SUCCEEDED). Apidojo's
                camelCase output is normalized to louisdeconinck's shape
                via src.comment_normalizer.normalize_apidojo_api, so the
                dedup / save loop stays agnostic to the source actor.
+            -- the fallback is kept as a safety net even though the
+               primary's known failure mode is now blocked by the
+               mandatory input fields above.
             -- if BOTH primary and fallback return empty, posts stay
                unscanned in the queue (don't mark last_scanned_at) so
                the next pipeline run retries them.

@@ -60,6 +60,20 @@ COST_PER_COMMENT = 0.0005
 DEFAULT_COMMENTS_PRIMARY_ACTOR = "louisdeconinck/instagram-comments-scraper"
 DEFAULT_COMMENTS_FALLBACK_ACTOR = "apidojo/instagram-comments-scraper-api"
 
+# louisdeconinck silently returns 0 items with status=SUCCEEDED if its
+# input is missing a per-post comment cap -- bisected via
+# ``scripts/test_comment_scrapers.py`` (recipe 1 -> recipe 3). The
+# fallback (apidojo-api) has no such requirement and is left alone.
+#
+# 10_000 is a *ceiling*, not a target: the actor returns only
+# comments that actually exist on the post, so a higher cap doesn't
+# raise our bill -- it just protects against losing the tail on a
+# viral post. Max ``comments_count`` observed in our DB is ~2_200
+# (avg ~130), so 10_000 leaves ~5x headroom for unexpected spikes.
+# The cap is applied on the primary's call only -- see
+# ``_fetch_comments_with_fallback``.
+LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000
+
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 RELEVANCE_PROMPT = """\
@@ -270,12 +284,35 @@ def _fetch_comments_with_fallback(
     constants) so ``main()`` can override them from ``config.yaml``
     without touching this function.
     """
+    # Two louisdeconinck-specific guardrails baked into the primary
+    # call -- both bisected via ``scripts/test_comment_scrapers.py``:
+    #
+    # * ``proxy: useApifyProxy`` keeps Apify infra IPs off Instagram's
+    #   block list. Without it the actor finishes ~9s with 0 items.
+    #
+    # * ``resultsLimit`` + ``maxComments`` are MANDATORY for this
+    #   actor: omitting them is the actual reason Step 3 has been
+    #   silently returning 0 items even with proxy on (recipe 3
+    #   confirmed it -- the cap is what makes the actor commit
+    #   instead of bailing out). The fallback (apidojo-api) does
+    #   NOT need this and intentionally keeps its uncapped shape.
+    #   ``LOUISDECONINCK_COMMENTS_CAP_PER_POST`` is set well above
+    #   any per-post comment count we've ever seen, so it acts as
+    #   a safety ceiling rather than a real cap.
     primary_items, primary_cost, primary_run = _run_apify_actor(
         apify,
         pipeline,
         primary_actor,
-        run_input={"urls": urls},
-        log_input={"urls_count": len(urls)},
+        run_input={
+            "urls": urls,
+            "proxy": {"useApifyProxy": True},
+            "resultsLimit": LOUISDECONINCK_COMMENTS_CAP_PER_POST,
+            "maxComments": LOUISDECONINCK_COMMENTS_CAP_PER_POST,
+        },
+        log_input={
+            "urls_count": len(urls),
+            "results_limit": LOUISDECONINCK_COMMENTS_CAP_PER_POST,
+        },
     )
     debug = {
         "primary_actor": primary_actor,
@@ -304,8 +341,14 @@ def _fetch_comments_with_fallback(
         fallback_actor,
         # apidojo-api takes ``startUrls`` (flat string array) + ``maxItems``.
         # Omitting maxItems lets it fetch every comment, matching the
-        # primary's "no per-post cap" behavior.
-        run_input={"startUrls": urls},
+        # primary's "no per-post cap" behavior. ``proxy: useApifyProxy``
+        # is harmless if the actor's input schema doesn't declare it
+        # (Apify silently drops unknown fields) and matches the rest of
+        # the pipeline's Apify calls -- see the primary above.
+        run_input={
+            "startUrls": urls,
+            "proxy": {"useApifyProxy": True},
+        },
         log_input={"startUrls_count": len(urls), "fallback": True},
     )
     debug.update(
