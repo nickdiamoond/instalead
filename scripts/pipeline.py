@@ -178,21 +178,19 @@ def _apply_score(db: LeadDB, post_id: str, score: dict | None) -> str:
     return relevance
 
 
-def _score_via_transcript(
-    transcriber: NexaraTranscriber,
-    deepseek: OpenAI,
-    video_url: str,
-) -> dict | None:
-    """Transcribe a video URL and DeepSeek-score the resulting transcript.
+def _build_scoring_text(caption: str | None, transcript: str | None) -> str:
+    """Concatenate caption and video transcript into a single payload.
 
-    Returns ``None`` if transcription itself failed (no key, download
-    error, Nexara non-2xx, empty body) — caller should treat as
-    "transcript fallback unavailable".
+    Order is fixed: caption first, transcript second, separated by a
+    blank line. Either part may be missing. The result is what gets
+    sent to ``RELEVANCE_PROMPT``.
     """
-    transcript = transcriber.transcribe(video_url)
-    if not transcript:
-        return None
-    return score_caption(deepseek, transcript)
+    parts: list[str] = []
+    if caption and caption.strip():
+        parts.append(caption.strip())
+    if transcript and transcript.strip():
+        parts.append(transcript.strip())
+    return "\n\n".join(parts)
 
 
 def _banner(title: str, char: str = "=") -> None:
@@ -472,9 +470,9 @@ def main():
         issues.append(("Step 1", "post-scraper returned 0 items"))
 
     # ============================================================
-    # STEP 2: Score new posts via DeepSeek
+    # STEP 2: Score new posts via DeepSeek (caption + transcript)
     # ============================================================
-    _banner("STEP 2: Score new posts (DeepSeek + Nexara fallback)")
+    _banner("STEP 2: Score new posts (DeepSeek over caption + transcript)")
     with db._conn() as conn:
         unscored = conn.execute(
             "SELECT post_id, caption FROM processed_posts WHERE relevance IS NULL"
@@ -489,64 +487,51 @@ def main():
 
     transcribed = 0
     transcribe_failed = 0
-    rescored_via_transcript = 0
+    empty_skipped = 0
 
     for p in unscored:
         post_id = p["post_id"]
         caption = p.get("caption")
         video_url = post_videos.get(post_id)
 
-        if caption_is_empty(caption):
-            # No caption to analyze. Try the video transcript first.
-            if video_url:
-                t_score = _score_via_transcript(transcriber, deepseek, video_url)
-                if t_score is not None:
-                    transcribed += 1
-                    relevance = _apply_score(db, post_id, t_score)
-                    if relevance != "unknown":
-                        rescored_via_transcript += 1
-                    continue
+        # Always transcribe when a fresh videoUrl is available -- the
+        # transcript is concatenated with the caption (caption first,
+        # transcript second) and the combined payload is scored in a
+        # single DeepSeek call. IG videoUrls are signed and expire in
+        # ~1-2 days, so transcription only fires for posts pulled in
+        # the *current* run; older ``relevance IS NULL`` leftovers
+        # fall back to caption-only scoring on subsequent runs.
+        transcript: str | None = None
+        if video_url:
+            transcript = transcriber.transcribe(video_url)
+            if transcript:
+                transcribed += 1
+            else:
                 transcribe_failed += 1
-            # No fresh video URL or transcribe failed -> legacy unknown.
+
+        combined = _build_scoring_text(caption, transcript)
+
+        # Nothing meaningful to send to DeepSeek (no caption / just
+        # hashtags AND no usable transcript) -> mark unknown without
+        # spending a DeepSeek call.
+        if caption_is_empty(combined):
+            empty_skipped += 1
             _apply_score(db, post_id, None)
             continue
 
-        # Caption present — score it first.
-        caption_score = score_caption(deepseek, caption)
-        caption_unknown = (
-            "error" in caption_score
-            or caption_score.get("is_real_estate") is None
-        )
-        if not caption_unknown:
-            _apply_score(db, post_id, caption_score)
-            continue
-
-        # Caption analysis returned nothing — try transcript fallback.
-        if video_url:
-            t_score = _score_via_transcript(transcriber, deepseek, video_url)
-            if t_score is not None:
-                transcribed += 1
-                relevance = _apply_score(db, post_id, t_score)
-                if relevance != "unknown":
-                    rescored_via_transcript += 1
-                continue
-            transcribe_failed += 1
-
-        # Final fallback: persist the caption-based unknown (keeps any CTA
-        # info DeepSeek did manage to extract).
-        _apply_score(db, post_id, caption_score)
+        _apply_score(db, post_id, score_caption(deepseek, combined))
 
     log.info(
         "step2_done",
         scored=len(unscored),
         transcribed=transcribed,
         transcribe_failed=transcribe_failed,
-        rescored_via_transcript=rescored_via_transcript,
+        empty_skipped=empty_skipped,
     )
     print(f"  DONE: scored {len(unscored)} "
           f"(transcribed={transcribed}, "
           f"transcribe_failed={transcribe_failed}, "
-          f"rescored_via_transcript={rescored_via_transcript})")
+          f"empty_skipped={empty_skipped})")
     if transcribe_failed and transcribe_failed > transcribed:
         issues.append((
             "Step 2",

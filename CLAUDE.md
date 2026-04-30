@@ -68,16 +68,18 @@ Step 1: Fetch posts from tracked_realtors (batch, last 7 days)
         Skip posts already in DB, update comments_count for existing
         Filter: commentsCount >= 10
 
-Step 2: Score new posts via DeepSeek (with Nexara video fallback)
- Only posts with relevance=NULL
- First pass: run RELEVANCE_PROMPT on caption.
- Fallback: if caption is empty OR DeepSeek returned `is_real_estate=null`,
- AND the post has a fresh `videoUrl` from Step 1's in-memory pass,
- download the video, transcribe via Nexara, then re-run
- RELEVANCE_PROMPT on the transcript alone (caption is not combined).
+Step 2: Score new posts via DeepSeek (caption + transcript combined)
+ Only posts with relevance=NULL.
+ If the post has a fresh `videoUrl` from Step 1's in-memory pass,
+ always download the video and transcribe it via Nexara (no
+ caption-based gating). The pipeline then concatenates the two
+ strings -- caption first, transcript second, separated by a
+ blank line -- and runs RELEVANCE_PROMPT on the combined payload
+ in a single DeepSeek call.
  IG video URLs are signed and expire in ~1-2 days, so transcription
- only fires for posts fetched in the *current* run — `relevance IS NULL`
- leftovers from older runs stay "unknown" until a fresh fetch.
+ only fires for posts fetched in the *current* run. Older
+ `relevance IS NULL` leftovers fall back to caption-only scoring
+ on subsequent runs (or "unknown" if the caption is too short).
  Output: relevant / irrelevant / unknown + CTA type
 
 Step 3: Fetch comments (with cost confirmation prompt)
