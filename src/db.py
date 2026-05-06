@@ -76,6 +76,19 @@ class LeadDB:
                     telegram_username   TEXT,
                     whatsapp            TEXT,
 
+                    -- Sherlock (Module 2): Step 5 resolves Telegram
+                    -- contacts for leads whose bio gave us nothing.
+                    -- Found phone / telegram_username are written into
+                    -- the existing contact columns above; sherlock_link
+                    -- is the URL of the matched profile (vk.com/...,
+                    -- t.me/...). sherlock_processed_at gates retries
+                    -- (NULL = never tried; selector key for Step 5).
+                    -- sherlock_status records the outcome label so we
+                    -- can debug coverage without re-running.
+                    sherlock_link           TEXT,
+                    sherlock_processed_at   TEXT,
+                    sherlock_status         TEXT,
+
                     -- processing state
                     profile_fetched     INTEGER DEFAULT 0,
                     contact_found       INTEGER DEFAULT 0,
@@ -138,6 +151,12 @@ class LeadDB:
                 ("avatar_path", "TEXT"),
                 ("faces_count", "INTEGER"),
                 ("face_photo_path", "TEXT"),
+                # Module 2 / Step 5 (Sherlock contact resolution).
+                # See the CREATE TABLE block above for the meaning;
+                # listed here so existing DBs pick them up via ALTER.
+                ("sherlock_link", "TEXT"),
+                ("sherlock_processed_at", "TEXT"),
+                ("sherlock_status", "TEXT"),
             ],
         }
         for table, columns in required.items():
@@ -303,14 +322,177 @@ class LeadDB:
                 (face_photo_path, username),
             )
 
+    # --- Sherlock (Step 5) -----------------------------------------
+
+    def get_leads_for_sherlock(self, limit: int = 10000) -> list[dict]:
+        """Leads that need Sherlock-based contact resolution.
+
+        Selection rules (per Step 5 spec):
+          * profile_fetched=1 -- we have at least the bare profile data
+            (Step 4 ran for them).
+          * phone IS NULL AND telegram_username IS NULL -- the bio
+            extractor in Step 4 found no contact. If we already have
+            *any* contact from bio, Sherlock is skipped to save bot
+            quota and avoid overwriting cheaper / equally-valid data.
+          * sherlock_processed_at IS NULL -- we never tried Sherlock
+            on this lead before. Step 5 marks every terminal outcome
+            (found / no_match / no_face_photo / error) so leads aren't
+            silently retried; clear this column manually to re-process.
+          * is_private != 1 -- private accounts have no useful avatar
+            and no public bio, Sherlock can't help.
+
+        Returns rows with ``username``, ``user_id``, ``full_name`` and
+        ``face_photo_path`` -- everything Step 5 needs to decide nick
+        vs photo path without a second SELECT.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT username, user_id, full_name, face_photo_path "
+                "FROM lead_accounts "
+                "WHERE profile_fetched = 1 "
+                "  AND phone IS NULL "
+                "  AND telegram_username IS NULL "
+                "  AND sherlock_processed_at IS NULL "
+                "  AND COALESCE(is_private, 0) = 0 "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_lead_sherlock(
+        self,
+        username: str,
+        *,
+        status: str,
+        telegram_username: str | None = None,
+        phone: str | None = None,
+        sherlock_link: str | None = None,
+    ) -> None:
+        """Record the outcome of a Sherlock pass for one lead.
+
+        Always sets ``sherlock_processed_at = now`` and
+        ``sherlock_status = status`` so the lead is excluded from the
+        next ``get_leads_for_sherlock()`` window. When Sherlock did
+        find data, the contact fields (``telegram_username`` /
+        ``phone``) are filled in *only if currently NULL* -- this
+        preserves the invariant from
+        :py:meth:`get_leads_for_sherlock` (Sherlock never overwrites
+        bio data) and keeps the function safe to call even if some
+        other code path raced and filled the column.
+
+        ``status`` is the free-form label produced by Step 5
+        (e.g. ``"found_nick"`` / ``"found_photo"`` / ``"no_match"`` /
+        ``"no_face_photo"`` / ``"error"``). It's not enum-validated
+        here because Step 5 owns the vocabulary.
+        """
+        sets: list[str] = [
+            "sherlock_processed_at = ?",
+            "sherlock_status = ?",
+        ]
+        vals: list = [_now(), status]
+
+        if telegram_username:
+            sets.append(
+                "telegram_username = COALESCE(telegram_username, ?)"
+            )
+            vals.append(telegram_username)
+        if phone:
+            sets.append("phone = COALESCE(phone, ?)")
+            vals.append(phone)
+        if sherlock_link:
+            sets.append("sherlock_link = ?")
+            vals.append(sherlock_link)
+
+        # contact_found is the global "did we get any contact?" flag
+        # used by ``get_stats`` and downstream consumers. Flip it to 1
+        # whenever Sherlock contributed something usable so the stats
+        # banner reflects reality without a separate counter.
+        if telegram_username or phone:
+            sets.append("contact_found = 1")
+            sets.append("contact_found_at = COALESCE(contact_found_at, ?)")
+            vals.append(_now())
+
+        vals.append(username)
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE lead_accounts SET {', '.join(sets)} "
+                f"WHERE username = ?",
+                vals,
+            )
+
+    def get_leads_with_spent_photos(self, limit: int = 10000) -> list[dict]:
+        """Leads whose face assets are no longer needed and can be deleted.
+
+        Step 6 of the pipeline calls this to find leads where:
+          * Sherlock has finished (``sherlock_processed_at IS NOT NULL``).
+          * Outcome was NOT ``error`` -- those keep their photos so a
+            retry (after manually clearing ``sherlock_processed_at``)
+            doesn't have to re-pay Apify for Step 4.
+          * At least one of ``avatar_path`` / ``face_photo_path`` still
+            points at a file. The presence-OR clause is also what makes
+            this query self-terminating: once Step 6 NULLs both columns,
+            the lead is excluded next run.
+
+        Returns the columns Step 6 needs to delete files and clear DB
+        state in a single pass:
+          ``username``, ``user_id``, ``avatar_path``, ``face_photo_path``.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT username, user_id, avatar_path, face_photo_path "
+                "FROM lead_accounts "
+                "WHERE sherlock_processed_at IS NOT NULL "
+                "  AND COALESCE(sherlock_status, '') != 'error' "
+                "  AND (avatar_path IS NOT NULL OR face_photo_path IS NOT NULL) "
+                "LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_lead_photos_cleaned(self, username: str) -> None:
+        """NULL out ``avatar_path`` and ``face_photo_path`` for a lead.
+
+        Called by Step 6 after the on-disk files were unlinked. Keeps
+        ``faces_count`` intact -- it's an analytical signal (how many
+        faces we saw on this lead's avatar), not a path. Keeps every
+        Sherlock column intact -- the lead's terminal status / link /
+        timestamp are part of its permanent contact history.
+
+        Note: there's no dedicated ``photos_cleaned_at`` column.
+        Cleaned-vs-not is implicit: ``sherlock_processed_at IS NOT NULL
+        AND avatar_path IS NULL AND face_photo_path IS NULL`` means the
+        lead was cleaned; the four face-detection queries
+        (:py:meth:`get_leads_needing_avatar` &c) gate on
+        ``sherlock_processed_at IS NULL`` so cleaned leads aren't
+        re-fetched by ``backfill_avatars.py`` / dev test scripts.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE lead_accounts "
+                "SET avatar_path = NULL, face_photo_path = NULL "
+                "WHERE username = ?",
+                (username,),
+            )
+
     def get_leads_needing_avatar(self, limit: int = 1000) -> list[dict]:
-        """Leads that have profile data but no avatar processed yet."""
+        """Leads that have profile data but no avatar processed yet.
+
+        Excludes leads Sherlock has already processed (terminal status set).
+        Step 6 of the pipeline NULLs out ``avatar_path`` after Sherlock
+        finishes (except for ``error`` outcomes), so without this gate
+        ``backfill_avatars.py`` would re-fetch every cleaned lead via
+        Apify -- direct money loss. The retry path "clear
+        sherlock_processed_at to re-process" is documented on
+        :py:meth:`get_leads_for_sherlock` and naturally re-admits the
+        lead here once it's cleared.
+        """
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT username, user_id, profile_pic_url_hd, profile_pic_url "
                 "FROM lead_accounts "
                 "WHERE profile_fetched = 1 "
                 "  AND avatar_path IS NULL "
+                "  AND sherlock_processed_at IS NULL "
                 "  AND COALESCE(is_private, 0) = 0 "
                 "LIMIT ?",
                 (limit,),
@@ -332,6 +514,11 @@ class LeadDB:
         Candidates for the last-N-posts fallback. Skips private profiles and
         rows without stored ``latest_media_urls`` (we'd have nothing to probe
         anyway — a fresh Apify refetch is needed, which the dev script does).
+
+        Excludes Sherlock-processed leads -- same reasoning as
+        :py:meth:`get_leads_needing_avatar`. Step 6's cleanup may have
+        wiped ``face_photo_path``; re-running fallback for them
+        without re-running Step 5 is a money-burn loop.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -341,6 +528,7 @@ class LeadDB:
                 "WHERE profile_fetched = 1 "
                 "  AND faces_count IS NOT NULL AND faces_count != 1 "
                 "  AND face_photo_path IS NULL "
+                "  AND sherlock_processed_at IS NULL "
                 "  AND COALESCE(is_private, 0) = 0 "
                 "LIMIT ?",
                 (limit,),
@@ -352,6 +540,11 @@ class LeadDB:
 
         Useful for re-running detection with tweaked parameters or a new
         model without touching leads that already look clean.
+
+        Skips Sherlock-processed leads: their face assets may have been
+        wiped by Step 6, and re-detection on them would either find
+        nothing (cleaned) or duplicate work that no longer feeds Step 5.
+        Clear ``sherlock_processed_at`` manually to re-admit a lead.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -359,6 +552,7 @@ class LeadDB:
                 "       profile_pic_url, faces_count "
                 "FROM lead_accounts "
                 "WHERE faces_count IS NOT NULL AND faces_count != 1 "
+                "  AND sherlock_processed_at IS NULL "
                 "  AND COALESCE(is_private, 0) = 0 "
                 "LIMIT ?",
                 (limit,),
@@ -377,7 +571,14 @@ class LeadDB:
         stored ``faces_count`` should be overwritten with the new
         detector's verdict.
 
-        Excludes private accounts (their avatars aren't accessible).
+        Excludes private accounts (their avatars aren't accessible)
+        AND Sherlock-processed leads. The latter is for the same
+        reason as :py:meth:`get_leads_needing_avatar`: Step 6 may
+        have wiped their avatars, so wholesale re-detection would
+        re-trigger Apify downloads on leads we deliberately cleaned.
+        Clear ``sherlock_processed_at`` first if you really want to
+        include them.
+
         ``faces_count`` and ``avatar_path`` are returned so callers can
         log before/after diffs.
         """
@@ -387,6 +588,7 @@ class LeadDB:
                 "       profile_pic_url, faces_count, avatar_path "
                 "FROM lead_accounts "
                 "WHERE profile_fetched = 1 "
+                "  AND sherlock_processed_at IS NULL "
                 "  AND COALESCE(is_private, 0) = 0 "
                 "LIMIT ?",
                 (limit,),

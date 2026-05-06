@@ -55,11 +55,13 @@ either of these — bisected via `scripts/test_comment_scrapers.py`:
   Apify infra IPs and Instagram blocks them within seconds.
 * `resultsLimit` + `maxComments` — the actor refuses to commit to a run
   without a per-post comment cap. The pipeline passes
-  `LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000`. Actor returns only
-  comments that actually exist on the post, so a higher cap does NOT
-  raise our bill -- it just protects against truncating the tail on
-  a viral post. Current peak in DB is `~2200` (avg `~130`), so this
-  gives ~5x headroom without any cost downside.
+  `pipeline.step3.louisdeconinck_comments_cap_per_post` from
+  `config.yaml` (default `10_000` via `DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST`).
+  Actor returns only comments that actually exist on the post, so a
+  higher cap does NOT raise our bill -- it just protects against
+  truncating the tail on a viral post. Current peak in DB is `~2200`
+  (avg `~130`), so the default gives ~5x headroom without any cost
+  downside.
 
 Both fields are applied **only on the primary call** in
 `_fetch_comments_with_fallback`. The fallback (`apidojo-api`) does not
@@ -107,13 +109,15 @@ Step 2: Score new posts via DeepSeek (caption + transcript combined)
  Output: relevant / irrelevant / unknown + CTA type
 
 Step 3: Fetch comments (with cost confirmation prompt)
-        Posts where: relevant + CTA=comment + (never scanned OR comments grew 5%+)
+        Posts where: relevant + CTA=comment + (never scanned OR
+        comments grew >= pipeline.step3.comments_growth_pct % since
+        last scan; default 5%).
         Primary actor:  louisdeconinck/instagram-comments-scraper
             -- run_input MUST include proxy: useApifyProxy AND
-               resultsLimit/maxComments=LOUISDECONINCK_COMMENTS_CAP_PER_POST
-               (=10_000). Either field missing -> actor returns 0 items
-               with status=SUCCEEDED. See "louisdeconinck input contract"
-               above for the bisection.
+               resultsLimit/maxComments=pipeline.step3.louisdeconinck_comments_cap_per_post
+               (default 10_000). Either field missing -> actor returns
+               0 items with status=SUCCEEDED. See "louisdeconinck input
+               contract" above for the bisection.
         Fallback actor: apidojo/instagram-comments-scraper-api
             -- triggers automatically when the primary returns 0 items
                for the entire batch (with status=SUCCEEDED). Apidojo's
@@ -138,6 +142,27 @@ Step 4: Fetch profiles for new leads (batches of 50)
         If faces_count == 1: avatar becomes face_photo_path
         If faces_count != 1: fall back to last N post photos (face leader)
         Actor: instagram-profile-scraper
+
+Step 5: Resolve Telegram contacts via Sherlock (parallel)
+        For "naked" leads (profile fetched, bio gave no phone/telegram).
+        Stage 1: nick search (cheap, ~30s) -- POST /v1/search/nick.
+        Stage 2: photo search (slow, ~135s) if face_photo_path exists --
+                 POST /v1/search/photo. Skipped under --skip-sherlock or
+                 if SHERLOCK_API_KEY missing.
+        Sets sherlock_processed_at on every terminal outcome (found_nick,
+        found_photo, no_match, no_face_photo, error) so leads aren't
+        silently retried -- clear the column manually to re-process.
+        Worker pool defaults to /v1/health pool.idle (override via
+        --workers or sherlock.concurrency.workers).
+
+Step 6: Cleanup spent face assets
+        Wipes avatar_path + face_photo_path files from disk for leads
+        where Sherlock has reached a non-error terminal outcome
+        (sherlock_processed_at IS NOT NULL AND sherlock_status != 'error').
+        NULLs those columns in DB. error-status leads keep their photos
+        so a manual retry doesn't have to re-pay Apify for Step 4.
+        Runs even with --skip-sherlock to drain the backlog of leads
+        Sherlock'd in prior runs. Suppress with --keep-photos.
 ```
 
 **Avatar face detection note:** Instagram CDN URLs are signed and expire
@@ -162,6 +187,26 @@ does the actual cross-profile matching itself). Otherwise the lead is
 skipped. Embeddings are used internally for clustering and discarded
 afterwards. All knobs live under `face_fallback:` in `config.yaml`.
 Downloaded post photos are removed except the chosen one (configurable).
+The chosen one (and the avatar) are then themselves wiped by Step 6
+once Sherlock has finished with the lead -- see "Disk hygiene" below.
+
+**Disk hygiene (Step 6):** face assets (`avatar_path` and
+`face_photo_path`) live on disk only for the window
+`Step 4 -> Step 5 + Step 6`. Once Sherlock has produced a terminal
+outcome, the files are unlinked and the path columns NULL'd
+(``faces_count`` is preserved as an analytical signal). Leads with
+`sherlock_status='error'` are exempt: their photos stay so a manual
+retry (clear `sherlock_processed_at`) doesn't require re-paying
+Apify for Step 4. The four face-detection helper queries on
+``LeadDB`` (``get_leads_needing_avatar``, ``get_leads_needing_face_fallback``,
+``get_leads_with_non_single_face``, ``get_all_face_detection_candidates``)
+gate on ``sherlock_processed_at IS NULL`` so cleaned leads aren't
+re-fetched by ``backfill_avatars.py`` / dev test scripts. Runs every
+pipeline invocation (including ``--skip-sherlock``) to drain the
+backlog; suppress with ``--keep-photos``. There is no
+``photos_cleaned_at`` column -- "cleaned" is implicit:
+``sherlock_processed_at IS NOT NULL AND avatar_path IS NULL AND
+face_photo_path IS NULL``.
 
 ## Database Schema (SQLite)
 
@@ -178,9 +223,10 @@ Downloaded post photos are removed except the chosen one (configurable).
 - `phone`, `email`, `telegram_username`, `whatsapp` — contacts
 - `profile_fetched` (0/1), `contact_found` (0/1) — processing state
 - `latest_media_urls` — JSON array of photo/video URLs from posts
-- `avatar_path` — local path to downloaded avatar (`data/avatars/<user_id>.jpg`)
-- `faces_count` — number of faces detected by SCRFD above `min_det_score` (NULL = not processed)
-- `face_photo_path` — canonical single-face photo sent to the Sherlock bot (avatar if single-face, else post-fallback winner)
+- `avatar_path` — local path to downloaded avatar (`data/avatars/<user_id>.jpg`); **NULLed by Step 6 after Sherlock for non-error leads**
+- `faces_count` — number of faces detected by SCRFD above `min_det_score` (NULL = not processed); preserved across Step 6 cleanup as an analytical signal
+- `face_photo_path` — canonical single-face photo sent to the Sherlock bot (avatar if single-face, else post-fallback winner); **NULLed by Step 6 after Sherlock for non-error leads**
+- `sherlock_processed_at`, `sherlock_status`, `sherlock_link` — Step 5 outcome. `sherlock_processed_at IS NOT NULL` gates Step 6 cleanup AND excludes the lead from face-detection helper queries (so backfill scripts don't re-fetch via Apify after cleanup).
 
 **`lead_post_links`** — which lead commented on which post
 - `username`, `user_id`, `post_url`, `post_shortcode`, `comment_text`
@@ -238,6 +284,10 @@ python scripts/test_face_leader.py --keep-photos
 ## Configuration
 
 - `config.yaml` — search parameters, Apify actor IDs, limits, filters
+  - `pipeline.stepN.*` — per-step tuning knobs (post age, min comments,
+    growth threshold, batch sizes, Sherlock cap). Every value falls
+    back to a `DEFAULT_*` constant in `scripts/pipeline.py` if the key
+    is missing, so a fresh / partial config still boots.
 - `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`
 - Realtor accounts stored in DB table `tracked_realtors` (not config)
 
@@ -279,6 +329,7 @@ python scripts/test_face_leader.py --keep-photos
 - **Budget controls:** Pipeline shows estimated cost before expensive operations and asks for confirmation.
 - **Incremental:** Each pipeline run only processes new/changed data. Safe to run repeatedly.
 - **5% comment growth threshold:** Don't re-scan comments on a post unless comment count grew by at least 5% since last scan.
+- **Disk hygiene:** face photos (avatars + post-photo leaders) live on disk only between Step 4 and Step 6. After Sherlock finishes a lead with a non-error terminal status, Step 6 unlinks its files and NULLs the path columns. Face-detection helper queries gate on `sherlock_processed_at IS NULL` so cleaned leads aren't re-fetched via Apify.
 
 ## Language
 

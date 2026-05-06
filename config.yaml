@@ -61,6 +61,53 @@ cycle:
   max_apify_requests_per_cycle: 50
   max_accounts_per_cycle: 200
 
+# Daily pipeline tuning. Each subsection corresponds to a step in
+# scripts/pipeline.py. All values have safe defaults baked into the
+# pipeline (DEFAULT_* module-level constants); this section is for
+# overrides without code edits. Missing keys / sections fall back to
+# the in-code default.
+pipeline:
+  step1:
+    # apify/instagram-post-scraper input "onlyPostsNewerThan = N days".
+    # Realtors don't update old posts, so this both bounds the dataset
+    # and keeps comments fresh enough for Step 3 to find new commenters.
+    posts_max_age_days: 7
+    # Filter for processed_posts: posts with fewer than this many
+    # comments aren't worth scoring (DeepSeek $) or scanning (Apify $).
+    min_comments_per_post: 10
+
+  step3:
+    # Re-scan a post's comments only after N% growth since last scan.
+    # Lower = more freshness, higher = lower Apify cost.
+    comments_growth_pct: 5.0
+    # Used only for the "Estimated cost" prompt in Step 3 -- the actual
+    # bill is read back from Apify's run.usageTotalUsd. Update if the
+    # primary actor's pricing changes.
+    cost_per_comment_usd: 0.0005
+    # louisdeconinck silently returns 0 items unless we declare a
+    # per-post comment cap (bisected via test_comment_scrapers.py).
+    # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
+    # Bumping it does not raise the bill -- the actor returns only
+    # comments that actually exist on the post.
+    louisdeconinck_comments_cap_per_post: 10000
+
+  step4:
+    # apify/instagram-profile-scraper batch size. Apify accepts up
+    # to ~50 usernames per run before throughput drops; smaller =
+    # more API overhead, bigger = more data lost if a batch fails.
+    profile_batch_size: 50
+    # Max leads pulled per pipeline run from get_leads_without_profile.
+    # Bigger = more new contacts/run but a longer run; smaller =
+    # backlog grows across runs.
+    batch_limit: 1000
+
+  step5:
+    # Max leads pulled per pipeline run from get_leads_for_sherlock.
+    # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
+    # photo). 1000 leads on a 3-account pool is already a multi-hour
+    # run; bigger pools could safely raise this.
+    batch_limit: 1000
+
 db:
   path: "data/leads.db"
 
@@ -98,6 +145,39 @@ face_fallback:
   cluster_threshold: 0.5      # cosine-similarity threshold for cluster_faces
   skip_videos: true           # ignore post items that are videoUrl-only
   keep_photos: false          # false = delete downloaded post photos after processing (keep only the chosen one)
+
+# Sherlock REST API (Module 2: Telegram contact resolution).
+#
+# Step 5 of the daily pipeline POSTs each "naked" lead (no phone /
+# telegram_username from bio) to Sherlock to try and resolve a Telegram
+# contact. The API runs a real Telegram-bot client behind the scenes,
+# so individual calls are slow (tens of seconds to minutes) -- it's
+# always async: enqueue, then poll /v1/tasks/{id} until terminal.
+#
+# `concurrency.workers: null` (the default) means Step 5 will probe
+# /v1/health at startup and use `pool.by_status.idle` as the worker
+# count. That matches the practical concurrency cap (one task = one
+# Telegram account); going higher just stuffs the server-side queue
+# without making things faster. Override with an integer to force a
+# specific count (or via `--workers N` on the pipeline CLI).
+sherlock:
+  base_url: "http://94.131.9.237:8000"
+  api_key_env_var: "SHERLOCK_API_KEY"
+  nick_search:
+    # 1 page is enough to confirm a Telegram handle exists / doesn't.
+    # We don't paginate further because Step 5 only needs a yes/no answer.
+    max_pages: 1
+    max_attempts: 3
+  photo_search:
+    # 20 pages ~= 135 s end-to-end on our smoke test (avg ~15 s/page).
+    # Lower = faster + cheaper but you may miss matches on the tail.
+    max_pages: 20
+    max_attempts: 3
+  task:
+    poll_interval_secs: 3
+    max_wait_secs: 300
+  concurrency:
+    workers: null
 
 logging:
   level: "INFO"

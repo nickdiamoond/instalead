@@ -1,6 +1,7 @@
 """Manual-review run of the face-leader fallback.
 
-Picks every lead in the DB whose avatar face count is NOT exactly one
+Picks up to 100 leads from the DB (hardcoded) whose avatar face count
+is NOT exactly one
 (``faces_count != 1``, so group shots + no-face avatars) and replays
 the last-N-posts face-leader algorithm on them — but instead of writing
 the decision back to the DB and deleting the candidate photos, it lays
@@ -64,6 +65,8 @@ setup_logging()
 log = get_logger("test_face_leader_manual_review")
 
 PROFILE_BATCH_SIZE = 50
+# Hard cap on leads read from the DB (Apify cost control).
+MANUAL_REVIEW_DB_LIMIT = 30
 COST_PER_PROFILE = 0.0023
 LOGS_DIR = Path("logs")
 REVIEW_DIR = Path("data/manual_review")
@@ -87,7 +90,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--limit", type=int, default=0,
-        help="Max leads to process (0 = all).",
+        help=(
+            "Max leads to process from the DB. "
+            f"0 = use the hardcoded ceiling ({MANUAL_REVIEW_DB_LIMIT}). "
+            "Any positive value is capped at that ceiling."
+        ),
     )
     parser.add_argument("--yes", action="store_true",
                         help="Skip cost confirmation prompt.")
@@ -109,7 +116,11 @@ def main() -> None:
     db = LeadDB("data/leads.db")
     stats_before = db.get_stats()
 
-    effective_limit = args.limit if args.limit > 0 else 10**9
+    effective_limit = (
+        min(MANUAL_REVIEW_DB_LIMIT, args.limit)
+        if args.limit > 0
+        else MANUAL_REVIEW_DB_LIMIT
+    )
     leads = db.get_leads_with_non_single_face(limit=effective_limit)
 
     if args.only_multi:
@@ -135,8 +146,14 @@ def main() -> None:
     print(f"  threshold:            {fb_threshold}")
     print(f"  skip videos:          {fb_skip_videos}")
     print(f"  only-multi filter:    {args.only_multi}")
-    print(f"Leads to process:       {len(leads)}"
-          + ("" if args.limit == 0 else f" (capped at --limit {args.limit})"))
+    _limit_note = (
+        f" (DB cap {MANUAL_REVIEW_DB_LIMIT}, effective {effective_limit})"
+        if args.limit > 0 and args.limit != effective_limit
+        else f" (DB cap {MANUAL_REVIEW_DB_LIMIT})"
+        if args.limit == 0
+        else f" (--limit {args.limit})"
+    )
+    print(f"Leads to process:       {len(leads)}{_limit_note}")
     print(f"Apify (profile):        ~${estimated_cost:.3f}")
     print("Policy:                 DB is NOT modified, photos are NOT deleted.")
     print(f"{'='*64}")
@@ -353,7 +370,9 @@ def main() -> None:
     json_path = LOGS_DIR / f"test_face_leader_manual_review_{ts}.json"
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "limit": args.limit,
+        "limit": effective_limit,
+        "db_limit_cap": MANUAL_REVIEW_DB_LIMIT,
+        "cli_limit_arg": args.limit,
         "only_multi": args.only_multi,
         "review_dir": str(REVIEW_DIR.resolve()),
         "config": {

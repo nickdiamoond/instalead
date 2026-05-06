@@ -5,13 +5,17 @@ Steps:
   2. Score new posts via DeepSeek (relevance + CTA)
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
+  5. Resolve Telegram contacts for naked leads via Sherlock
+     (nick search first, photo fallback if face_photo_path exists)
 
 Uses DB for deduplication — safe to run repeatedly.
 """
 
+import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +26,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from src.avatar_downloader import (
+    cleanup_lead_face_assets,
     cleanup_lead_photos,
     download_avatar,
     download_post_photos,
@@ -34,16 +39,50 @@ from src.face_embedder import make_face_embedder
 from src.face_leader import resolve_face_leader
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
+from src.sherlock_client import (
+    PHOTO_RESULT_STATUS_NO_MATCH,
+    SherlockError,
+    make_sherlock_client,
+)
 from src.transcriber import NexaraTranscriber
 
 setup_logging()
 log = get_logger("pipeline")
 
-POSTS_MAX_AGE_DAYS = 7
-MIN_COMMENTS = 10
-COMMENTS_GROWTH_PCT = 5.0
-PROFILE_BATCH_SIZE = 50
-COST_PER_COMMENT = 0.0005
+# Per-step tuning knobs. These are *defaults*; ``main()`` overrides
+# every value from ``config.yaml`` (``pipeline.stepN.*``) so the daily
+# run picks up changes without a code edit. Constants are kept in the
+# module (rather than only in YAML) so direct imports / unit tests
+# don't have to pull in the config loader to know reasonable values.
+#
+# Don't touch these to "tune the pipeline"; edit ``config.yaml``
+# instead. They exist solely to keep the script bootable when a key
+# is missing from a fresh config (e.g. on a brand-new machine before
+# the operator has copied the canonical YAML over).
+
+# Step 1: Apify post-scraper "onlyPostsNewerThan" + the post-level
+# comments filter that gates entry into ``processed_posts``.
+DEFAULT_POSTS_MAX_AGE_DAYS = 7
+DEFAULT_MIN_COMMENTS = 10
+
+# Step 3: comment re-scan growth threshold + the displayed cost
+# estimate per fetched comment (real bill comes from
+# ``run.usageTotalUsd`` regardless of this value).
+DEFAULT_COMMENTS_GROWTH_PCT = 5.0
+DEFAULT_COST_PER_COMMENT = 0.0005
+
+# Step 4: profile-scraper batch size + max new leads pulled per run.
+DEFAULT_PROFILE_BATCH_SIZE = 50
+DEFAULT_STEP4_BATCH_LIMIT = 1000
+
+# Step 5: max leads pulled per run from get_leads_for_sherlock.
+# Smaller than Step 4's effective rate because Sherlock tasks are
+# slow (~30 s nick / ~135 s photo each), so 1000 leads on a 3-account
+# pool is already a multi-hour run; bigger pools could safely raise
+# this. The daily run has no CLI flag for it on purpose, to keep
+# ``python scripts/pipeline.py`` behavior reproducible across
+# machines / cron jobs -- override via config.yaml.
+DEFAULT_SHERLOCK_BATCH_LIMIT = 1000
 
 # Step 3 comment scrapers. louisdeconinck is the primary because its
 # snake_case Instagram-raw output maps 1:1 to ``lead_accounts`` columns
@@ -71,8 +110,9 @@ DEFAULT_COMMENTS_FALLBACK_ACTOR = "apidojo/instagram-comments-scraper-api"
 # viral post. Max ``comments_count`` observed in our DB is ~2_200
 # (avg ~130), so 10_000 leaves ~5x headroom for unexpected spikes.
 # The cap is applied on the primary's call only -- see
-# ``_fetch_comments_with_fallback``.
-LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000
+# ``_fetch_comments_with_fallback``. Override via
+# ``pipeline.step3.louisdeconinck_comments_cap_per_post`` in config.
+DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000
 
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
@@ -258,6 +298,7 @@ def _fetch_comments_with_fallback(
     *,
     primary_actor: str,
     fallback_actor: str,
+    louisdeconinck_cap_per_post: int,
 ) -> tuple[list[dict], float, str, dict]:
     """Pull comments for ``urls`` with primary -> apidojo-api fallback.
 
@@ -280,9 +321,10 @@ def _fetch_comments_with_fallback(
     Both Apify runs are logged separately via ``pipeline.log_run`` so
     the per-actor cost split stays explicit in ``logs/pipeline_*.json``.
 
-    The actor ids are passed in (rather than read from module-level
-    constants) so ``main()`` can override them from ``config.yaml``
-    without touching this function.
+    The actor ids and the per-post comment cap are passed in (rather
+    than read from module-level constants) so ``main()`` can override
+    them from ``config.yaml`` (``pipeline.step3.*``) without touching
+    this function.
     """
     # Two louisdeconinck-specific guardrails baked into the primary
     # call -- both bisected via ``scripts/test_comment_scrapers.py``:
@@ -296,9 +338,9 @@ def _fetch_comments_with_fallback(
     #   confirmed it -- the cap is what makes the actor commit
     #   instead of bailing out). The fallback (apidojo-api) does
     #   NOT need this and intentionally keeps its uncapped shape.
-    #   ``LOUISDECONINCK_COMMENTS_CAP_PER_POST`` is set well above
-    #   any per-post comment count we've ever seen, so it acts as
-    #   a safety ceiling rather than a real cap.
+    #   ``louisdeconinck_cap_per_post`` is set well above any
+    #   per-post comment count we've ever seen, so it acts as a
+    #   safety ceiling rather than a real cap.
     primary_items, primary_cost, primary_run = _run_apify_actor(
         apify,
         pipeline,
@@ -306,12 +348,12 @@ def _fetch_comments_with_fallback(
         run_input={
             "urls": urls,
             "proxy": {"useApifyProxy": True},
-            "resultsLimit": LOUISDECONINCK_COMMENTS_CAP_PER_POST,
-            "maxComments": LOUISDECONINCK_COMMENTS_CAP_PER_POST,
+            "resultsLimit": louisdeconinck_cap_per_post,
+            "maxComments": louisdeconinck_cap_per_post,
         },
         log_input={
             "urls_count": len(urls),
-            "results_limit": LOUISDECONINCK_COMMENTS_CAP_PER_POST,
+            "results_limit": louisdeconinck_cap_per_post,
         },
     )
     debug = {
@@ -391,7 +433,539 @@ def _fetch_comments_with_fallback(
     return fb_items, total_cost, "fallback", debug
 
 
+# =========================================================================
+# Step 5: Sherlock contact resolution (parallel)
+# =========================================================================
+#
+# For each "naked" lead (profile fetched, but bio gave us no contact),
+# we try Sherlock in two stages -- nick first because it's cheap and
+# definitive, photo only as fallback because it's slow:
+#
+#   1) POST /v1/search/nick { nick = ig_username, search_in = "telegram" }
+#      If `result.results` is non-empty, the IG handle exists in TG and
+#      we save the matched username + t.me link. Done.
+#
+#   2) Else, if face_photo_path is set, POST /v1/search/photo with the
+#      file. Look at result.results[0] only (per spec). If its `status`
+#      is anything OTHER than the exact Cyrillic string "не совпадение",
+#      save phone + link. Otherwise mark no_match.
+#
+# Workers run the full nick->photo flow per lead end-to-end, in parallel,
+# and DB writes are serialised in the main thread (one futures.as_completed
+# loop) so SQLite stays single-writer regardless of how many workers we
+# spin up.
+
+# Sherlock outcome labels stored in lead_accounts.sherlock_status. Kept
+# as a centralized vocabulary so the pipeline summary banner and
+# downstream tooling can rely on a closed set of values.
+SH_STATUS_FOUND_NICK = "found_nick"
+SH_STATUS_FOUND_PHOTO = "found_photo"
+SH_STATUS_NO_MATCH = "no_match"
+SH_STATUS_NO_FACE_PHOTO = "no_face_photo"
+SH_STATUS_ERROR = "error"
+
+
+def _resolve_one_lead_via_sherlock(
+    sherlock,
+    lead: dict,
+    *,
+    nick_cfg: dict,
+    photo_cfg: dict,
+    task_cfg: dict,
+) -> dict:
+    """Run the full nick->photo flow for one lead.
+
+    Pure function w.r.t. the DB: returns a dict that the orchestrator
+    persists via :py:meth:`LeadDB.mark_lead_sherlock`. Never raises --
+    every exception path resolves to ``status=error`` with a populated
+    ``error`` message so a single misbehaving lead doesn't sink the
+    whole batch.
+
+    Returned shape:
+      {
+        "username": str,           # echoed back for the orchestrator
+        "status":   str,           # SH_STATUS_* label
+        "telegram_username": str | None,
+        "phone":            str | None,
+        "sherlock_link":    str | None,
+        "error":            str | None,   # debug message, not stored
+      }
+    """
+    username = lead["username"]
+    out: dict = {
+        "username": username,
+        "status": SH_STATUS_ERROR,
+        "telegram_username": None,
+        "phone": None,
+        "sherlock_link": None,
+        "error": None,
+    }
+    poll_interval = float(task_cfg.get("poll_interval_secs", 3))
+    max_wait = float(task_cfg.get("max_wait_secs", 300))
+
+    # ---- Stage 1: nick search ------------------------------------
+    # We always try nick first; even leads without a face photo can
+    # be resolved here for free (1 page, ~30 s).
+    try:
+        enq = sherlock.enqueue_nick(
+            nick=username,
+            search_in="telegram",
+            max_pages=int(nick_cfg.get("max_pages", 1)),
+            max_attempts=int(nick_cfg.get("max_attempts", 3)),
+        )
+        task = sherlock.wait_for_task(
+            enq["id"],
+            poll_interval=poll_interval,
+            max_wait=max_wait,
+        )
+        if (task.get("status") or "").lower() == "completed":
+            results = ((task.get("result") or {}).get("results")) or []
+            if results:
+                first = results[0] or {}
+                # Prefer the result's reported handle (case might
+                # differ from the IG one, e.g. CamelCase). Fall back
+                # to the queried IG username if missing.
+                tg_username = first.get("username") or username
+                tg_link = (
+                    first.get("link")
+                    or f"https://t.me/{tg_username}"
+                )
+                out.update({
+                    "status": SH_STATUS_FOUND_NICK,
+                    "telegram_username": tg_username,
+                    "sherlock_link": tg_link,
+                })
+                return out
+        # Anything else (failed / timeout / completed-but-empty) -> fall
+        # through to photo. We don't return early on a nick failure
+        # because photo might still rescue the lead.
+    except (SherlockError, TimeoutError) as exc:
+        # Best-effort: log and try photo anyway. If photo also fails
+        # the lead ends up as `error` further down.
+        out["error"] = f"nick: {exc}"
+    except Exception as exc:  # noqa: BLE001 - never let a thread die
+        out["error"] = f"nick: unexpected {type(exc).__name__}: {exc}"
+
+    # ---- Stage 2: photo fallback ---------------------------------
+    face_path_str = lead.get("face_photo_path")
+    if not face_path_str:
+        # Spec: skip leads without a usable photo. They keep
+        # `sherlock_processed_at` set so we don't retry next run.
+        out["status"] = SH_STATUS_NO_FACE_PHOTO
+        # Clear the nick-stage error message: the *outcome* is
+        # cleanly "no face photo to try", not an error.
+        out["error"] = None
+        return out
+
+    face_path = Path(face_path_str)
+    if not face_path.is_file():
+        # Path is recorded but the file is gone (manual cleanup,
+        # disk hiccup). Treat the same as "no photo".
+        out["status"] = SH_STATUS_NO_FACE_PHOTO
+        out["error"] = f"face_photo missing on disk: {face_path}"
+        return out
+
+    try:
+        enq = sherlock.enqueue_photo(
+            face_path,
+            max_pages=int(photo_cfg.get("max_pages", 20)),
+            max_attempts=int(photo_cfg.get("max_attempts", 3)),
+        )
+        task = sherlock.wait_for_task(
+            enq["id"],
+            poll_interval=poll_interval,
+            max_wait=max_wait,
+        )
+        final_status = (task.get("status") or "").lower()
+        if final_status != "completed":
+            out["status"] = SH_STATUS_ERROR
+            out["error"] = (
+                task.get("error_message")
+                or f"photo task ended status={final_status!r}"
+            )
+            return out
+        results = ((task.get("result") or {}).get("results")) or []
+        if not results:
+            out["status"] = SH_STATUS_NO_MATCH
+            out["error"] = None
+            return out
+        first = results[0] or {}
+        per_status = first.get("status") or ""
+        # Spec: anything OTHER than the exact Cyrillic
+        # "не совпадение" counts as a hit. Includes
+        # "вероятное совпадение", "возможное совпадение", etc.
+        if per_status == PHOTO_RESULT_STATUS_NO_MATCH:
+            out["status"] = SH_STATUS_NO_MATCH
+            out["error"] = None
+            return out
+        out.update({
+            "status": SH_STATUS_FOUND_PHOTO,
+            "phone": first.get("phone"),
+            "sherlock_link": first.get("link"),
+            "error": None,
+        })
+        return out
+    except (SherlockError, TimeoutError) as exc:
+        out["status"] = SH_STATUS_ERROR
+        out["error"] = f"photo: {exc}"
+        return out
+    except Exception as exc:  # noqa: BLE001
+        out["status"] = SH_STATUS_ERROR
+        out["error"] = f"photo: unexpected {type(exc).__name__}: {exc}"
+        return out
+
+
+def _format_eta(seconds: float) -> str:
+    """Render a duration as ``Xh Ym`` / ``Ym Zs`` for the cost banner."""
+    if seconds >= 3600:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+    if seconds >= 60:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}m {s}s"
+    return f"{seconds:.0f}s"
+
+
+# Per-task wallclock estimates from our smoke tests against the live
+# service. Used only for the cost-confirmation banner -- actual times
+# fluctuate with TG-side latency and pool saturation.
+NICK_TASK_ETA_S = 30
+PHOTO_TASK_ETA_S = 135
+
+
+def _step_5_resolve_contacts_via_sherlock(
+    db: "LeadDB",
+    cfg: dict,
+    *,
+    batch_limit: int,
+    workers_override: int | None,
+    auto_yes: bool,
+    log,
+    issues: list[tuple[str, str]],
+) -> None:
+    """Run Sherlock contact resolution for naked leads in parallel.
+
+    Pulls up to ``batch_limit`` candidates via
+    :py:meth:`LeadDB.get_leads_for_sherlock` (mirrors Step 4's
+    ``get_leads_without_profile`` pattern -- one pipeline run eats
+    a bounded chunk of the Sherlock backlog, leftovers are picked
+    up next run since ``sherlock_processed_at`` is set on every
+    terminal outcome), fans them out across a thread pool sized
+    to either ``workers_override`` (CLI flag) or
+    ``/v1/health.pool.idle`` (fallback 3 if unreachable), and
+    persists each terminal outcome to the DB as it arrives.
+
+    ``batch_limit`` is sourced by ``main()`` from
+    ``config.yaml`` (``pipeline.step5.batch_limit``), defaulting
+    to :data:`DEFAULT_SHERLOCK_BATCH_LIMIT`.
+
+    The function is self-contained: builds its own SherlockClient
+    from ``cfg`` and tears it down before returning. Never raises;
+    user-visible failures land in ``issues`` so the final summary
+    banner highlights them.
+    """
+    _banner("STEP 5: Resolve contacts via Sherlock")
+
+    sh_cfg = cfg.get("sherlock") or {}
+    nick_cfg = sh_cfg.get("nick_search") or {}
+    photo_cfg = sh_cfg.get("photo_search") or {}
+    task_cfg = sh_cfg.get("task") or {}
+    conc_cfg = sh_cfg.get("concurrency") or {}
+
+    try:
+        sherlock = make_sherlock_client(cfg)
+    except EnvironmentError as exc:
+        # Most common cause: SHERLOCK_API_KEY missing in .env.
+        # Don't crash the whole pipeline -- skip the step loudly.
+        print(f"  SKIPPED: cannot build Sherlock client ({exc}).")
+        log.warning("step5_skip_no_client", error=str(exc))
+        issues.append(("Step 5", f"Sherlock client missing: {exc}"))
+        return
+
+    try:
+        # Workers: CLI override beats config beats live pool probe.
+        if workers_override is not None:
+            workers = max(1, int(workers_override))
+            workers_source = "--workers"
+        elif conc_cfg.get("workers"):
+            workers = max(1, int(conc_cfg["workers"]))
+            workers_source = "config.yaml sherlock.concurrency.workers"
+        else:
+            workers = sherlock.get_pool_idle(fallback=3)
+            workers_source = "/v1/health pool.idle"
+
+        candidates = db.get_leads_for_sherlock(limit=batch_limit)
+        with_face = sum(1 for c in candidates if c.get("face_photo_path"))
+
+        # Best- and worst-case ETAs:
+        #   best  = every nick hits (no photo runs)
+        #   worst = every nick misses, every face_photo'd lead burns a
+        #           full photo task
+        n = len(candidates)
+        best_eta = (n * NICK_TASK_ETA_S) / max(workers, 1)
+        worst_eta = (
+            n * NICK_TASK_ETA_S + with_face * PHOTO_TASK_ETA_S
+        ) / max(workers, 1)
+
+        print(f"  Candidates:        {n}")
+        print(f"  With face photo:   {with_face}  (eligible for photo fallback)")
+        print(f"  Workers:           {workers}  (from {workers_source})")
+        print(f"  Best-case ETA:     {_format_eta(best_eta)}  "
+              f"(every nick search hits)")
+        print(f"  Worst-case ETA:    {_format_eta(worst_eta)}  "
+              f"(every photo fallback runs)")
+
+        if n == 0:
+            print("  SKIPPED: no candidates.")
+            log.info("step5_no_candidates")
+            return
+
+        if not auto_yes:
+            confirm = input("  Proceed? (y/n): ").strip().lower()
+            if confirm != "y":
+                print("  SKIPPED by user.")
+                log.info("step5_skipped_by_user")
+                return
+
+        log.info(
+            "step5_start",
+            candidates=n,
+            with_face=with_face,
+            workers=workers,
+            workers_source=workers_source,
+        )
+
+        counters: dict[str, int] = {
+            SH_STATUS_FOUND_NICK: 0,
+            SH_STATUS_FOUND_PHOTO: 0,
+            SH_STATUS_NO_MATCH: 0,
+            SH_STATUS_NO_FACE_PHOTO: 0,
+            SH_STATUS_ERROR: 0,
+        }
+
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="sherlock"
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _resolve_one_lead_via_sherlock,
+                    sherlock,
+                    lead,
+                    nick_cfg=nick_cfg,
+                    photo_cfg=photo_cfg,
+                    task_cfg=task_cfg,
+                ): lead
+                for lead in candidates
+            }
+            for i, fut in enumerate(as_completed(futures), 1):
+                lead = futures[fut]
+                username = lead["username"]
+                # Worker is supposed to swallow all exceptions, but
+                # belt-and-suspenders: a stray crash maps to error.
+                try:
+                    res = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    res = {
+                        "username": username,
+                        "status": SH_STATUS_ERROR,
+                        "telegram_username": None,
+                        "phone": None,
+                        "sherlock_link": None,
+                        "error": f"worker crashed: {type(exc).__name__}: {exc}",
+                    }
+
+                # DB write happens here on the main thread -- SQLite
+                # stays single-writer, no Lock needed even though we
+                # have many workers.
+                db.mark_lead_sherlock(
+                    username=username,
+                    status=res["status"],
+                    telegram_username=res.get("telegram_username"),
+                    phone=res.get("phone"),
+                    sherlock_link=res.get("sherlock_link"),
+                )
+                counters[res["status"]] = counters.get(res["status"], 0) + 1
+
+                # Per-lead progress line. Kept short -- multiple
+                # workers will interleave and a wall of text would
+                # bury the structlog stderr stream.
+                tag = res["status"]
+                detail_bits: list[str] = []
+                if res.get("telegram_username"):
+                    detail_bits.append(f"tg=@{res['telegram_username']}")
+                if res.get("phone"):
+                    detail_bits.append(f"phone={res['phone']}")
+                if res.get("sherlock_link"):
+                    detail_bits.append(f"link={res['sherlock_link']}")
+                if res.get("error") and res["status"] == SH_STATUS_ERROR:
+                    detail_bits.append(f"err={res['error'][:80]}")
+                detail = "  " + " ".join(detail_bits) if detail_bits else ""
+                print(f"  [{i:>4}/{n}] @{username:<25} -> {tag}{detail}")
+                log.info(
+                    "step5_lead_done",
+                    username=username,
+                    status=tag,
+                    telegram_username=res.get("telegram_username"),
+                    phone=bool(res.get("phone")),
+                    error=res.get("error"),
+                )
+
+        # Final breakdown.
+        print()
+        print(f"  DONE: {n} processed")
+        for label in (
+            SH_STATUS_FOUND_NICK,
+            SH_STATUS_FOUND_PHOTO,
+            SH_STATUS_NO_MATCH,
+            SH_STATUS_NO_FACE_PHOTO,
+            SH_STATUS_ERROR,
+        ):
+            print(f"    {label:<18} {counters.get(label, 0)}")
+
+        log.info("step5_done", **{f"count_{k}": v for k, v in counters.items()})
+
+        if counters.get(SH_STATUS_ERROR, 0):
+            issues.append((
+                "Step 5",
+                f"{counters[SH_STATUS_ERROR]} leads finished as error -- "
+                "check logs for Sherlock task failures / timeouts",
+            ))
+    finally:
+        sherlock.close()
+
+
+# =========================================================================
+# Step 6: cleanup spent face assets
+# =========================================================================
+#
+# Once Sherlock has produced a terminal outcome for a lead, its avatar
+# and face_photo are no longer needed by the pipeline -- the contact
+# (or "no_match") is recorded in lead_accounts. Step 6 walks
+# get_leads_with_spent_photos() (Sherlock done, status != 'error',
+# at least one path still set) and unlinks the files, then NULLs the
+# columns. error-status leads keep their photos so a manual retry
+# (clear sherlock_processed_at) doesn't have to re-pay Apify for
+# Step 4.
+#
+# The four face-detection queries used by backfill / dev scripts
+# (get_leads_needing_avatar &c) gate on `sherlock_processed_at IS NULL`,
+# so cleaned leads aren't re-fetched via Apify after Step 6 wipes
+# their avatar_path. See db.mark_lead_photos_cleaned for the
+# implicit "cleaned" predicate.
+#
+# Runs even with --skip-sherlock so the operator can drain the
+# accumulated backlog of already-Sherlock'd leads from prior runs.
+# Suppress with --keep-photos for forensic / debugging sessions.
+
+
+def _step_6_cleanup_spent_face_assets(
+    db: "LeadDB",
+    *,
+    log,
+    issues: list[tuple[str, str]],
+) -> None:
+    """Delete avatars / face photos for leads Sherlock has finished with.
+
+    Idempotent: once both columns are NULL the lead is excluded from
+    :py:meth:`LeadDB.get_leads_with_spent_photos`, so subsequent runs
+    only touch new spent leads. Never raises -- per-lead unlink
+    failures land in ``issues`` for the summary banner.
+    """
+    _banner("STEP 6: Cleanup spent face assets")
+
+    # No limit pagination here on purpose: cleanup is local and cheap
+    # (one unlink per file, no network), and the natural cap is the
+    # backlog size on first run after this feature ships. The DB
+    # method's default `limit=10000` is just a paranoia ceiling.
+    candidates = db.get_leads_with_spent_photos()
+    if not candidates:
+        print("  SKIPPED: no spent face assets to clean.")
+        log.info("step6_no_candidates")
+        return
+
+    print(f"  Leads to clean:    {len(candidates)}")
+    log.info("step6_cleanup_spent_assets", count=len(candidates))
+
+    files_deleted = 0
+    files_failed = 0
+    leads_cleaned = 0
+
+    for lead in candidates:
+        username = lead["username"]
+        deleted, failed = cleanup_lead_face_assets(
+            lead.get("avatar_path"),
+            lead.get("face_photo_path"),
+            user_id=lead.get("user_id"),
+        )
+        # Always mark the lead cleaned in DB even if every file was
+        # already missing on disk -- the goal is to converge the DB
+        # state to "no asset paths set" so future runs skip this lead.
+        db.mark_lead_photos_cleaned(username)
+        files_deleted += deleted
+        files_failed += failed
+        leads_cleaned += 1
+
+    print(
+        f"  DONE: cleaned {leads_cleaned} leads, "
+        f"{files_deleted} files removed, "
+        f"{files_failed} failed"
+    )
+    log.info(
+        "step6_done",
+        leads_cleaned=leads_cleaned,
+        files_deleted=files_deleted,
+        files_failed=files_failed,
+    )
+
+    if files_failed:
+        issues.append((
+            "Step 6",
+            f"{files_failed} files failed to unlink during cleanup -- "
+            "check warnings in logs (avatar_downloader). Lead rows "
+            "were still marked cleaned to avoid re-trying.",
+        ))
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    """Pipeline-level CLI flags. Kept minimal -- the daily run uses
+    no flags; flags exist for ad-hoc Step 5 / Step 6 runs."""
+    parser = argparse.ArgumentParser(
+        description="Daily lead collection pipeline (Apify + DeepSeek + Sherlock)."
+    )
+    parser.add_argument(
+        "--skip-sherlock",
+        action="store_true",
+        help="Skip Step 5 (Sherlock contact resolution). "
+             "Useful when only Steps 1-4 are needed.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Override Step 5 worker count. Default: probe /v1/health "
+             "and use pool.idle (fallback 3).",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Auto-confirm Step 5's cost prompt (skip the y/n input). "
+             "Use only when running unattended.",
+    )
+    parser.add_argument(
+        "--keep-photos",
+        action="store_true",
+        help="Skip Step 6 (cleanup of spent face assets). Use for "
+             "debugging / forensic sessions where you need avatars "
+             "and face photos to stay on disk after Sherlock.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = _parse_cli_args()
     load_dotenv()
     cfg = load_config()
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
@@ -427,13 +1001,50 @@ def main():
     fb_skip_videos = bool(fb_cfg.get("skip_videos", True))
     fb_keep_photos = bool(fb_cfg.get("keep_photos", False))
 
+    # Per-step tuning knobs from config.yaml (``pipeline.stepN.*``).
+    # Every value falls back to its DEFAULT_* module constant so a
+    # missing section / key boots the pipeline with safe values.
+    pipe_cfg = cfg.get("pipeline") or {}
+    s1_cfg = pipe_cfg.get("step1") or {}
+    s3_cfg = pipe_cfg.get("step3") or {}
+    s4_cfg = pipe_cfg.get("step4") or {}
+    s5_cfg = pipe_cfg.get("step5") or {}
+
+    posts_max_age_days = int(
+        s1_cfg.get("posts_max_age_days", DEFAULT_POSTS_MAX_AGE_DAYS)
+    )
+    min_comments = int(
+        s1_cfg.get("min_comments_per_post", DEFAULT_MIN_COMMENTS)
+    )
+    comments_growth_pct = float(
+        s3_cfg.get("comments_growth_pct", DEFAULT_COMMENTS_GROWTH_PCT)
+    )
+    cost_per_comment = float(
+        s3_cfg.get("cost_per_comment_usd", DEFAULT_COST_PER_COMMENT)
+    )
+    louisdeconinck_cap = int(
+        s3_cfg.get(
+            "louisdeconinck_comments_cap_per_post",
+            DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST,
+        )
+    )
+    profile_batch_size = int(
+        s4_cfg.get("profile_batch_size", DEFAULT_PROFILE_BATCH_SIZE)
+    )
+    step4_batch_limit = int(
+        s4_cfg.get("batch_limit", DEFAULT_STEP4_BATCH_LIMIT)
+    )
+    sherlock_batch_limit = int(
+        s5_cfg.get("batch_limit", DEFAULT_SHERLOCK_BATCH_LIMIT)
+    )
+
     stats_before = db.get_stats()
     log.info("pipeline_start", **stats_before)
 
     # ============================================================
     # STEP 1: Fetch posts from tracked realtors
     # ============================================================
-    _banner(f"STEP 1: Fetch posts (last {POSTS_MAX_AGE_DAYS} days)")
+    _banner(f"STEP 1: Fetch posts (last {posts_max_age_days} days)")
     realtors = db.get_active_realtors()
     if not realtors:
         log.error("no_realtors", msg="Add realtors to tracked_realtors table first")
@@ -442,12 +1053,12 @@ def main():
         return
 
     print(f"  Realtors:       {len(realtors)}")
-    log.info("step1_fetch_posts", realtors=len(realtors), max_age_days=POSTS_MAX_AGE_DAYS)
+    log.info("step1_fetch_posts", realtors=len(realtors), max_age_days=posts_max_age_days)
 
     run = apify.actor("apify/instagram-post-scraper").call(run_input={
         "username": realtors,
         "resultsLimit": 20,
-        "onlyPostsNewerThan": f"{POSTS_MAX_AGE_DAYS} days",
+        "onlyPostsNewerThan": f"{posts_max_age_days} days",
         "dataDetailLevel": "basicData",
         "proxy": {"useApifyProxy": True},
     })
@@ -473,7 +1084,7 @@ def main():
     for p in all_posts:
         shortcode = p.get("shortCode", "")
         comments_count = p.get("commentsCount") or 0
-        if comments_count < MIN_COMMENTS:
+        if comments_count < min_comments:
             continue
 
         is_reel = p.get("type") == "Video" or p.get("productType") == "clips"
@@ -586,14 +1197,14 @@ def main():
     # STEP 3: Fetch comments
     # ============================================================
     _banner("STEP 3: Fetch comments (Apify)")
-    posts_to_scan = db.get_posts_needing_comments(min_growth_pct=COMMENTS_GROWTH_PCT)
+    posts_to_scan = db.get_posts_needing_comments(min_growth_pct=comments_growth_pct)
 
     if not posts_to_scan:
         print("  SKIPPED: no relevant posts in the queue.")
         log.info("step3_no_posts_to_scan")
     else:
         total_comments = sum(p.get("comments_count") or 0 for p in posts_to_scan)
-        estimated_cost = total_comments * COST_PER_COMMENT
+        estimated_cost = total_comments * cost_per_comment
 
         log.info("step3_fetch_comments", posts=len(posts_to_scan),
                  total_comments=total_comments, estimated_cost=round(estimated_cost, 2))
@@ -623,6 +1234,7 @@ def main():
                 urls,
                 primary_actor=primary_actor,
                 fallback_actor=fallback_actor,
+                louisdeconinck_cap_per_post=louisdeconinck_cap,
             )
 
             # Bail out *before* marking anything as scanned if both the
@@ -631,7 +1243,7 @@ def main():
             # "succeed" with 0/null comments per page (its own log says
             # ``fetched 0/null comments``). Marking those posts as
             # scanned would freeze them out of the queue until comments
-            # grow another COMMENTS_GROWTH_PCT% — i.e. silently lose
+            # grow another ``comments_growth_pct`` — i.e. silently lose
             # tens of thousands of real commenters. Treat as a transient
             # failure and leave the queue untouched so the next run
             # retries them.
@@ -792,7 +1404,7 @@ def main():
     # STEP 4: Fetch profiles for new leads
     # ============================================================
     _banner("STEP 4: Fetch profiles for new leads")
-    leads_to_fetch = db.get_leads_without_profile(limit=1000)
+    leads_to_fetch = db.get_leads_without_profile(limit=step4_batch_limit)
 
     if not leads_to_fetch:
         print("  SKIPPED: no leads without profile.")
@@ -809,8 +1421,8 @@ def main():
         fallback_resolved = 0
         fallback_skipped = 0
 
-        for i in range(0, len(usernames), PROFILE_BATCH_SIZE):
-            batch = usernames[i:i + PROFILE_BATCH_SIZE]
+        for i in range(0, len(usernames), profile_batch_size):
+            batch = usernames[i:i + profile_batch_size]
 
             run = apify.actor("apify/instagram-profile-scraper").call(run_input={
                 "usernames": batch,
@@ -930,6 +1542,45 @@ def main():
               f"fallback_skipped={fallback_skipped}")
 
     # ============================================================
+    # STEP 5: Resolve Telegram contacts via Sherlock (parallel)
+    # ============================================================
+    # Only runs for "naked" leads -- profile fetched but bio gave us
+    # no phone / telegram. Step 4's contact_extractor wins ties; we
+    # don't overwrite anything it found. Skipped entirely under
+    # --skip-sherlock or if the SHERLOCK_API_KEY is missing.
+    if args.skip_sherlock:
+        _banner("STEP 5: Resolve contacts via Sherlock")
+        print("  SKIPPED by --skip-sherlock.")
+        log.info("step5_skipped_by_flag")
+    else:
+        _step_5_resolve_contacts_via_sherlock(
+            db,
+            cfg,
+            batch_limit=sherlock_batch_limit,
+            workers_override=args.workers,
+            auto_yes=args.yes,
+            log=log,
+            issues=issues,
+        )
+
+    # ============================================================
+    # STEP 6: Cleanup spent face assets
+    # ============================================================
+    # Runs even under --skip-sherlock to drain the backlog of leads
+    # already Sherlock'd in prior runs. --keep-photos disables it
+    # for debugging / forensic work.
+    if args.keep_photos:
+        _banner("STEP 6: Cleanup spent face assets")
+        print("  SKIPPED by --keep-photos.")
+        log.info("step6_skipped_by_flag")
+    else:
+        _step_6_cleanup_spent_face_assets(
+            db,
+            log=log,
+            issues=issues,
+        )
+
+    # ============================================================
     # SUMMARY
     # ============================================================
     stats_after = db.get_stats()
@@ -939,7 +1590,8 @@ def main():
     print(f"Tracked realtors:     {stats_after['tracked_realtors']}")
     print(f"Leads total:          {stats_after['leads_total']} (+{stats_after['leads_total'] - stats_before['leads_total']})")
     print(f"  with profile:       {stats_after['leads_with_profile']}")
-    print(f"  with contacts:      {stats_after['leads_with_contacts']}")
+    print(f"  with contacts:      {stats_after['leads_with_contacts']} "
+          f"(+{stats_after['leads_with_contacts'] - stats_before['leads_with_contacts']})")
     print(f"  with avatar:        {stats_after['leads_with_avatar']}")
     print(f"  single-face:        {stats_after['leads_with_single_face']}")
     print(f"  face photo ready:   {stats_after['leads_with_face_photo']}")

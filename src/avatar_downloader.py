@@ -165,3 +165,68 @@ def cleanup_lead_photos(
         except OSError:
             pass
     return deleted, failed
+
+
+def cleanup_lead_face_assets(
+    avatar_path: str | None,
+    face_photo_path: str | None,
+    *,
+    user_id: str | None = None,
+    photos_root: Path = LEAD_PHOTOS_DIR,
+) -> tuple[int, int]:
+    """Delete a lead's avatar + face photo after Sherlock has finished.
+
+    Used by Step 6 of the daily pipeline. Distinct from
+    :func:`cleanup_lead_photos` -- that one is for the in-flight
+    Step 4 fallback (drop everything except the leader cluster
+    winner). This one is for the post-Sherlock teardown: both
+    ``avatar_path`` and ``face_photo_path`` are spent and can go.
+
+    Subtleties:
+
+    * In the single-face case ``face_photo_path == avatar_path``;
+      the function dedups via a ``set`` so we don't ``unlink`` the
+      same file twice (and double-count failures).
+    * Missing files are silently treated as "already gone" -- not
+      counted as failures. This is the common case after a manual
+      cleanup or a botched previous run.
+    * After unlinking we best-effort ``rmdir`` ``data/lead_photos/<uid>/``
+      if it became empty, mirroring :func:`cleanup_lead_photos`.
+      Failure is silent: the directory may legitimately still hold
+      files for other reasons (e.g. a partial Step 4 from earlier).
+
+    Returns ``(deleted, failed)`` -- ``deleted`` counts files actually
+    removed, ``failed`` counts ``OSError`` paths during ``unlink``.
+    """
+    paths: set[Path] = set()
+    if avatar_path:
+        paths.add(Path(avatar_path))
+    if face_photo_path:
+        paths.add(Path(face_photo_path))
+
+    deleted = 0
+    failed = 0
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            p.unlink()
+            deleted += 1
+        except OSError as e:
+            log.warning(
+                "cleanup_face_unlink_failed",
+                path=str(p),
+                error=str(e),
+            )
+            failed += 1
+
+    if user_id:
+        lead_dir = photos_root / _safe_stem(str(user_id))
+        if lead_dir.is_dir():
+            try:
+                if not any(lead_dir.iterdir()):
+                    lead_dir.rmdir()
+            except OSError:
+                pass
+
+    return deleted, failed
