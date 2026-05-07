@@ -78,7 +78,7 @@ INTERACTIONS_PATH = "/v1/tasks/{task_id}/interactions"
 # higher mostly buys patience for a saturated pool.
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_MAX_WAIT = 300.0
-DEFAULT_HTTP_TIMEOUT = 30.0
+DEFAULT_HTTP_TIMEOUT = 90.0
 
 # Image content types Sherlock advertises (JPEG / PNG). Anything else
 # is sent as ``application/octet-stream`` -- the server still accepts

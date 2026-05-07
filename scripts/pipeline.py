@@ -504,47 +504,59 @@ def _resolve_one_lead_via_sherlock(
     max_wait = float(task_cfg.get("max_wait_secs", 300))
 
     # ---- Stage 1: nick search ------------------------------------
-    # We always try nick first; even leads without a face photo can
-    # be resolved here for free (1 page, ~30 s).
-    try:
-        enq = sherlock.enqueue_nick(
-            nick=username,
-            search_in="telegram",
-            max_pages=int(nick_cfg.get("max_pages", 1)),
-            max_attempts=int(nick_cfg.get("max_attempts", 3)),
-        )
-        task = sherlock.wait_for_task(
-            enq["id"],
-            poll_interval=poll_interval,
-            max_wait=max_wait,
-        )
-        if (task.get("status") or "").lower() == "completed":
-            results = ((task.get("result") or {}).get("results")) or []
-            if results:
-                first = results[0] or {}
-                # Prefer the result's reported handle (case might
-                # differ from the IG one, e.g. CamelCase). Fall back
-                # to the queried IG username if missing.
-                tg_username = first.get("username") or username
-                tg_link = (
-                    first.get("link")
-                    or f"https://t.me/{tg_username}"
+    # Nick is invalid for Sherlock if it contains dot. In that case we
+    # skip nick stage entirely and go straight to photo fallback.
+    if "." not in username:
+        # Sherlock expects the leading '@' in nick queries.
+        nick_query = f"@{username}"
+        try:
+            enq = sherlock.enqueue_nick(
+                nick=nick_query,
+                search_in="telegram",
+                max_pages=int(nick_cfg.get("max_pages", 1)),
+                max_attempts=int(nick_cfg.get("max_attempts", 3)),
+            )
+            task = sherlock.wait_for_task(
+                enq["id"],
+                poll_interval=poll_interval,
+                max_wait=max_wait,
+            )
+            if (task.get("status") or "").lower() == "completed":
+                results = ((task.get("result") or {}).get("results")) or []
+                if isinstance(results, dict):
+                    results = [results]
+                # Nick hit is valid ONLY when profile_url exists.
+                match = next(
+                    (
+                        item for item in results
+                        if isinstance(item, dict) and item.get("profile_url")
+                    ),
+                    None,
                 )
-                out.update({
-                    "status": SH_STATUS_FOUND_NICK,
-                    "telegram_username": tg_username,
-                    "sherlock_link": tg_link,
-                })
-                return out
-        # Anything else (failed / timeout / completed-but-empty) -> fall
-        # through to photo. We don't return early on a nick failure
-        # because photo might still rescue the lead.
-    except (SherlockError, TimeoutError) as exc:
-        # Best-effort: log and try photo anyway. If photo also fails
-        # the lead ends up as `error` further down.
-        out["error"] = f"nick: {exc}"
-    except Exception as exc:  # noqa: BLE001 - never let a thread die
-        out["error"] = f"nick: unexpected {type(exc).__name__}: {exc}"
+                if match:
+                    # Prefer the result's reported handle (case might
+                    # differ from the IG one, e.g. CamelCase). Fall back
+                    # to the queried IG username if missing.
+                    tg_username = match.get("username") or username
+                    tg_link = (
+                        match.get("link")
+                        or f"https://t.me/{tg_username}"
+                    )
+                    out.update({
+                        "status": SH_STATUS_FOUND_NICK,
+                        "telegram_username": tg_username,
+                        "sherlock_link": tg_link,
+                    })
+                    return out
+            # Anything else (failed / timeout / completed-but-empty) -> fall
+            # through to photo. We don't return early on a nick failure
+            # because photo might still rescue the lead.
+        except (SherlockError, TimeoutError) as exc:
+            # Best-effort: log and try photo anyway. If photo also fails
+            # the lead ends up as `error` further down.
+            out["error"] = f"nick: {exc}"
+        except Exception as exc:  # noqa: BLE001 - never let a thread die
+            out["error"] = f"nick: unexpected {type(exc).__name__}: {exc}"
 
     # ---- Stage 2: photo fallback ---------------------------------
     face_path_str = lead.get("face_photo_path")

@@ -1,31 +1,16 @@
-"""Batch nick-search harness aligned with pipeline Step 5 (nick stage only).
+"""Batch nick-search harness mirroring pipeline Step 5 stage 1 only.
 
-Loads up to ``DB_SAMPLE_LIMIT`` rows from ``lead_accounts`` with the same
-WHERE clause as :meth:`LeadDB.get_leads_for_sherlock`. Opens SQLite with
-``mode=ro`` (no writes).
+Loads up to ``DB_SAMPLE_LIMIT`` Instagram usernames from ``lead_accounts``
+using the **same WHERE clause** as :meth:`LeadDB.get_leads_for_sherlock`
+(Step 5 candidate pool). Opens SQLite in ``mode=ro`` — no writes.
 
-Orchestration mirrors :func:`scripts.pipeline._step_5_resolve_contacts_via_sherlock`
-for the parts that apply to nick search:
-
-  * one shared :class:`~src.sherlock_client.SherlockClient` across the thread
-    pool (same as the pipeline — do not give each worker its own session);
-  * worker count from ``--workers``, else ``sherlock.concurrency.workers`` in
-    config, else ``GET /v1/health`` → ``pool.by_status.idle`` (fallback 3);
-  * same ``enqueue_nick`` / ``wait_for_task`` arguments as
-    :func:`scripts.pipeline._resolve_one_lead_via_sherlock` stage 1.
-
-Photo fallback is intentionally omitted; the script dumps the final ``TaskOut``
-JSON from Sherlock for each nick.
-
-**Why it looked “stuck”:** each nick can take ~30–300s with no output unless
-we log polls — this script prints enqueue + per-poll status lines (like the
-pipeline’s per-lead progress, but more verbose).
+Runs ``POST /v1/search/nick`` + polls ``GET /v1/tasks/{id}`` per nick and
+prints the full final ``TaskOut`` JSON from Sherlock.
 
 Usage:
     python scripts/test_sherlock_step5_nick_only.py
-    python scripts/test_sherlock_step5_nick_only.py --workers 1
+    python scripts/test_sherlock_step5_nick_only.py --workers 4
     python scripts/test_sherlock_step5_nick_only.py --db data/leads.db
-    python scripts/test_sherlock_step5_nick_only.py --no-poll-log   # JSON blocks only
 """
 
 from __future__ import annotations
@@ -37,10 +22,8 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable
 
 import yaml
-from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -53,10 +36,13 @@ for _stream in (sys.stdout, sys.stderr):
 
 # Hardcoded: how many lead usernames to pull from the DB (Step 5 pool).
 DB_SAMPLE_LIMIT = 50
+SH_STATUS_FOUND_NICK = "found_nick"
+SH_STATUS_NO_MATCH = "no_match"
+SH_STATUS_ERROR = "error"
 
 # Same selection as LeadDB.get_leads_for_sherlock (scripts/pipeline Step 5).
 _STEP5_CANDIDATE_SQL = """
-SELECT username, user_id, full_name, face_photo_path
+SELECT username
 FROM lead_accounts
 WHERE profile_fetched = 1
   AND phone IS NULL
@@ -65,8 +51,6 @@ WHERE profile_fetched = 1
   AND COALESCE(is_private, 0) = 0
 LIMIT ?
 """
-
-PollPrinter = Callable[..., None]
 
 
 def _load_cfg(config_path: Path) -> dict:
@@ -85,8 +69,7 @@ def _resolve_db_path(cfg: dict, root: Path, override: Path | None) -> Path:
     return p
 
 
-def _fetch_leads_readonly(db_path: Path, limit: int) -> list[dict]:
-    """Return Step 5-shaped rows (read-only), same columns as get_leads_for_sherlock."""
+def _fetch_usernames_readonly(db_path: Path, limit: int) -> list[str]:
     if not db_path.is_file():
         raise FileNotFoundError(f"Database not found: {db_path}")
     uri_path = db_path.resolve().as_posix()
@@ -95,88 +78,110 @@ def _fetch_leads_readonly(db_path: Path, limit: int) -> list[dict]:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(_STEP5_CANDIDATE_SQL.strip(), (limit,)).fetchall()
-        return [dict(r) for r in rows]
+        return [str(r["username"]) for r in rows if r["username"]]
     finally:
         conn.close()
 
 
-def _resolve_workers(
-    sherlock: SherlockClient,
-    cfg: dict,
-    workers_override: int | None,
-) -> tuple[int, str]:
-    """Match pipeline: CLI > config > /v1/health pool.idle."""
-    sh_cfg = cfg.get("sherlock") or {}
-    conc_cfg = sh_cfg.get("concurrency") or {}
-    if workers_override is not None:
-        return max(1, int(workers_override)), "--workers"
-    if conc_cfg.get("workers") is not None:
-        return max(1, int(conc_cfg["workers"])), "config.yaml sherlock.concurrency.workers"
-    return max(1, sherlock.get_pool_idle(fallback=3)), "/v1/health pool.idle"
-
-
-def _format_eta(seconds: float) -> str:
-    if seconds >= 3600:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        return f"{h}h {m}m"
-    if seconds >= 60:
-        m = int(seconds // 60)
-        s = int(seconds % 60)
-        return f"{m}m {s}s"
-    return f"{seconds:.0f}s"
+def _nick_params(cfg: dict) -> tuple[int, int, float, float]:
+    sh = cfg.get("sherlock") or {}
+    nick_cfg = sh.get("nick_search") or {}
+    task_cfg = sh.get("task") or {}
+    max_pages = int(nick_cfg.get("max_pages", 1))
+    max_attempts = int(nick_cfg.get("max_attempts", 3))
+    poll_interval = float(task_cfg.get("poll_interval_secs", 3))
+    max_wait = float(task_cfg.get("max_wait_secs", 300))
+    return max_pages, max_attempts, poll_interval, max_wait
 
 
 def _run_one_nick(
     client: SherlockClient,
-    lead: dict,
+    username: str,
     *,
-    nick_cfg: dict,
-    task_cfg: dict,
-    on_poll: PollPrinter | None,
+    max_pages: int,
+    max_attempts: int,
+    poll_interval: float,
+    max_wait: float,
 ) -> tuple[str, dict | None, str | None]:
-    """Nick stage only — same API calls as pipeline._resolve_one_lead_via_sherlock."""
-    username = lead["username"]
-    poll_interval = float(task_cfg.get("poll_interval_secs", 3))
-    max_wait = float(task_cfg.get("max_wait_secs", 300))
-    max_pages = int(nick_cfg.get("max_pages", 1))
-    max_attempts = int(nick_cfg.get("max_attempts", 3))
     try:
+        query_nick = f"@{username}"
         enq = client.enqueue_nick(
-            nick=username,
+            nick=query_nick,
             search_in="telegram",
             max_pages=max_pages,
             max_attempts=max_attempts,
         )
         task_id = enq["id"]
-        if on_poll is not None:
-            on_poll(
-                "enqueued",
-                username,
-                task_id=task_id,
-            )
         task = client.wait_for_task(
             task_id,
             poll_interval=poll_interval,
             max_wait=max_wait,
-            on_poll=(
-                lambda pc, el, tk: on_poll("poll", username, poll_count=pc, elapsed=el, task=tk)
-                if on_poll is not None
-                else None
-            ),
         )
         return username, task, None
-    except (SherlockError, TimeoutError) as exc:
+    except (SherlockError, TimeoutError, OSError) as exc:
         return username, None, f"{type(exc).__name__}: {exc}"
     except Exception as exc:  # noqa: BLE001
         return username, None, f"{type(exc).__name__}: {exc}"
+
+
+def _interpret_nick_outcome(
+    queried_username: str,
+    task: dict | None,
+    client_error: str | None,
+) -> dict:
+    """Mirror Step 5's human-readable status for nick stage only."""
+    out = {
+        "status": SH_STATUS_ERROR,
+        "telegram_username": None,
+        "sherlock_link": None,
+        "error": None,
+    }
+    if client_error:
+        out["error"] = client_error
+        return out
+    if not task:
+        out["error"] = "empty task payload"
+        return out
+
+    task_status = (task.get("status") or "").lower()
+    if task_status == "completed":
+        results = ((task.get("result") or {}).get("results")) or []
+        if results:
+            first = results[0] or {}
+            tg_username = first.get("username") or queried_username
+            tg_link = first.get("link") or f"https://t.me/{tg_username}"
+            out.update({
+                "status": SH_STATUS_FOUND_NICK,
+                "telegram_username": tg_username,
+                "sherlock_link": tg_link,
+            })
+            return out
+        out["status"] = SH_STATUS_NO_MATCH
+        return out
+
+    out["status"] = SH_STATUS_NO_MATCH
+    return out
+
+
+def _has_profile_url(task: dict) -> bool:
+    """True when Sherlock payload includes result->results->profile_url."""
+    result = task.get("result") or {}
+    results = result.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and item.get("profile_url"):
+                return True
+        return False
+    if isinstance(results, dict):
+        return bool(results.get("profile_url"))
+    return False
 
 
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(
         description=(
-            "Sherlock nick-search batch test (Step 5 nick stage only). "
+            "Sherlock nick-search batch test (Step 5 stage 1 only). "
             "Read-only DB; no pipeline writes."
         )
     )
@@ -195,33 +200,21 @@ def main() -> int:
     parser.add_argument(
         "--workers",
         type=int,
-        default=None,
-        help="Thread pool size (default: same rules as pipeline Step 5).",
-    )
-    parser.add_argument(
-        "--no-poll-log",
-        action="store_true",
-        help="Disable enqueue/poll progress lines (only username banner + JSON).",
+        default=1,
+        help="Parallel Sherlock clients (default: 1 sequential).",
     )
     args = parser.parse_args()
-
-    # Ensure .env is loaded when the IDE cwd is not the repo root (pipeline
-    # often runs from repo root; this script may not).
-    load_dotenv(root / ".env")
-    load_dotenv()
 
     cfg = _load_cfg(args.config)
     db_path = _resolve_db_path(cfg, root, args.db)
 
     try:
-        leads = _fetch_leads_readonly(db_path, DB_SAMPLE_LIMIT)
+        usernames = _fetch_usernames_readonly(db_path, DB_SAMPLE_LIMIT)
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr, flush=True)
         return 1
 
-    sh_cfg = cfg.get("sherlock") or {}
-    nick_cfg = sh_cfg.get("nick_search") or {}
-    task_cfg = sh_cfg.get("task") or {}
+    max_pages, max_attempts, poll_interval, max_wait = _nick_params(cfg)
 
     print(
         "\n=== Usernames under test (Step 5 pool from DB, read-only) ===",
@@ -229,70 +222,66 @@ def main() -> int:
     )
     print(f"  DB: {db_path}", flush=True)
     print(f"  Limit (hardcoded): {DB_SAMPLE_LIMIT}", flush=True)
-    print(f"  Fetched: {len(leads)}", flush=True)
-    for i, lead in enumerate(leads, start=1):
-        print(f"  {i:2}. {lead['username']}", flush=True)
-    print(f"=== Total: {len(leads)} ===\n", flush=True)
+    print(f"  Fetched: {len(usernames)}", flush=True)
+    for i, uname in enumerate(usernames, start=1):
+        print(f"  {i:2}. {uname}", flush=True)
+    print(f"=== Total: {len(usernames)} ===\n", flush=True)
 
-    if not leads:
+    if not usernames:
         print("No candidates match Step 5 selector — nothing to query.", flush=True)
         return 0
 
-    print("Initializing Sherlock client (same factory as pipeline)...", flush=True)
-    try:
-        sherlock = make_sherlock_client(cfg)
-    except EnvironmentError as exc:
-        print(f"Cannot build Sherlock client: {exc}", file=sys.stderr, flush=True)
-        return 1
+    skipped_bad_nicks = 0
+    eligible_usernames: list[str] = []
+    for username in usernames:
+        if "." in username:
+            skipped_bad_nicks += 1
+            print(
+                f"  SKIP (nick not suitable): @{username} contains '.'",
+                flush=True,
+            )
+            continue
+        eligible_usernames.append(username)
 
-    workers, workers_source = _resolve_workers(sherlock, cfg, args.workers)
-    n = len(leads)
-    nick_eta_s = 30
-    best_eta = (n * nick_eta_s) / max(workers, 1)
+    if not eligible_usernames:
+        print("No suitable usernames after nick validation — nothing to query.", flush=True)
+        return 0
 
-    print(f"  Workers:         {workers}  (from {workers_source})", flush=True)
-    print(
-        f"  Rough ETA:       ~{_format_eta(best_eta)} wall-clock "
-        f"if ~{nick_eta_s}s per nick (actual time varies).",
-        flush=True,
-    )
-    print(
-        "  Poll log:        "
-        + ("off (--no-poll-log)" if args.no_poll_log else "on (stderr)"),
-        flush=True,
-    )
-    print(flush=True)
-
+    workers = max(1, int(args.workers))
     print_lock = threading.Lock()
-
-    def poll_printer(kind: str, username: str, **kw: object) -> None:
-        if args.no_poll_log:
-            return
-        with print_lock:
-            if kind == "enqueued":
-                tid = kw.get("task_id", "?")
-                print(
-                    f"  [{username}] enqueued task_id={tid!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            elif kind == "poll":
-                pc = kw.get("poll_count")
-                el = kw.get("elapsed")
-                task = kw.get("task") or {}
-                st = task.get("status")
-                print(
-                    f"  [{username}] poll #{pc} {float(el):.1f}s "
-                    f"task.status={st!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+    counters = {
+        SH_STATUS_FOUND_NICK: 0,
+        SH_STATUS_NO_MATCH: 0,
+        SH_STATUS_ERROR: 0,
+    }
+    progress_done = 0
 
     def dump_block(username: str, task: dict | None, err: str | None) -> None:
+        nonlocal progress_done
+        interpreted = _interpret_nick_outcome(username, task, err)
+        tag = interpreted["status"]
+        counters[tag] = counters.get(tag, 0) + 1
+        progress_done += 1
+        detail_bits: list[str] = []
+        if interpreted.get("telegram_username"):
+            detail_bits.append(f"tg=@{interpreted['telegram_username']}")
+        if interpreted.get("sherlock_link"):
+            detail_bits.append(f"link={interpreted['sherlock_link']}")
+        if interpreted.get("error") and interpreted["status"] == SH_STATUS_ERROR:
+            detail_bits.append(f"err={interpreted['error'][:80]}")
+        detail = "  " + " ".join(detail_bits) if detail_bits else ""
         with print_lock:
+            print(
+                f"  [{progress_done:>4}/{len(eligible_usernames)}] "
+                f"@{username:<25} -> {tag}{detail}",
+                flush=True,
+            )
             print(f"----- nick={username} -----", flush=True)
             if task is not None:
-                print(json.dumps(task, indent=2, ensure_ascii=False), flush=True)
+                if _has_profile_url(task):
+                    print(json.dumps(task, indent=2, ensure_ascii=False), flush=True)
+                else:
+                    print("аккаунт не найден", flush=True)
             else:
                 print(
                     json.dumps(
@@ -304,39 +293,50 @@ def main() -> int:
                 )
             print(flush=True)
 
-    on_poll: PollPrinter | None = poll_printer if not args.no_poll_log else None
-
+    clients = [make_sherlock_client(cfg) for _ in range(workers)]
     try:
         if workers == 1:
-            for lead in leads:
+            client = clients[0]
+            for username in eligible_usernames:
                 u, task, err = _run_one_nick(
-                    sherlock,
-                    lead,
-                    nick_cfg=nick_cfg,
-                    task_cfg=task_cfg,
-                    on_poll=on_poll,
+                    client,
+                    username,
+                    max_pages=max_pages,
+                    max_attempts=max_attempts,
+                    poll_interval=poll_interval,
+                    max_wait=max_wait,
                 )
                 dump_block(u, task, err)
         else:
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="sherlock_nick"
             ) as pool:
-                futures = {
-                    pool.submit(
+                futures = {}
+                for idx, username in enumerate(eligible_usernames):
+                    c = clients[idx % workers]
+                    fut = pool.submit(
                         _run_one_nick,
-                        sherlock,
-                        lead,
-                        nick_cfg=nick_cfg,
-                        task_cfg=task_cfg,
-                        on_poll=on_poll,
-                    ): lead
-                    for lead in leads
-                }
+                        c,
+                        username,
+                        max_pages=max_pages,
+                        max_attempts=max_attempts,
+                        poll_interval=poll_interval,
+                        max_wait=max_wait,
+                    )
+                    futures[fut] = username
                 for fut in as_completed(futures):
                     u, task, err = fut.result()
                     dump_block(u, task, err)
     finally:
-        sherlock.close()
+        for c in clients:
+            c.close()
+
+    print()
+    print(f"  DONE: {len(eligible_usernames)} processed")
+    if skipped_bad_nicks:
+        print(f"    skipped_bad_nicks   {skipped_bad_nicks}")
+    for label in (SH_STATUS_FOUND_NICK, SH_STATUS_NO_MATCH, SH_STATUS_ERROR):
+        print(f"    {label:<18} {counters.get(label, 0)}")
 
     return 0
 
