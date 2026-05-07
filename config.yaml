@@ -89,7 +89,7 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 10000
+    louisdeconinck_comments_cap_per_post: 20000
 
   step4:
     # apify/instagram-profile-scraper batch size. Apify accepts up
@@ -99,14 +99,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 1000
+    batch_limit: 100
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
-    batch_limit: 1000
+    batch_limit: 100
 
 db:
   path: "data/leads.db"
@@ -175,7 +175,7 @@ sherlock:
     max_attempts: 3
   task:
     poll_interval_secs: 3
-    max_wait_secs: 300
+    max_wait_secs: 600
   concurrency:
     workers: null
 

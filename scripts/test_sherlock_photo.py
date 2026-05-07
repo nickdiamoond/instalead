@@ -73,7 +73,7 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_PHOTO = "man.jpg"
 DEFAULT_HTTP_TIMEOUT = 30      # per-request HTTP timeout
 DEFAULT_POLL_INTERVAL = 3.0    # seconds between /tasks/{id} polls
-DEFAULT_MAX_WAIT = 300         # overall budget for one task (5 min)
+DEFAULT_MAX_WAIT = 600         # overall budget for one task (5 min)
 DEFAULT_MAX_PAGES = 20         # Sherlock-side knob (also the API default)
 
 
