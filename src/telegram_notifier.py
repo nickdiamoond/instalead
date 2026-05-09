@@ -16,16 +16,20 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.types import FSInputFile
 
+from src.ig_media_payload import parse_item_timestamp_utc
 from src.logger import get_logger
 
 log = get_logger("telegram_notifier")
+
+# Pause between Step 1 per-post Telegram messages (rate limits / UX).
+_STEP1_NEW_POST_MESSAGE_DELAY_SEC = 0.5
 
 TOKEN_ENV_VAR = "TELEGRAM_BOT_TOKEN"
 
 # One initial attempt + this many retries; 20s pause after each failure.
 _TELEGRAM_SEND_RETRIES = 3
-_TELEGRAM_RETRY_DELAY_SEC = 20.0
-_TELEGRAM_REQUEST_TIMEOUT_SEC = 20.0
+_TELEGRAM_RETRY_DELAY_SEC = 40.0
+_TELEGRAM_REQUEST_TIMEOUT_SEC = 40.0
 
 
 def _is_retryable_telegram_send_error(exc: BaseException) -> bool:
@@ -55,6 +59,107 @@ def truncate_for_telegram(text: str, limit: int = _TELEGRAM_MESSAGE_HARD_LIMIT) 
         return text
     suffix = "\n...(truncated for Telegram limit)"
     return text[: max(0, limit - len(suffix))] + suffix
+
+
+def step1_display_content_type(item: dict[str, Any]) -> str:
+    """Map Apify ``type`` / ``productType`` to Image | Video | Sidecar."""
+    raw = (item.get("type") or "").strip()
+    if raw in ("Image", "Video", "Sidecar"):
+        return raw
+    if raw:
+        return raw
+    return "Unknown"
+
+
+def build_step1_new_post_message(item: dict[str, Any]) -> str:
+    """One Telegram text per newly upserted Step 1 post (Apify-shaped dict)."""
+    shortcode = (item.get("shortCode") or "").strip()
+    url = (item.get("url") or "").strip()
+    if not url and shortcode:
+        url = f"https://www.instagram.com/p/{shortcode}/"
+    if not url:
+        url = "(unknown)"
+
+    ts_raw = item.get("timestamp")
+    ts_parsed = parse_item_timestamp_utc(ts_raw)
+    if ts_parsed is not None:
+        ts_line = ts_parsed.strftime("%Y-%m-%d %H:%M:%S UTC")
+    else:
+        ts_line = str(ts_raw).strip() if ts_raw is not None else "(unknown)"
+
+    owner = (item.get("ownerUsername") or "").strip() or "(unknown)"
+
+    raw_tags = item.get("hashtags")
+    tags: list[str] = []
+    if isinstance(raw_tags, list):
+        tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+    elif isinstance(raw_tags, str) and raw_tags.strip():
+        tags = [raw_tags.strip()]
+
+    hashtag_lines: list[str]
+    if tags:
+        hashtag_lines = []
+        for t in tags:
+            hashtag_lines.append(t if t.startswith("#") else f"#{t}")
+    else:
+        hashtag_lines = ["(none)"]
+
+    comments_n = item.get("commentsCount")
+    likes_n = item.get("likesCount")
+    ctype = step1_display_content_type(item)
+
+    loc_name = item.get("locationName")
+    loc_id = item.get("locationId")
+    loc_name_s = (
+        str(loc_name).strip()
+        if loc_name is not None and str(loc_name).strip()
+        else ""
+    )
+    loc_id_s = (
+        str(loc_id).strip()
+        if loc_id is not None and str(loc_id).strip()
+        else ""
+    )
+
+    lines: list[str] = [
+        "Step 1 · new post",
+        "────────",
+        "",
+        "url",
+        url,
+        "",
+        "timestamp",
+        ts_line,
+        "",
+        "ownerUsername",
+        owner,
+        "",
+        "hashtags",
+        *hashtag_lines,
+        "",
+        "commentsCount",
+        str(comments_n if comments_n is not None else "—"),
+        "",
+        "likesCount",
+        str(likes_n if likes_n is not None else "—"),
+        "",
+        "type",
+        ctype,
+    ]
+
+    if loc_name_s or loc_id_s:
+        lines.extend(
+            [
+                "",
+                "locationName",
+                loc_name_s if loc_name_s else "—",
+                "",
+                "locationId",
+                loc_id_s if loc_id_s else "—",
+            ]
+        )
+
+    return "\n".join(lines)
 
 
 def build_step2_scored_video_message(
@@ -262,15 +367,35 @@ class PipelineTelegramNotifier:
         chat_id = _parse_report_chat_id(cfg)
         return cls(token, chat_id)
 
-    def notify_step1(self, new_posts: int, realtors_count: int) -> None:
+    def notify_step1(
+        self,
+        new_posts: int,
+        source_count: int,
+        *,
+        discovery_mode: str = "realtors",
+    ) -> None:
         if not self._enabled:
             return
+        if discovery_mode == "hashtags":
+            tail = f"searched {source_count} hashtag(s)."
+        else:
+            tail = f"searched {source_count} active realtor(s)."
         text = (
             "Step 1: "
             f"{new_posts} new post(s) saved;\n "
-            f"searched {realtors_count} active realtor(s)."
+            f"{tail}"
         )
         self._send_sync(text)
+
+    def notify_step1_new_posts(self, items: list[dict[str, Any]]) -> None:
+        """Send one message per new post; ``0.5s`` pause between sends."""
+        if not self._enabled or not items:
+            return
+        for i, raw in enumerate(items):
+            text = truncate_for_telegram(build_step1_new_post_message(raw))
+            self._send_sync(text)
+            if i + 1 < len(items):
+                time.sleep(_STEP1_NEW_POST_MESSAGE_DELAY_SEC)
 
     def notify_step2_scored_video(
         self,

@@ -1,7 +1,7 @@
 """Daily lead collection pipeline.
 
 Steps:
-  1. Fetch recent posts/reels from tracked realtors
+  1. Fetch recent posts/reels (tracked realtors or hashtags — ``pipeline.step1.discovery_mode``)
   2. Score new posts via DeepSeek (relevance + CTA)
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
@@ -16,6 +16,7 @@ import copy
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +39,13 @@ from src.contact_extractor import extract_contacts
 from src.db import LeadDB
 from src.face_embedder import make_face_embedder
 from src.face_leader import resolve_face_leader
+from src.ig_media_payload import (
+    extract_video_url,
+    filter_items_within_max_age,
+    is_reel_payload,
+    is_valid_video_url,
+    merge_hashtag_items_by_shortcode,
+)
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 from src.sherlock_client import (
@@ -66,6 +74,12 @@ log = get_logger("pipeline")
 # comments filter that gates entry into ``processed_posts``.
 DEFAULT_POSTS_MAX_AGE_DAYS = 7
 DEFAULT_MIN_COMMENTS = 10
+# ``apify/instagram-post-scraper`` input ``resultsLimit`` (per username).
+# Override via ``pipeline.step1.post_scraper_results_limit`` (legacy:
+# ``apify.test_limits.post_scraper_results_limit`` still honored if step1 omits it).
+DEFAULT_POST_SCRAPER_RESULTS_LIMIT = 20
+# Step 1: ``pipeline.step1.discovery_mode`` — ``realtors`` | ``hashtags``.
+DEFAULT_STEP1_DISCOVERY_MODE = "realtors"
 
 # Step 3: comment re-scan growth threshold + the displayed cost
 # estimate per fetched comment (real bill comes from
@@ -85,6 +99,8 @@ DEFAULT_STEP4_BATCH_LIMIT = 1000
 # ``python scripts/pipeline.py`` behavior reproducible across
 # machines / cron jobs -- override via config.yaml.
 DEFAULT_SHERLOCK_BATCH_LIMIT = 1000
+DEFAULT_SHERLOCK_SEQUENTIAL = True
+DEFAULT_SHERLOCK_REQUEST_GAP_SECS = 5.0
 
 # Step 3 comment scrapers. louisdeconinck is the primary because its
 # snake_case Instagram-raw output maps 1:1 to ``lead_accounts`` columns
@@ -452,10 +468,9 @@ def _fetch_comments_with_fallback(
 #      is anything OTHER than the exact Cyrillic string "не совпадение",
 #      save phone + link. Otherwise mark no_match.
 #
-# Workers run the full nick->photo flow per lead end-to-end, in parallel,
-# and DB writes are serialised in the main thread (one futures.as_completed
-# loop) so SQLite stays single-writer regardless of how many workers we
-# spin up.
+# By default Step 5 runs one lead at a time (sequential) with a short
+# pause between leads; set ``pipeline.step5.sequential: false`` to fan
+# out across a thread pool again. DB writes stay on the main thread.
 
 # Sherlock outcome labels stored in lead_accounts.sherlock_status. Kept
 # as a centralized vocabulary so the pipeline summary banner and
@@ -671,22 +686,30 @@ def _step_5_resolve_contacts_via_sherlock(
     *,
     batch_limit: int,
     workers_override: int | None,
+    sequential: bool,
+    request_gap_secs: float,
     auto_yes: bool,
     log,
     issues: list[tuple[str, str]],
     tg_notifier: PipelineTelegramNotifier,
 ) -> None:
-    """Run Sherlock contact resolution for naked leads in parallel.
+    """Run Sherlock contact resolution for naked leads (parallel or sequential).
 
     Pulls up to ``batch_limit`` candidates via
     :py:meth:`LeadDB.get_leads_for_sherlock` (mirrors Step 4's
     ``get_leads_without_profile`` pattern -- one pipeline run eats
     a bounded chunk of the Sherlock backlog, leftovers are picked
     up next run since ``sherlock_processed_at`` is set on every
-    terminal outcome), fans them out across a thread pool sized
-    to either ``workers_override`` (CLI flag) or
-    ``/v1/health.pool.idle`` (fallback 3 if unreachable), and
-    persists each terminal outcome to the DB as it arrives.
+    terminal outcome).
+
+    By default (``pipeline.step5.sequential``) each lead is fully
+    resolved before the next starts, with ``request_gap_secs`` between
+    leads (after the first). With ``sequential: false``, leads are fanned
+    out across a thread pool sized to either ``workers_override`` (CLI)
+    or ``/v1/health.pool.idle`` (fallback 3 if unreachable).
+
+    DB writes always happen on the main thread so SQLite stays
+    single-writer.
 
     ``batch_limit`` is sourced by ``main()`` from
     ``config.yaml`` (``pipeline.step5.batch_limit``), defaulting
@@ -720,8 +743,13 @@ def _step_5_resolve_contacts_via_sherlock(
         return
 
     try:
-        # Workers: CLI override beats config beats live pool probe.
-        if workers_override is not None:
+        gap_s = max(0.0, float(request_gap_secs))
+        # Workers: sequential forces 1; else CLI override beats config
+        # beats live pool probe.
+        if sequential:
+            workers = 1
+            workers_source = "sequential (pipeline.step5.sequential)"
+        elif workers_override is not None:
             workers = max(1, int(workers_override))
             workers_source = "--workers"
         elif conc_cfg.get("workers"):
@@ -739,14 +767,35 @@ def _step_5_resolve_contacts_via_sherlock(
         #   worst = every nick misses, every face_photo'd lead burns a
         #           full photo task
         n = len(candidates)
-        best_eta = (n * NICK_TASK_ETA_S) / max(workers, 1)
-        worst_eta = (
-            n * NICK_TASK_ETA_S + with_face * PHOTO_TASK_ETA_S
-        ) / max(workers, 1)
+        if sequential:
+            best_eta = n * NICK_TASK_ETA_S
+            worst_eta = n * NICK_TASK_ETA_S + with_face * PHOTO_TASK_ETA_S
+            if gap_s > 0 and n > 1:
+                best_eta += gap_s * (n - 1)
+                worst_eta += gap_s * (n - 1)
+        else:
+            best_eta = (n * NICK_TASK_ETA_S) / max(workers, 1)
+            worst_eta = (
+                n * NICK_TASK_ETA_S + with_face * PHOTO_TASK_ETA_S
+            ) / max(workers, 1)
+
+        if not sequential and gap_s > 0:
+            print(
+                "  NOTE: request_gap_secs is ignored unless sequential mode "
+                "(pipeline.step5.sequential)."
+            )
+            log.warning(
+                "step5_gap_ignored_not_sequential",
+                request_gap_secs=gap_s,
+            )
 
         print(f"  Candidates:        {n}")
         print(f"  With face photo:   {with_face}  (eligible for photo fallback)")
         print(f"  Workers:           {workers}  (from {workers_source})")
+        if sequential and gap_s > 0:
+            print(
+                f"  Gap between leads: {gap_s}s  (pipeline.step5.request_gap_secs)"
+            )
         print(f"  Best-case ETA:     {_format_eta(best_eta)}  "
               f"(every nick search hits)")
         print(f"  Worst-case ETA:    {_format_eta(worst_eta)}  "
@@ -770,6 +819,8 @@ def _step_5_resolve_contacts_via_sherlock(
             with_face=with_face,
             workers=workers,
             workers_source=workers_source,
+            sequential=sequential,
+            request_gap_secs=gap_s if sequential else 0.0,
         )
 
         counters: dict[str, int] = {
@@ -780,79 +831,93 @@ def _step_5_resolve_contacts_via_sherlock(
             SH_STATUS_ERROR: 0,
         }
 
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="sherlock"
-        ) as pool:
-            futures = {
-                pool.submit(
-                    _resolve_one_lead_via_sherlock,
-                    sherlock,
-                    lead,
-                    nick_cfg=nick_cfg,
-                    photo_cfg=photo_cfg,
-                    task_cfg=task_cfg,
-                ): lead
-                for lead in candidates
+        def _worker_error_payload(username: str, exc: Exception) -> dict:
+            return {
+                "username": username,
+                "status": SH_STATUS_ERROR,
+                "telegram_username": None,
+                "phone": None,
+                "sherlock_link": None,
+                "error": f"worker crashed: {type(exc).__name__}: {exc}",
+                "nick_skipped_dot": "." in username,
+                "nick_search_ran": False,
+                "nick_hit": False,
+                "photo_search_ran": False,
+                "photo_task": None,
+                "nick_query": None if "." in username else f"@{username}",
             }
-            for i, fut in enumerate(as_completed(futures), 1):
-                lead = futures[fut]
+
+        def _apply_step5_result(lead: dict, res: dict, progress_i: int) -> None:
+            username = lead["username"]
+            db.mark_lead_sherlock(
+                username=username,
+                status=res["status"],
+                telegram_username=res.get("telegram_username"),
+                phone=res.get("phone"),
+                sherlock_link=res.get("sherlock_link"),
+            )
+            tg_notifier.notify_sherlock_lead(lead, res, cfg=cfg)
+            counters[res["status"]] = counters.get(res["status"], 0) + 1
+            tag = res["status"]
+            detail_bits: list[str] = []
+            if res.get("telegram_username"):
+                detail_bits.append(f"tg=@{res['telegram_username']}")
+            if res.get("phone"):
+                detail_bits.append(f"phone={res['phone']}")
+            if res.get("sherlock_link"):
+                detail_bits.append(f"link={res['sherlock_link']}")
+            if res.get("error") and res["status"] == SH_STATUS_ERROR:
+                detail_bits.append(f"err={res['error'][:80]}")
+            detail = "  " + " ".join(detail_bits) if detail_bits else ""
+            print(f"  [{progress_i:>4}/{n}] @{username:<25} -> {tag}{detail}")
+            log.info(
+                "step5_lead_done",
+                username=username,
+                status=tag,
+                telegram_username=res.get("telegram_username"),
+                phone=bool(res.get("phone")),
+                error=res.get("error"),
+            )
+
+        if sequential:
+            for idx, lead in enumerate(candidates, 1):
+                if idx > 1 and gap_s > 0:
+                    time.sleep(gap_s)
                 username = lead["username"]
-                # Worker is supposed to swallow all exceptions, but
-                # belt-and-suspenders: a stray crash maps to error.
                 try:
-                    res = fut.result()
+                    res = _resolve_one_lead_via_sherlock(
+                        sherlock,
+                        lead,
+                        nick_cfg=nick_cfg,
+                        photo_cfg=photo_cfg,
+                        task_cfg=task_cfg,
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    res = {
-                        "username": username,
-                        "status": SH_STATUS_ERROR,
-                        "telegram_username": None,
-                        "phone": None,
-                        "sherlock_link": None,
-                        "error": f"worker crashed: {type(exc).__name__}: {exc}",
-                        "nick_skipped_dot": "." in username,
-                        "nick_search_ran": False,
-                        "nick_hit": False,
-                        "photo_search_ran": False,
-                        "photo_task": None,
-                        "nick_query": None if "." in username else f"@{username}",
-                    }
-
-                # DB write happens here on the main thread -- SQLite
-                # stays single-writer, no Lock needed even though we
-                # have many workers.
-                db.mark_lead_sherlock(
-                    username=username,
-                    status=res["status"],
-                    telegram_username=res.get("telegram_username"),
-                    phone=res.get("phone"),
-                    sherlock_link=res.get("sherlock_link"),
-                )
-                tg_notifier.notify_sherlock_lead(lead, res, cfg=cfg)
-                counters[res["status"]] = counters.get(res["status"], 0) + 1
-
-                # Per-lead progress line. Kept short -- multiple
-                # workers will interleave and a wall of text would
-                # bury the structlog stderr stream.
-                tag = res["status"]
-                detail_bits: list[str] = []
-                if res.get("telegram_username"):
-                    detail_bits.append(f"tg=@{res['telegram_username']}")
-                if res.get("phone"):
-                    detail_bits.append(f"phone={res['phone']}")
-                if res.get("sherlock_link"):
-                    detail_bits.append(f"link={res['sherlock_link']}")
-                if res.get("error") and res["status"] == SH_STATUS_ERROR:
-                    detail_bits.append(f"err={res['error'][:80]}")
-                detail = "  " + " ".join(detail_bits) if detail_bits else ""
-                print(f"  [{i:>4}/{n}] @{username:<25} -> {tag}{detail}")
-                log.info(
-                    "step5_lead_done",
-                    username=username,
-                    status=tag,
-                    telegram_username=res.get("telegram_username"),
-                    phone=bool(res.get("phone")),
-                    error=res.get("error"),
-                )
+                    res = _worker_error_payload(username, exc)
+                _apply_step5_result(lead, res, idx)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="sherlock"
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        _resolve_one_lead_via_sherlock,
+                        sherlock,
+                        lead,
+                        nick_cfg=nick_cfg,
+                        photo_cfg=photo_cfg,
+                        task_cfg=task_cfg,
+                    ): lead
+                    for lead in candidates
+                }
+                for i, fut in enumerate(as_completed(futures), 1):
+                    lead = futures[fut]
+                    username = lead["username"]
+                    try:
+                        res = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        res = _worker_error_payload(username, exc)
+                    _apply_step5_result(lead, res, i)
 
         # Final breakdown.
         print()
@@ -986,8 +1051,9 @@ def _parse_cli_args() -> argparse.Namespace:
         "--workers",
         type=int,
         default=None,
-        help="Override Step 5 worker count. Default: probe /v1/health "
-             "and use pool.idle (fallback 3).",
+        help="Override Step 5 worker count when pipeline.step5.sequential "
+             "is false. Default: probe /v1/health and use pool.idle "
+             "(fallback 3).",
     )
     parser.add_argument(
         "--yes",
@@ -1059,6 +1125,22 @@ def main():
     min_comments = int(
         s1_cfg.get("min_comments_per_post", DEFAULT_MIN_COMMENTS)
     )
+    test_limits_cfg = (cfg.get("apify") or {}).get("test_limits") or {}
+    post_scraper_results_limit = int(
+        s1_cfg.get(
+            "post_scraper_results_limit",
+            test_limits_cfg.get(
+                "post_scraper_results_limit",
+                DEFAULT_POST_SCRAPER_RESULTS_LIMIT,
+            ),
+        )
+    )
+    discovery_mode = str(
+        s1_cfg.get("discovery_mode", DEFAULT_STEP1_DISCOVERY_MODE)
+    ).strip().lower()
+    hashtag_results_limit = int(
+        s1_cfg.get("hashtag_results_limit", post_scraper_results_limit)
+    )
     comments_growth_pct = float(
         s3_cfg.get("comments_growth_pct", DEFAULT_COMMENTS_GROWTH_PCT)
     )
@@ -1080,62 +1162,198 @@ def main():
     sherlock_batch_limit = int(
         s5_cfg.get("batch_limit", DEFAULT_SHERLOCK_BATCH_LIMIT)
     )
+    sherlock_sequential = bool(
+        s5_cfg.get("sequential", DEFAULT_SHERLOCK_SEQUENTIAL)
+    )
+    sherlock_request_gap_secs = float(
+        s5_cfg.get(
+            "request_gap_secs",
+            DEFAULT_SHERLOCK_REQUEST_GAP_SECS,
+        )
+    )
 
     stats_before = db.get_stats()
     log.info("pipeline_start", **stats_before)
 
     # ============================================================
-    # STEP 1: Fetch posts from tracked realtors
+    # STEP 1: Fetch posts (tracked realtors OR hashtag discovery)
     # ============================================================
-    _banner(f"STEP 1: Fetch posts (last {posts_max_age_days} days)")
-    realtors = db.get_active_realtors()
-    if not realtors:
-        log.error("no_realtors", msg="Add realtors to tracked_realtors table first")
-        print("FAILED: no active realtors in DB. Add rows to tracked_realtors first.")
-        issues.append(("Step 1", "no active realtors in tracked_realtors"))
+    actors_cfg = (cfg.get("apify") or {}).get("actors") or {}
+    hashtag_actor_id = actors_cfg.get("hashtag", "apify/instagram-hashtag-scraper")
+
+    if discovery_mode not in ("realtors", "hashtags"):
+        log.error("step1_invalid_discovery_mode", mode=discovery_mode)
+        print(
+            "FAILED: pipeline.step1.discovery_mode must be 'realtors' or "
+            f"'hashtags', got {discovery_mode!r}."
+        )
+        issues.append(("Step 1", f"invalid discovery_mode: {discovery_mode}"))
         return
 
-    print(f"  Realtors:       {len(realtors)}")
-    log.info("step1_fetch_posts", realtors=len(realtors), max_age_days=posts_max_age_days)
+    step1_cost_usd = 0.0
+    posts_age_stats: dict[str, int] | None = None
+    reels_age_stats: dict[str, int] | None = None
+    step1_empty_issue = "post-scraper returned 0 items"
+    notify_secondary_count = 0
 
-    run = apify.actor("apify/instagram-post-scraper").call(run_input={
-        "username": realtors,
-        "resultsLimit": 20,
-        "onlyPostsNewerThan": f"{posts_max_age_days} days",
-        "dataDetailLevel": "basicData",
-        "proxy": {"useApifyProxy": True},
-    })
-    detail = apify.run(run["id"]).get()
-    all_posts = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
+    if discovery_mode == "realtors":
+        _banner(f"STEP 1: Fetch posts (last {posts_max_age_days} days) [realtors]")
+        realtors = db.get_active_realtors()
+        if not realtors:
+            log.error("no_realtors", msg="Add realtors to tracked_realtors table first")
+            print("FAILED: no active realtors in DB. Add rows to tracked_realtors first.")
+            issues.append(("Step 1", "no active realtors in tracked_realtors"))
+            return
 
-    pipeline.log_run(
-        actor_id="apify/instagram-post-scraper",
-        run_id=run["id"], status=run["status"],
-        input_params={"realtors": len(realtors)},
-        items_count=len(all_posts),
-        cost_usd=detail.get("usageTotalUsd", 0),
-        duration_ms=detail.get("stats", {}).get("durationMillis"),
-    )
+        notify_secondary_count = len(realtors)
+        print(f"  Realtors:       {len(realtors)}")
+        log.info(
+            "step1_fetch_posts",
+            discovery_mode=discovery_mode,
+            realtors=len(realtors),
+            max_age_days=posts_max_age_days,
+            post_scraper_results_limit=post_scraper_results_limit,
+        )
+
+        run = apify.actor("apify/instagram-post-scraper").call(run_input={
+            "username": realtors,
+            "resultsLimit": post_scraper_results_limit,
+            "onlyPostsNewerThan": f"{posts_max_age_days} days",
+            "dataDetailLevel": "basicData",
+            "proxy": {"useApifyProxy": True},
+        })
+        detail = apify.run(run["id"]).get()
+        all_posts = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
+        step1_cost_usd = float(detail.get("usageTotalUsd") or 0)
+
+        pipeline.log_run(
+            actor_id="apify/instagram-post-scraper",
+            run_id=run["id"],
+            status=run["status"],
+            input_params={
+                "realtors": len(realtors),
+                "resultsLimit": post_scraper_results_limit,
+            },
+            items_count=len(all_posts),
+            cost_usd=detail.get("usageTotalUsd", 0),
+            duration_ms=detail.get("stats", {}).get("durationMillis"),
+        )
+    else:
+        hashtags = list((cfg.get("search") or {}).get("hashtags") or [])
+        _banner(
+            f"STEP 1: Fetch posts via hashtags "
+            f"(≤{posts_max_age_days}d by timestamp) [hashtags]"
+        )
+        if not hashtags:
+            log.error("step1_no_hashtags")
+            print(
+                "FAILED: search.hashtags is empty in config for discovery_mode=hashtags."
+            )
+            issues.append(("Step 1", "search.hashtags empty"))
+            return
+
+        notify_secondary_count = len(hashtags)
+        print(f"  Hashtags:       {len(hashtags)}")
+        log.info(
+            "step1_fetch_posts",
+            discovery_mode=discovery_mode,
+            hashtags=len(hashtags),
+            hashtag_results_limit=hashtag_results_limit,
+            max_age_days=posts_max_age_days,
+        )
+
+        proxy_in = {"useApifyProxy": True}
+        run_base = {
+            "hashtags": hashtags,
+            "resultsLimit": hashtag_results_limit,
+            "proxy": proxy_in,
+        }
+
+        run_p = apify.actor(hashtag_actor_id).call(
+            run_input={**run_base, "resultsType": "posts"}
+        )
+        detail_p = apify.run(run_p["id"]).get()
+        posts_fetched = list(apify.dataset(run_p["defaultDatasetId"]).iterate_items())
+        posts_filtered, posts_age_stats = filter_items_within_max_age(
+            posts_fetched, posts_max_age_days
+        )
+        cost_p = float(detail_p.get("usageTotalUsd") or 0)
+        step1_cost_usd += cost_p
+        pipeline.log_run(
+            actor_id=hashtag_actor_id,
+            run_id=run_p["id"],
+            status=run_p["status"],
+            input_params={
+                "hashtags": len(hashtags),
+                "resultsType": "posts",
+                "resultsLimit": hashtag_results_limit,
+            },
+            items_count=len(posts_fetched),
+            cost_usd=cost_p,
+            duration_ms=detail_p.get("stats", {}).get("durationMillis"),
+        )
+
+        run_r = apify.actor(hashtag_actor_id).call(
+            run_input={**run_base, "resultsType": "reels"}
+        )
+        detail_r = apify.run(run_r["id"]).get()
+        reels_fetched = list(apify.dataset(run_r["defaultDatasetId"]).iterate_items())
+        reels_filtered, reels_age_stats = filter_items_within_max_age(
+            reels_fetched, posts_max_age_days
+        )
+        cost_r = float(detail_r.get("usageTotalUsd") or 0)
+        step1_cost_usd += cost_r
+        pipeline.log_run(
+            actor_id=hashtag_actor_id,
+            run_id=run_r["id"],
+            status=run_r["status"],
+            input_params={
+                "hashtags": len(hashtags),
+                "resultsType": "reels",
+                "resultsLimit": hashtag_results_limit,
+            },
+            items_count=len(reels_fetched),
+            cost_usd=cost_r,
+            duration_ms=detail_r.get("stats", {}).get("durationMillis"),
+        )
+
+        all_posts = merge_hashtag_items_by_shortcode(posts_filtered, reels_filtered)
+        step1_empty_issue = "hashtag-scraper returned 0 items after merge/filter"
+        log.info(
+            "step1_hashtag_merge",
+            posts_raw=len(posts_fetched),
+            reels_raw=len(reels_fetched),
+            merged=len(all_posts),
+            posts_age_stats=posts_age_stats,
+            reels_age_stats=reels_age_stats,
+        )
 
     # Filter by min comments and register in DB
     new_posts = 0
+    step1_new_post_items: list[dict] = []
     updated_posts = 0
+    skipped_no_video_url = 0
     # In-memory bridge to step 2: shortcode -> fresh IG videoUrl. Used by
     # the transcription fallback. Stored only for the lifetime of this
     # run because IG CDN URLs are signed and expire in ~1-2 days.
     post_videos: dict[str, str] = {}
     for p in all_posts:
-        shortcode = p.get("shortCode", "")
+        shortcode = (p.get("shortCode") or "").strip()
         comments_count = p.get("commentsCount") or 0
         if comments_count < min_comments:
             continue
+        if not shortcode:
+            continue
 
-        is_reel = p.get("type") == "Video" or p.get("productType") == "clips"
-        existing = db.get_post(shortcode)
-
-        video_url = p.get("videoUrl")
-        if shortcode and video_url:
+        is_reel = is_reel_payload(p)
+        video_url = extract_video_url(p)
+        if is_reel:
+            if not is_valid_video_url(video_url):
+                skipped_no_video_url += 1
+                continue
             post_videos[shortcode] = video_url
+
+        existing = db.get_post(shortcode)
 
         if existing:
             # Update comments_count if changed
@@ -1156,17 +1374,35 @@ def main():
                 timestamp=p.get("timestamp"),
             )
             new_posts += 1
+            step1_new_post_items.append(p)
 
-    log.info("step1_done", total_posts=len(all_posts), new=new_posts, updated=updated_posts,
-             videos=len(post_videos), cost=detail.get("usageTotalUsd", 0))
-    print(f"  DONE: fetched {len(all_posts)} posts "
-          f"(new={new_posts}, updated={updated_posts}, "
-          f"with_video={len(post_videos)}) "
-          f"cost=${detail.get('usageTotalUsd', 0):.4f}")
+    log.info(
+        "step1_done",
+        discovery_mode=discovery_mode,
+        total_posts=len(all_posts),
+        new=new_posts,
+        updated=updated_posts,
+        videos=len(post_videos),
+        skipped_no_video_url=skipped_no_video_url,
+        cost=step1_cost_usd,
+        posts_age_stats=posts_age_stats,
+        reels_age_stats=reels_age_stats,
+    )
+    print(
+        f"  DONE: fetched {len(all_posts)} posts "
+        f"(new={new_posts}, updated={updated_posts}, "
+        f"with_video={len(post_videos)}, skipped_no_video_url={skipped_no_video_url}) "
+        f"cost=${step1_cost_usd:.4f}"
+    )
     if len(all_posts) == 0:
-        issues.append(("Step 1", "post-scraper returned 0 items"))
+        issues.append(("Step 1", step1_empty_issue))
 
-    tg_notifier.notify_step1(new_posts, len(realtors))
+    tg_notifier.notify_step1(
+        new_posts,
+        notify_secondary_count,
+        discovery_mode=discovery_mode,
+    )
+    tg_notifier.notify_step1_new_posts(step1_new_post_items)
 
     # ============================================================
     # STEP 2: Score new posts via DeepSeek (caption + transcript)
@@ -1630,7 +1866,7 @@ def main():
     )
 
     # ============================================================
-    # STEP 5: Resolve Telegram contacts via Sherlock (parallel)
+    # STEP 5: Resolve Telegram contacts via Sherlock
     # ============================================================
     # Only runs for "naked" leads -- profile fetched but bio gave us
     # no phone / telegram. Step 4's contact_extractor wins ties; we
@@ -1646,6 +1882,8 @@ def main():
             cfg,
             batch_limit=sherlock_batch_limit,
             workers_override=args.workers,
+            sequential=sherlock_sequential,
+            request_gap_secs=sherlock_request_gap_secs,
             auto_yes=args.yes,
             log=log,
             issues=issues,

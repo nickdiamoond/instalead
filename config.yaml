@@ -30,14 +30,18 @@ apify:
 
   test_limits:
     search_limit: 5       # макс. результатов поиска юзеров
-    results_limit: 10     # макс. постов на хештег/аккаунт
+    # hashtag-scraper и прочие dev-скрипты через ApifyWrapper (не daily Step 1)
+    results_limit: 1     # макс. постов на хештег/аккаунт
     comments_limit: 15    # макс. комментов на пост
 
 search:
   # Method 1: поиск по хештегам (через instagram-hashtag-scraper)
   hashtags:
+    - "квартира"
+    - "недвижимость"
     - "квартираспб"
     - "недвижимостьспб"
+    - "недвижимостьпетербург"
     - "новостройкиспб"
     - "купитьквартируспб"
     - "жильеспб"
@@ -63,7 +67,7 @@ cycle:
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -1003926996735
+  report_chat_id: -1003926996735 #-5255644193 
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. All values have safe defaults baked into the
@@ -72,6 +76,14 @@ telegram:
 # the in-code default.
 pipeline:
   step1:
+    # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on DB
+    # tracked_realtors) or "hashtags" (instagram-hashtag-scraper on search.hashtags).
+    discovery_mode: hashtags
+    # apify/instagram-post-scraper: resultsLimit per username (realtors mode).
+    post_scraper_results_limit: 20
+    # instagram-hashtag-scraper: resultsLimit per hashtag per resultsType (posts vs reels).
+    # Defaults to post_scraper_results_limit above when omitted.
+    hashtag_results_limit: 10
     # apify/instagram-post-scraper input "onlyPostsNewerThan = N days".
     # Realtors don't update old posts, so this both bounds the dataset
     # and keeps comments fresh enough for Step 3 to find new commenters.
@@ -111,6 +123,11 @@ pipeline:
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
     batch_limit: 30
+    # Temporary throttle: one lead fully resolved before the next; pause
+    # (seconds) between leads after the first. Set sequential: false to
+    # restore parallel Step 5.
+    sequential: true
+    request_gap_secs: 5
 
 db:
   path: "data/leads.db"

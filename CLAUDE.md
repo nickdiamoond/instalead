@@ -89,10 +89,21 @@ test code -- just swap the dict.
 Daily pipeline (`scripts/pipeline.py`):
 
 ```
-Step 1: Fetch posts from tracked_realtors (batch, last 7 days)
-        Actor: instagram-post-scraper
-        Skip posts already in DB, update comments_count for existing
-        Filter: commentsCount >= 10
+Step 1: Discover posts (config: pipeline.step1.discovery_mode)
+        Mode "realtors" (default): tracked_realtors → instagram-post-scraper
+        batch, onlyPostsNewerThan = pipeline.step1.posts_max_age_days,
+        resultsLimit = pipeline.step1.post_scraper_results_limit (legacy fallback:
+        apify.test_limits.post_scraper_results_limit).
+        Mode "hashtags": search.hashtags → two runs of
+        apify/instagram-hashtag-scraper (resultsType posts + reels),
+        resultsLimit = pipeline.step1.hashtag_results_limit (fallback:
+        post_scraper_results_limit). Hashtag actor has no onlyPostsNewerThan;
+        same max-age window applied client-side on item timestamps (UTC).
+        Merge posts+reels datasets by shortCode (prefer row with valid videoUrl).
+        Skip posts already in DB, update comments_count for existing.
+        Filter: commentsCount >= pipeline.step1.min_comments_per_post.
+        Video/Reel items (type Video or productType clips) require a valid
+        HTTPS Instagram/Facebook CDN videoUrl — otherwise skipped (not upserted).
 
 Step 2: Score new posts via DeepSeek (caption + transcript combined)
  Only posts with relevance=NULL.
@@ -285,9 +296,10 @@ python scripts/test_face_leader.py --keep-photos
 
 - `config.yaml` — search parameters, Apify actor IDs, limits, filters
   - `pipeline.stepN.*` — per-step tuning knobs (post age, min comments,
-    growth threshold, batch sizes, Sherlock cap). Every value falls
-    back to a `DEFAULT_*` constant in `scripts/pipeline.py` if the key
-    is missing, so a fresh / partial config still boots.
+    Step 1 `discovery_mode` / `hashtag_results_limit`, growth threshold,
+    batch sizes, Sherlock cap). Every value falls back to a `DEFAULT_*`
+    constant in `scripts/pipeline.py` if the key is missing, so a fresh /
+    partial config still boots.
 - `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`
 - Realtor accounts stored in DB table `tracked_realtors` (not config)
 
@@ -295,6 +307,9 @@ python scripts/test_face_leader.py --keep-photos
 
 - `src/db.py` — SQLite DB with all tables, dedup logic, lead lifecycle methods
 - `src/apify_client_wrapper.py` — Apify wrapper with logging and cost tracking
+- `src/ig_media_payload.py` — Apify Instagram media helpers shared by Step 1 and
+  `scripts/test_hashtag_step1.py`: reel detection, video URL extract/validate,
+  hashtag age filter on timestamps, merge posts+reels by shortCode
 - `src/pipeline_logger.py` — JSON pipeline logs (every API call → `logs/*.json`)
 - `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
 - `src/comment_normalizer.py` — `normalize_apidojo_api()` remaps the

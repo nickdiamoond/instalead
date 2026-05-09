@@ -13,8 +13,57 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
+    build_step1_new_post_message,
     build_step2_scored_video_message,
+    step1_display_content_type,
 )
+
+
+def test_step1_display_content_type_known() -> None:
+    assert step1_display_content_type({"type": "Sidecar"}) == "Sidecar"
+    assert step1_display_content_type({"type": "Video"}) == "Video"
+
+
+def test_build_step1_new_post_message_shape() -> None:
+    msg = build_step1_new_post_message(
+        {
+            "shortCode": "AbCdEfGh",
+            "url": "https://www.instagram.com/p/AbCdEfGh/",
+            "timestamp": "2026-03-10T14:00:00.000Z",
+            "ownerUsername": "seller_spb",
+            "hashtags": ["спб", "новостройка"],
+            "commentsCount": 40,
+            "likesCount": 200,
+            "type": "Video",
+            "locationName": "Санкт-Петербург",
+            "locationId": "12345",
+        }
+    )
+    assert "https://www.instagram.com/p/AbCdEfGh/" in msg
+    assert "2026-03-10 14:00:00 UTC" in msg
+    assert "seller_spb" in msg
+    assert "#спб" in msg and "#новостройка" in msg
+    assert "commentsCount" in msg and "40" in msg
+    assert "likesCount" in msg and "200" in msg
+    assert "type" in msg and "Video" in msg
+    assert "locationName" in msg
+    assert "Санкт-Петербург" in msg
+    assert "locationId" in msg and "12345" in msg
+
+
+def test_build_step1_new_post_message_omits_geo_when_absent() -> None:
+    msg = build_step1_new_post_message(
+        {
+            "shortCode": "Xx",
+            "ownerUsername": "u",
+            "hashtags": [],
+            "commentsCount": 1,
+            "likesCount": 2,
+            "type": "Image",
+        }
+    )
+    assert "locationName" not in msg
+    assert "locationId" not in msg
 
 
 def test_build_step2_scored_video_message_shape() -> None:
@@ -76,6 +125,28 @@ def test_notifier_skips_when_no_chat_id() -> None:
     mock_run.assert_not_called()
 
 
+@patch("src.telegram_notifier.time.sleep")
+@patch("src.telegram_notifier.Bot")
+def test_notify_step1_new_posts_sleeps_between(
+    mock_bot_class: MagicMock, mock_sleep: MagicMock
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    n.notify_step1_new_posts(
+        [
+            {"shortCode": "A", "url": "https://www.instagram.com/p/A/", "type": "Image"},
+            {"shortCode": "B", "url": "https://www.instagram.com/p/B/", "type": "Image"},
+        ]
+    )
+
+    assert mock_bot.send_message.await_count == 2
+    mock_sleep.assert_called_once_with(0.5)
+
+
 @patch("src.telegram_notifier.Bot")
 def test_notifier_sends_via_bot(mock_bot_class: MagicMock) -> None:
     mock_bot = MagicMock()
@@ -91,6 +162,22 @@ def test_notifier_sends_via_bot(mock_bot_class: MagicMock) -> None:
     assert kwargs["chat_id"] == -42
     assert "7 new post" in kwargs["text"]
     assert "3 active realtor" in kwargs["text"]
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notifier_step1_hashtags_wording(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    n.notify_step1(2, 8, discovery_mode="hashtags")
+
+    kwargs = mock_bot.send_message.await_args.kwargs
+    assert "2 new post" in kwargs["text"]
+    assert "8 hashtag" in kwargs["text"]
+    assert "realtor" not in kwargs["text"].lower()
 
 
 def test_notifier_step3_skips_when_no_token() -> None:
