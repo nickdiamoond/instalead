@@ -12,6 +12,7 @@ Uses DB for deduplication — safe to run repeatedly.
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -44,6 +45,7 @@ from src.sherlock_client import (
     SherlockError,
     make_sherlock_client,
 )
+from src.telegram_notifier import PipelineTelegramNotifier
 from src.transcriber import NexaraTranscriber
 
 setup_logging()
@@ -481,14 +483,20 @@ def _resolve_one_lead_via_sherlock(
     ``error`` message so a single misbehaving lead doesn't sink the
     whole batch.
 
-    Returned shape:
+    Returned shape (orchestrator + Telegram):
       {
-        "username": str,           # echoed back for the orchestrator
+        "username": str,
         "status":   str,           # SH_STATUS_* label
         "telegram_username": str | None,
         "phone":            str | None,
         "sherlock_link":    str | None,
         "error":            str | None,   # debug message, not stored
+        "nick_skipped_dot": bool,
+        "nick_search_ran": bool,
+        "nick_hit": bool,
+        "photo_search_ran": bool,
+        "photo_task": dict | None,       # snapshot after photo wait_for_task
+        "nick_query": str | None,
       }
     """
     username = lead["username"]
@@ -499,6 +507,12 @@ def _resolve_one_lead_via_sherlock(
         "phone": None,
         "sherlock_link": None,
         "error": None,
+        "nick_skipped_dot": "." in username,
+        "nick_search_ran": False,
+        "nick_hit": False,
+        "photo_search_ran": False,
+        "photo_task": None,
+        "nick_query": None if "." in username else f"@{username}",
     }
     poll_interval = float(task_cfg.get("poll_interval_secs", 3))
     max_wait = float(task_cfg.get("max_wait_secs", 300))
@@ -509,6 +523,7 @@ def _resolve_one_lead_via_sherlock(
     if "." not in username:
         # Sherlock expects the leading '@' in nick queries.
         nick_query = f"@{username}"
+        out["nick_search_ran"] = True
         try:
             enq = sherlock.enqueue_nick(
                 nick=nick_query,
@@ -546,6 +561,7 @@ def _resolve_one_lead_via_sherlock(
                         "status": SH_STATUS_FOUND_NICK,
                         "telegram_username": tg_username,
                         "sherlock_link": tg_link,
+                        "nick_hit": True,
                     })
                     return out
             # Anything else (failed / timeout / completed-but-empty) -> fall
@@ -588,6 +604,8 @@ def _resolve_one_lead_via_sherlock(
             poll_interval=poll_interval,
             max_wait=max_wait,
         )
+        out["photo_search_ran"] = True
+        out["photo_task"] = copy.deepcopy(task)
         final_status = (task.get("status") or "").lower()
         if final_status != "completed":
             out["status"] = SH_STATUS_ERROR
@@ -656,6 +674,7 @@ def _step_5_resolve_contacts_via_sherlock(
     auto_yes: bool,
     log,
     issues: list[tuple[str, str]],
+    tg_notifier: PipelineTelegramNotifier,
 ) -> None:
     """Run Sherlock contact resolution for naked leads in parallel.
 
@@ -677,6 +696,10 @@ def _step_5_resolve_contacts_via_sherlock(
     from ``cfg`` and tears it down before returning. Never raises;
     user-visible failures land in ``issues`` so the final summary
     banner highlights them.
+
+    ``tg_notifier``: after each ``mark_lead_sherlock``, sends Telegram
+    per lead from the main thread (photo + InsightFace caption, then text
+    when photo stage ran — see :meth:`PipelineTelegramNotifier.notify_sherlock_lead`).
     """
     _banner("STEP 5: Resolve contacts via Sherlock")
 
@@ -786,6 +809,12 @@ def _step_5_resolve_contacts_via_sherlock(
                         "phone": None,
                         "sherlock_link": None,
                         "error": f"worker crashed: {type(exc).__name__}: {exc}",
+                        "nick_skipped_dot": "." in username,
+                        "nick_search_ran": False,
+                        "nick_hit": False,
+                        "photo_search_ran": False,
+                        "photo_task": None,
+                        "nick_query": None if "." in username else f"@{username}",
                     }
 
                 # DB write happens here on the main thread -- SQLite
@@ -798,6 +827,7 @@ def _step_5_resolve_contacts_via_sherlock(
                     phone=res.get("phone"),
                     sherlock_link=res.get("sherlock_link"),
                 )
+                tg_notifier.notify_sherlock_lead(lead, res, cfg=cfg)
                 counters[res["status"]] = counters.get(res["status"], 0) + 1
 
                 # Per-lead progress line. Kept short -- multiple
@@ -980,6 +1010,7 @@ def main():
     args = _parse_cli_args()
     load_dotenv()
     cfg = load_config()
+    tg_notifier = PipelineTelegramNotifier.from_config(cfg)
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
     deepseek = OpenAI(
         api_key=os.environ["DEEPSEEK_API_KEY"],
@@ -1135,13 +1166,16 @@ def main():
     if len(all_posts) == 0:
         issues.append(("Step 1", "post-scraper returned 0 items"))
 
+    tg_notifier.notify_step1(new_posts, len(realtors))
+
     # ============================================================
     # STEP 2: Score new posts via DeepSeek (caption + transcript)
     # ============================================================
     _banner("STEP 2: Score new posts (DeepSeek over caption + transcript)")
     with db._conn() as conn:
         unscored = conn.execute(
-            "SELECT post_id, caption FROM processed_posts WHERE relevance IS NULL"
+            "SELECT post_id, caption, post_url FROM processed_posts "
+            "WHERE relevance IS NULL"
         ).fetchall()
         unscored = [dict(r) for r in unscored]
 
@@ -1185,7 +1219,19 @@ def main():
             _apply_score(db, post_id, None)
             continue
 
-        _apply_score(db, post_id, score_caption(deepseek, combined))
+        raw_score = score_caption(deepseek, combined)
+        relevance = _apply_score(db, post_id, raw_score)
+
+        if video_url:
+            post_link = (p.get("post_url") or "").strip()
+            if not post_link:
+                post_link = f"https://www.instagram.com/p/{post_id}/"
+            tg_notifier.notify_step2_scored_video(
+                post_url=post_link,
+                raw_score=raw_score,
+                resolved_relevance=relevance,
+                combined_text=combined,
+            )
 
     log.info(
         "step2_done",
@@ -1210,6 +1256,7 @@ def main():
     # ============================================================
     _banner("STEP 3: Fetch comments (Apify)")
     posts_to_scan = db.get_posts_needing_comments(min_growth_pct=comments_growth_pct)
+    step3_new_commenters = 0
 
     if not posts_to_scan:
         print("  SKIPPED: no relevant posts in the queue.")
@@ -1383,6 +1430,7 @@ def main():
                             post_url=post_info[0],
                             user_id=uid,
                             post_shortcode=post_info[1],
+                            comment_pk=str(c.get("pk") or ""),
                             comment_text=c.get("text", "")[:500],
                             comment_at=str(c.get("created_at_utc", "")),
                         )
@@ -1408,29 +1456,35 @@ def main():
                     f"({len(unique)} unique commenters / {len(items)} raw) "
                     f"via {source} cost=${cost:.4f}"
                 )
+                step3_new_commenters = new_leads
         else:
             log.info("step3_skipped")
             print("  SKIPPED by user.")
+
+    tg_notifier.notify_step3(step3_new_commenters)
 
     # ============================================================
     # STEP 4: Fetch profiles for new leads
     # ============================================================
     _banner("STEP 4: Fetch profiles for new leads")
     leads_to_fetch = db.get_leads_without_profile(limit=step4_batch_limit)
+    profiles_queued = 0
+    single_face_new = 0
+    fallback_resolved = 0
+    no_suitable_photo = 0
+    contacts_found = 0
 
     if not leads_to_fetch:
         print("  SKIPPED: no leads without profile.")
         log.info("step4_no_profiles_to_fetch")
     else:
         usernames = [l["username"] for l in leads_to_fetch]
-        print(f"  Leads to fetch:  {len(usernames)}")
-        log.info("step4_fetch_profiles", count=len(usernames))
+        profiles_queued = len(usernames)
+        print(f"  Leads to fetch:  {profiles_queued}")
+        log.info("step4_fetch_profiles", count=profiles_queued)
 
-        contacts_found = 0
         profiles_fetched = 0
         avatars_downloaded = 0
-        single_face_new = 0
-        fallback_resolved = 0
         fallback_skipped = 0
 
         for i in range(0, len(usernames), profile_batch_size):
@@ -1526,12 +1580,19 @@ def main():
                                 )
                             else:
                                 fallback_skipped += 1
+                                no_suitable_photo += 1
 
                             if not fb_keep_photos:
                                 cleanup_lead_photos(
                                     uid_str,
                                     keep=(result.photo_path if result else None),
                                 )
+                        else:
+                            no_suitable_photo += 1
+                    else:
+                        no_suitable_photo += 1
+                else:
+                    no_suitable_photo += 1
 
                 contacts = extract_contacts(
                     bio=p.get("biography"),
@@ -1542,16 +1603,31 @@ def main():
                     db.update_lead_contacts(username=username, **{k: v for k, v in contacts.items() if v})
                     contacts_found += 1
 
-        log.info("step4_done", profiles=profiles_fetched, contacts_from_bio=contacts_found,
-                 avatars=avatars_downloaded, single_face=single_face_new,
-                 fallback_resolved=fallback_resolved,
-                 fallback_skipped=fallback_skipped)
+        log.info(
+            "step4_done",
+            profiles=profiles_fetched,
+            contacts_from_bio=contacts_found,
+            avatars=avatars_downloaded,
+            single_face=single_face_new,
+            fallback_resolved=fallback_resolved,
+            fallback_skipped=fallback_skipped,
+            no_suitable_photo=no_suitable_photo,
+        )
         print(f"  DONE: profiles={profiles_fetched} "
               f"contacts={contacts_found} "
               f"avatars={avatars_downloaded} "
               f"single_face={single_face_new} "
               f"fallback_resolved={fallback_resolved} "
-              f"fallback_skipped={fallback_skipped}")
+              f"fallback_skipped={fallback_skipped} "
+              f"no_suitable_photo={no_suitable_photo}")
+
+    tg_notifier.notify_step4(
+        profiles_queued=profiles_queued,
+        single_face_avatar=single_face_new,
+        face_leader_resolved=fallback_resolved,
+        without_suitable_photo=no_suitable_photo,
+        contacts_from_bio=contacts_found,
+    )
 
     # ============================================================
     # STEP 5: Resolve Telegram contacts via Sherlock (parallel)
@@ -1573,6 +1649,7 @@ def main():
             auto_yes=args.yes,
             log=log,
             issues=issues,
+            tg_notifier=tg_notifier,
         )
 
     # ============================================================
@@ -1581,16 +1658,17 @@ def main():
     # Runs even under --skip-sherlock to drain the backlog of leads
     # already Sherlock'd in prior runs. --keep-photos disables it
     # for debugging / forensic work.
-    if args.keep_photos:
-        _banner("STEP 6: Cleanup spent face assets")
-        print("  SKIPPED by --keep-photos.")
-        log.info("step6_skipped_by_flag")
-    else:
-        _step_6_cleanup_spent_face_assets(
-            db,
-            log=log,
-            issues=issues,
-        )
+
+    #if args.keep_photos:
+    #    _banner("STEP 6: Cleanup spent face assets")
+    #    print("  SKIPPED by --keep-photos.")
+    #    log.info("step6_skipped_by_flag")
+    #else:
+    #    _step_6_cleanup_spent_face_assets(
+    #        db,
+    #        log=log,
+    #        issues=issues,
+    #    )
 
     # ============================================================
     # SUMMARY

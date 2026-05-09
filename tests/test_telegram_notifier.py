@@ -1,0 +1,185 @@
+"""Tests for ``src.telegram_notifier.PipelineTelegramNotifier``."""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from aiogram.exceptions import TelegramNetworkError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.telegram_notifier import (
+    PipelineTelegramNotifier,
+    build_step2_scored_video_message,
+)
+
+
+def test_build_step2_scored_video_message_shape() -> None:
+    msg = build_step2_scored_video_message(
+        "https://www.instagram.com/p/XX/",
+        {
+            "is_real_estate": True,
+            "has_call_to_action": True,
+            "call_to_action_type": "comment",
+        },
+        "relevant",
+        "Caption here\n\nTranscript here",
+    )
+    assert "https://www.instagram.com/p/XX/" in msg
+    assert "is_real_estate: True" in msg
+    assert "Pipeline relevance: relevant" in msg
+    assert "Caption here" in msg and "Transcript here" in msg
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_step2_scored_video_sends(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    n.notify_step2_scored_video(
+        post_url="https://www.instagram.com/p/Zz/",
+        raw_score={"error": "timeout"},
+        resolved_relevance="unknown",
+        combined_text="only caption",
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "https://www.instagram.com/p/Zz/" in text
+    assert "error: timeout" in text
+    assert "only caption" in text
+
+
+def test_notifier_skips_when_no_token() -> None:
+    n = PipelineTelegramNotifier(None, -123, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.notify_step1(1, 2)
+        n.notify_step2_scored_video(
+            post_url="https://www.instagram.com/p/AbC/",
+            raw_score={"is_real_estate": True},
+            resolved_relevance="relevant",
+            combined_text="hello",
+        )
+    mock_run.assert_not_called()
+
+
+def test_notifier_skips_when_no_chat_id() -> None:
+    n = PipelineTelegramNotifier("tok", None, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.notify_step1(1, 2)
+    mock_run.assert_not_called()
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notifier_sends_via_bot(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    n.notify_step1(7, 3)
+
+    mock_bot.send_message.assert_awaited_once()
+    kwargs = mock_bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == -42
+    assert "7 new post" in kwargs["text"]
+    assert "3 active realtor" in kwargs["text"]
+
+
+def test_notifier_step3_skips_when_no_token() -> None:
+    n = PipelineTelegramNotifier(None, -123, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.notify_step3(10)
+    mock_run.assert_not_called()
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notifier_step3_sends_via_bot(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -1, enabled=True)
+    n.notify_step3(12)
+
+    mock_bot.send_message.assert_awaited_once()
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "Step 3" in text
+    assert "12 new commenter" in text
+
+
+def test_notifier_step4_skips_when_no_token() -> None:
+    n = PipelineTelegramNotifier(None, -123, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.notify_step4(
+            profiles_queued=10,
+            single_face_avatar=3,
+            face_leader_resolved=2,
+            without_suitable_photo=5,
+            contacts_from_bio=4,
+        )
+    mock_run.assert_not_called()
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notifier_step4_sends_via_bot(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -1, enabled=True)
+    n.notify_step4(
+        profiles_queued=50,
+        single_face_avatar=20,
+        face_leader_resolved=5,
+        without_suitable_photo=25,
+        contacts_from_bio=10,
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "Step 4" in text
+    assert "50 profile(s) queued" in text
+    assert "20 single-face avatar" in text
+    assert "5 face photo(s) via face_leader" in text
+    assert "25 lead(s) without suitable photo" in text
+    assert "10 lead(s) with bio/contact" in text
+
+
+def test_send_sync_retries_on_network_error() -> None:
+    """First two asyncio.run failures retry; third uses real asyncio.run + mocked Bot."""
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    attempts: list[int] = []
+    real_run = asyncio.run
+
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    bot_cm = MagicMock()
+    bot_cm.__aenter__ = AsyncMock(return_value=mock_bot)
+    bot_cm.__aexit__ = AsyncMock(return_value=False)
+
+    def fake_run(coro):
+        attempts.append(1)
+        if len(attempts) < 3:
+            coro.close()
+            raise TelegramNetworkError(
+                method=MagicMock(),
+                message="Server disconnected",
+            )
+        return real_run(coro)
+
+    with patch("src.telegram_notifier.Bot", return_value=bot_cm):
+        with patch("src.telegram_notifier.asyncio.run", side_effect=fake_run):
+            n._send_sync("ping")
+
+    assert len(attempts) == 3
+    mock_bot.send_message.assert_awaited_once()

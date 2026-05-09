@@ -1,8 +1,9 @@
 """Batch nick-search harness mirroring pipeline Step 5 stage 1 only.
 
 Loads up to ``DB_SAMPLE_LIMIT`` Instagram usernames from ``lead_accounts``
-using the **same WHERE clause** as :meth:`LeadDB.get_leads_for_sherlock`
-(Step 5 candidate pool). Opens SQLite in ``mode=ro`` — no writes.
+using the **same filters** as :meth:`LeadDB.get_leads_for_sherlock`
+(Step 5 pool: SQL predicates + disk check on ``face_photo_path``).
+Opens SQLite in ``mode=ro`` — no writes.
 
 Runs ``POST /v1/search/nick`` + polls ``GET /v1/tasks/{id}`` per nick and
 prints the full final ``TaskOut`` JSON from Sherlock.
@@ -27,6 +28,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.db import lead_disk_photo_usable
 from src.sherlock_client import SherlockClient, SherlockError, make_sherlock_client
 
 for _stream in (sys.stdout, sys.stderr):
@@ -41,15 +43,16 @@ SH_STATUS_NO_MATCH = "no_match"
 SH_STATUS_ERROR = "error"
 
 # Same selection as LeadDB.get_leads_for_sherlock (scripts/pipeline Step 5).
-_STEP5_CANDIDATE_SQL = """
-SELECT username
+_STEP5_CANDIDATE_BATCH_SQL = """
+SELECT username, face_photo_path
 FROM lead_accounts
 WHERE profile_fetched = 1
   AND phone IS NULL
   AND telegram_username IS NULL
   AND sherlock_processed_at IS NULL
   AND COALESCE(is_private, 0) = 0
-LIMIT ?
+  AND face_photo_path IS NOT NULL
+LIMIT ? OFFSET ?
 """
 
 
@@ -69,16 +72,40 @@ def _resolve_db_path(cfg: dict, root: Path, override: Path | None) -> Path:
     return p
 
 
-def _fetch_usernames_readonly(db_path: Path, limit: int) -> list[str]:
+def _fetch_usernames_readonly(
+    db_path: Path, want: int, repo_root: Path
+) -> list[str]:
     if not db_path.is_file():
         raise FileNotFoundError(f"Database not found: {db_path}")
     uri_path = db_path.resolve().as_posix()
     uri = f"file:{uri_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
+    batch = max(256, min(want * 4, 4000))
+    offset = 0
+    out: list[str] = []
     try:
-        rows = conn.execute(_STEP5_CANDIDATE_SQL.strip(), (limit,)).fetchall()
-        return [str(r["username"]) for r in rows if r["username"]]
+        while len(out) < want:
+            rows = conn.execute(
+                _STEP5_CANDIDATE_BATCH_SQL.strip(),
+                (batch, offset),
+            ).fetchall()
+            if not rows:
+                break
+            offset += len(rows)
+            for r in rows:
+                fph = r["face_photo_path"]
+                if not lead_disk_photo_usable(
+                    None if fph is None else str(fph),
+                    base_dir=repo_root,
+                ):
+                    continue
+                name = r["username"]
+                if name:
+                    out.append(str(name))
+                if len(out) >= want:
+                    break
+        return out
     finally:
         conn.close()
 
@@ -209,7 +236,9 @@ def main() -> int:
     db_path = _resolve_db_path(cfg, root, args.db)
 
     try:
-        usernames = _fetch_usernames_readonly(db_path, DB_SAMPLE_LIMIT)
+        usernames = _fetch_usernames_readonly(
+            db_path, DB_SAMPLE_LIMIT, root
+        )
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr, flush=True)
         return 1

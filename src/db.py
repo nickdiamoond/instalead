@@ -6,6 +6,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def lead_disk_photo_usable(
+    path: str | None, *, base_dir: Path | None = None
+) -> bool:
+    """True if ``path`` points at a non-empty local file readable on disk."""
+    if not path:
+        return False
+    try:
+        fp = Path(path)
+        if base_dir is not None and not fp.is_absolute():
+            fp = base_dir / fp
+        return fp.is_file() and fp.stat().st_size > 0
+    except OSError:
+        return False
+
+
 class LeadDB:
     def __init__(self, db_path: str = "data/leads.db"):
         if db_path != ":memory:":
@@ -103,6 +118,7 @@ class LeadDB:
                     username        TEXT NOT NULL,
                     post_url        TEXT NOT NULL,
                     post_shortcode  TEXT,
+                    comment_pk      TEXT,
                     comment_text    TEXT,
                     comment_at      TEXT,
                     UNIQUE(username, post_url)
@@ -157,6 +173,9 @@ class LeadDB:
                 ("sherlock_link", "TEXT"),
                 ("sherlock_processed_at", "TEXT"),
                 ("sherlock_status", "TEXT"),
+            ],
+            "lead_post_links": [
+                ("comment_pk", "TEXT"),
             ],
         }
         for table, columns in required.items():
@@ -324,7 +343,9 @@ class LeadDB:
 
     # --- Sherlock (Step 5) -----------------------------------------
 
-    def get_leads_for_sherlock(self, limit: int = 10000) -> list[dict]:
+    def get_leads_for_sherlock(
+        self, limit: int = 10000, *, photo_base_dir: Path | None = None
+    ) -> list[dict]:
         """Leads that need Sherlock-based contact resolution.
 
         Selection rules (per Step 5 spec):
@@ -340,24 +361,65 @@ class LeadDB:
             silently retried; clear this column manually to re-process.
           * is_private != 1 -- private accounts have no useful avatar
             and no public bio, Sherlock can't help.
+          * Canonical ``face_photo_path`` recorded in DB and the file exists
+            on disk (non-empty). Step 5 always needs this for photo
+            fallback after nick misses; omitting naked leads without a usable
+            file avoids enqueueing batches that terminate as ``no_face_photo``.
+            Stale paths in DB are skipped until :py:meth:`null_missing_photo_paths`
+            clears them. Relative paths use the process CWD unless
+            ``photo_base_dir`` is set.
 
-        Returns rows with ``username``, ``user_id``, ``full_name`` and
-        ``face_photo_path`` -- everything Step 5 needs to decide nick
-        vs photo path without a second SELECT.
+        Also joins the latest ``lead_post_links`` row per username for
+        Telegram context (post URL, optional comment permalink).
+
+        Rows are fetched in SQL batches until ``limit`` matching leads are
+        collected or the candidate table is exhausted.
         """
+        sql = (
+            "SELECT "
+            "la.username AS username, "
+            "la.user_id AS user_id, "
+            "la.full_name AS full_name, "
+            "la.face_photo_path AS face_photo_path, "
+            "lpl.post_url AS context_post_url, "
+            "lpl.post_shortcode AS context_post_shortcode, "
+            "lpl.comment_pk AS context_comment_pk "
+            "FROM lead_accounts la "
+            "LEFT JOIN lead_post_links lpl ON lpl.id = ("
+            "  SELECT MAX(id) FROM lead_post_links l2 "
+            "  WHERE l2.username = la.username"
+            ") "
+            "WHERE profile_fetched = 1 "
+            "  AND phone IS NULL "
+            "  AND telegram_username IS NULL "
+            "  AND sherlock_processed_at IS NULL "
+            "  AND COALESCE(is_private, 0) = 0 "
+            "  AND la.face_photo_path IS NOT NULL "
+            "LIMIT ? OFFSET ?"
+        )
+        batch = max(256, min(limit * 4, 4000))
+        out: list[dict] = []
+        offset = 0
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT username, user_id, full_name, face_photo_path "
-                "FROM lead_accounts "
-                "WHERE profile_fetched = 1 "
-                "  AND phone IS NULL "
-                "  AND telegram_username IS NULL "
-                "  AND sherlock_processed_at IS NULL "
-                "  AND COALESCE(is_private, 0) = 0 "
-                "LIMIT ?",
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
+            while len(out) < limit:
+                rows = conn.execute(
+                    sql, (batch, offset)
+                ).fetchall()
+                if not rows:
+                    break
+                offset += len(rows)
+                for r in rows:
+                    d = dict(r)
+                    fph = d.get("face_photo_path")
+                    if not lead_disk_photo_usable(
+                        None if fph is None else str(fph),
+                        base_dir=photo_base_dir,
+                    ):
+                        continue
+                    out.append(d)
+                    if len(out) >= limit:
+                        break
+        return out
 
     def mark_lead_sherlock(
         self,
@@ -473,6 +535,49 @@ class LeadDB:
                 "WHERE username = ?",
                 (username,),
             )
+
+    def null_missing_photo_paths(self) -> dict[str, int]:
+        """NULL ``avatar_path`` / ``face_photo_path`` when the file is absent.
+
+        Relative paths are resolved from the process current working directory;
+        run from the repository root (where ``data/`` lives). Empty (0-byte)
+        files are treated as missing. Does not change ``faces_count`` or
+        Sherlock columns.
+        """
+        leads_changed = 0
+        avatar_nulled = 0
+        face_nulled = 0
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT username, avatar_path, face_photo_path "
+                "FROM lead_accounts "
+                "WHERE avatar_path IS NOT NULL OR face_photo_path IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                ap = row["avatar_path"]
+                fph = row["face_photo_path"]
+                drop_ap = ap is not None and not lead_disk_photo_usable(ap)
+                drop_f = fph is not None and not lead_disk_photo_usable(fph)
+                if not drop_ap and not drop_f:
+                    continue
+                sets: list[str] = []
+                if drop_ap:
+                    sets.append("avatar_path = NULL")
+                    avatar_nulled += 1
+                if drop_f:
+                    sets.append("face_photo_path = NULL")
+                    face_nulled += 1
+                conn.execute(
+                    f"UPDATE lead_accounts SET {', '.join(sets)} "
+                    "WHERE username = ?",
+                    (row["username"],),
+                )
+                leads_changed += 1
+        return {
+            "leads_changed": leads_changed,
+            "avatar_path_nulled": avatar_nulled,
+            "face_photo_path_nulled": face_nulled,
+        }
 
     def get_leads_needing_avatar(self, limit: int = 1000) -> list[dict]:
         """Leads that have profile data but no avatar processed yet.

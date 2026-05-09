@@ -61,6 +61,10 @@ cycle:
   max_apify_requests_per_cycle: 50
   max_accounts_per_cycle: 200
 
+telegram:
+  # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
+  report_chat_id: -1003926996735
+
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. All values have safe defaults baked into the
 # pipeline (DEFAULT_* module-level constants); this section is for
@@ -99,14 +103,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 100
+    batch_limit: 30
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
-    batch_limit: 100
+    batch_limit: 30
 
 db:
   path: "data/leads.db"
@@ -131,7 +135,7 @@ db:
 # in the frame, loose enough to keep real profile / side-view
 # detections (typical confidence on real faces: 0.78-0.92).
 face_detection:
-  min_det_score: 0.6
+  min_det_score: 0.7
   avatar_det_size: 320
   post_det_size: 640
 
@@ -175,7 +179,7 @@ sherlock:
     max_attempts: 3
   task:
     poll_interval_secs: 3
-    max_wait_secs: 600
+    max_wait_secs: 250
   concurrency:
     workers: null
 
