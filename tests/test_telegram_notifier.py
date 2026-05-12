@@ -13,10 +13,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
+    build_step1_date_filter_section_lines,
     build_step1_new_post_message,
-    build_step2_scored_video_message,
+    build_step1_pipeline_summary_telegram_text,
+    build_step2_scored_post_message,
     step1_display_content_type,
 )
+
+
+def test_build_step1_date_filter_realtors_vs_client() -> None:
+    rel = build_step1_date_filter_section_lines(
+        discovery_mode="realtors",
+        posts_max_age_days=14,
+        age_dropped_client=None,
+        age_kept_missing_ts=None,
+    )
+    assert "onlyPostsNewerThan" in "\n".join(rel)
+    assert "not available" in "\n".join(rel)
+
+    ht = build_step1_date_filter_section_lines(
+        discovery_mode="hashtags",
+        posts_max_age_days=7,
+        age_dropped_client=12,
+        age_kept_missing_ts=3,
+    )
+    s = "\n".join(ht)
+    assert "Dropped — older than window: 12" in s
+    assert "missing or unparseable" in s
+
+
+def test_build_step1_pipeline_summary_telegram_multiline() -> None:
+    text = build_step1_pipeline_summary_telegram_text(
+        new_posts=0,
+        source_count=2,
+        discovery_mode="hashtags",
+        min_comments=10,
+        fetched_total=50,
+        updated_posts=1,
+        with_video_count=3,
+        skipped_no_video_url=2,
+        step1_skip_low_comments=40,
+        step1_skip_no_shortcode=0,
+        step1_existing_unchanged=5,
+        cost_usd=0.1234,
+        posts_max_age_days=7,
+        age_dropped_client=9,
+        age_kept_missing_ts=1,
+    )
+    assert "\n" in text
+    assert "Date filter" in text
+    assert "posts_max_age_days = 7" in text
+    assert "Dropped — older than window: 9" in text
+    assert "Gate breakdown" in text
 
 
 def test_step1_display_content_type_known() -> None:
@@ -66,8 +114,8 @@ def test_build_step1_new_post_message_omits_geo_when_absent() -> None:
     assert "locationId" not in msg
 
 
-def test_build_step2_scored_video_message_shape() -> None:
-    msg = build_step2_scored_video_message(
+def test_build_step2_scored_post_message_shape() -> None:
+    msg = build_step2_scored_post_message(
         "https://www.instagram.com/p/XX/",
         {
             "is_real_estate": True,
@@ -77,6 +125,7 @@ def test_build_step2_scored_video_message_shape() -> None:
         "relevant",
         "Caption here\n\nTranscript here",
     )
+    assert "Step 2: scored post" in msg
     assert "https://www.instagram.com/p/XX/" in msg
     assert "is_real_estate: True" in msg
     assert "Pipeline relevance: relevant" in msg
@@ -84,14 +133,14 @@ def test_build_step2_scored_video_message_shape() -> None:
 
 
 @patch("src.telegram_notifier.Bot")
-def test_notify_step2_scored_video_sends(mock_bot_class: MagicMock) -> None:
+def test_notify_step2_scored_post_sends(mock_bot_class: MagicMock) -> None:
     mock_bot = MagicMock()
     mock_bot.send_message = AsyncMock()
     mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
     mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
 
     n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
-    n.notify_step2_scored_video(
+    n.notify_step2_scored_post(
         post_url="https://www.instagram.com/p/Zz/",
         raw_score={"error": "timeout"},
         resolved_relevance="unknown",
@@ -109,7 +158,7 @@ def test_notifier_skips_when_no_token() -> None:
     n = PipelineTelegramNotifier(None, -123, enabled=True)
     with patch("src.telegram_notifier.asyncio.run") as mock_run:
         n.notify_step1(1, 2)
-        n.notify_step2_scored_video(
+        n.notify_step2_scored_post(
             post_url="https://www.instagram.com/p/AbC/",
             raw_score={"is_real_estate": True},
             resolved_relevance="relevant",
@@ -160,8 +209,52 @@ def test_notifier_sends_via_bot(mock_bot_class: MagicMock) -> None:
     mock_bot.send_message.assert_awaited_once()
     kwargs = mock_bot.send_message.await_args.kwargs
     assert kwargs["chat_id"] == -42
-    assert "7 new post" in kwargs["text"]
-    assert "3 active realtor" in kwargs["text"]
+    text = kwargs["text"]
+    assert "Step 1" in text
+    assert "New post(s) saved: 7" in text
+    assert "Searched 3 active realtor" in text
+
+
+def test_build_step1_new_post_message_cookie_extras() -> None:
+    msg = build_step1_new_post_message(
+        {
+            "shortCode": "Zz",
+            "url": "https://www.instagram.com/p/Zz/",
+            "timestamp": "2026-04-01T10:00:00.000Z",
+            "ownerUsername": "owner",
+            "hashtags": [],
+            "commentsCount": 10,
+            "likesCount": 3,
+            "type": "Image",
+            "searchKeyword": "недвижимость",
+            "cookieMediaType": "Photo",
+            "captionPreview": "Short caption preview…",
+            "cookieMentions": ["@friend"],
+        }
+    )
+    assert "searchKeyword" in msg
+    assert "недвижимость" in msg
+    assert "cookieMediaType" in msg
+    assert "captionPreview" in msg
+    assert "@friend" in msg
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notifier_step1_cookie_keywords_wording(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    n.notify_step1(3, 5, discovery_mode="cookie_keywords")
+
+    kwargs = mock_bot.send_message.await_args.kwargs
+    text = kwargs["text"]
+    assert "New post(s) saved: 3" in text
+    assert "5 keyword" in text
+    assert "hashtag" not in text.lower()
+    assert "realtor" not in text.lower()
 
 
 @patch("src.telegram_notifier.Bot")
@@ -175,9 +268,10 @@ def test_notifier_step1_hashtags_wording(mock_bot_class: MagicMock) -> None:
     n.notify_step1(2, 8, discovery_mode="hashtags")
 
     kwargs = mock_bot.send_message.await_args.kwargs
-    assert "2 new post" in kwargs["text"]
-    assert "8 hashtag" in kwargs["text"]
-    assert "realtor" not in kwargs["text"].lower()
+    text = kwargs["text"]
+    assert "New post(s) saved: 2" in text
+    assert "8 hashtag" in text
+    assert "realtor" not in text.lower()
 
 
 def test_notifier_step3_skips_when_no_token() -> None:

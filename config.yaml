@@ -26,6 +26,8 @@ apify:
     comments_fallback: "apidojo/instagram-comments-scraper-api"
     profile: "apify/instagram-profile-scraper"  # инфо профиля (аватарка, bio)
     hashtag: "apify/instagram-hashtag-scraper"  # посты/рилсы по хештегу
+    # Dev: keyword search via logged-in session (see scripts/test_cookie_keyword_search.py)
+    cookie_search_posts: "crawlerbros/instagram-keyword-search-scraper"
     posts: "apify/instagram-post-scraper"       # посты конкретного аккаунта
 
   test_limits:
@@ -37,14 +39,29 @@ apify:
 search:
   # Method 1: поиск по хештегам (через instagram-hashtag-scraper)
   hashtags:
-    - "квартира"
-    - "недвижимость"
+    - "квартирапитер"
+    - "недвижимостьпитер"
+    - "спбнедвижимость"
+    - "спбквартира"
     - "квартираспб"
     - "недвижимостьспб"
     - "недвижимостьпетербург"
     - "новостройкиспб"
     - "купитьквартируспб"
     - "жильеспб"
+
+  # Same topics as ``search.hashtags`` but for keyword search (no leading ``#``).
+  # Used when ``pipeline.step1.discovery_mode`` is ``cookie_keywords`` and by
+  # ``scripts/test_cookie_keyword_search.py``.
+  cookie_search_keywords:
+    - "Санкт-Петербург"
+
+  # Limits for ``apify.actors.cookie_search_posts`` (maps to actor input ``maxPosts`` per keyword).
+  cookie_search:
+    size_per_keyword: 15
+    session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
+    # Passed to crawlerbros actor ``sessionName`` (cookie session label).
+    session_name: "instalead_cookie_search"
 
   # Method 2: список аккаунтов риелторов СПБ (найдены в предыдущих тестах)
   realtor_accounts:
@@ -67,7 +84,7 @@ cycle:
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -1003926996735 #-5255644193 
+  report_chat_id: -5255644193 #-1003926996735 
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. All values have safe defaults baked into the
@@ -77,8 +94,12 @@ telegram:
 pipeline:
   step1:
     # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on DB
-    # tracked_realtors) or "hashtags" (instagram-hashtag-scraper on search.hashtags).
-    discovery_mode: hashtags
+    # tracked_realtors), "hashtags" (instagram-hashtag-scraper on search.hashtags),
+    # or "cookie_keywords" (crawlerbros/instagram-keyword-search-scraper on
+    # search.cookie_search_keywords; requires INSTAGRAM_SESSION_COOKIE or env from
+    # search.cookie_search.session_cookie_env_var). For hashtags and cookie_keywords,
+    # posts_max_age_days is applied client-side after fetch (see src.ig_media_payload).
+    discovery_mode: cookie_keywords
     # apify/instagram-post-scraper: resultsLimit per username (realtors mode).
     post_scraper_results_limit: 20
     # instagram-hashtag-scraper: resultsLimit per hashtag per resultsType (posts vs reels).
@@ -87,7 +108,7 @@ pipeline:
     # apify/instagram-post-scraper input "onlyPostsNewerThan = N days".
     # Realtors don't update old posts, so this both bounds the dataset
     # and keeps comments fresh enough for Step 3 to find new commenters.
-    posts_max_age_days: 7
+    posts_max_age_days: 14
     # Filter for processed_posts: posts with fewer than this many
     # comments aren't worth scoring (DeepSeek $) or scanning (Apify $).
     min_comments_per_post: 10
@@ -155,6 +176,11 @@ face_detection:
   min_det_score: 0.7
   avatar_det_size: 320
   post_det_size: 640
+  # Step 4: if the avatar has exactly one face but its bbox covers less
+  # than this fraction of the image area (percent), skip promoting the
+  # avatar to face_photo_path and run the last-posts face-leader fallback
+  # instead. Post-photo path is unchanged.
+  min_avatar_face_area_pct: 2.0
 
 # Face leader fallback: when avatar face count is not exactly 1, probe the
 # last N post photos, keep only single-face ones, cluster them by cosine
@@ -196,7 +222,7 @@ sherlock:
     max_attempts: 3
   task:
     poll_interval_secs: 3
-    max_wait_secs: 250
+    max_wait_secs: 600
   concurrency:
     workers: null
 

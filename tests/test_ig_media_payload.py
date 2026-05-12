@@ -12,6 +12,7 @@ from src.ig_media_payload import (
     is_reel_payload,
     is_valid_video_url,
     merge_hashtag_items_by_shortcode,
+    post_location_label_from_item,
 )
 
 
@@ -19,6 +20,26 @@ def test_is_reel_payload() -> None:
     assert is_reel_payload({"type": "Video", "productType": "clips"}) is True
     assert is_reel_payload({"type": "Video", "productType": "feed"}) is True
     assert is_reel_payload({"type": "Image"}) is False
+
+
+def test_post_location_label_from_apify_keys() -> None:
+    assert post_location_label_from_item({}) is None
+    assert (
+        post_location_label_from_item(
+            {"locationName": "Санкт-Петербург", "locationId": "99"}
+        )
+        == "Санкт-Петербург (id 99)"
+    )
+    assert post_location_label_from_item({"locationName": " SPB "}) == "SPB"
+
+
+def test_post_location_label_from_nested_location_dict() -> None:
+    assert (
+        post_location_label_from_item(
+            {"location": {"name": "Moscow", "pk": "123"}}
+        )
+        == "Moscow (id 123)"
+    )
 
 
 @pytest.mark.parametrize(

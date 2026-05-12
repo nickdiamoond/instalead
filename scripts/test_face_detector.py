@@ -41,6 +41,8 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import load_config
@@ -49,6 +51,33 @@ from src.face_embedder import FaceEmbedder
 
 def _fmt_ms(seconds: float) -> str:
     return f"{seconds * 1000:.1f} ms"
+
+
+def face_bbox_percent_of_image(
+    bbox: tuple[float, float, float, float],
+    image_width: int,
+    image_height: int,
+) -> tuple[float, float, float]:
+    """How much of the raster the axis-aligned bbox covers, in percent.
+
+    Returns ``(area_percent, width_percent, height_percent)``:
+    - **area_percent** — ``100 * (bbox_w * bbox_h) / (image_w * image_h)``
+    - **width_percent** — ``100 * bbox_w / image_w``
+    - **height_percent** — ``100 * bbox_h / image_h``
+
+    If ``image_width`` or ``image_height`` is zero, returns ``(0.0, 0.0, 0.0)``.
+    """
+    x1, y1, x2, y2 = bbox
+    bw = max(0.0, float(x2 - x1))
+    bh = max(0.0, float(y2 - y1))
+    iw = float(image_width)
+    ih = float(image_height)
+    if iw <= 0.0 or ih <= 0.0:
+        return (0.0, 0.0, 0.0)
+    area_pct = 100.0 * (bw * bh) / (iw * ih)
+    w_pct = 100.0 * bw / iw
+    h_pct = 100.0 * bh / ih
+    return (area_pct, w_pct, h_pct)
 
 
 # det_size values to try in --sweep mode. Covers the full range of
@@ -73,6 +102,12 @@ def run_single(
     print(f"det_size:      {det_size}x{det_size}")
     print("=" * 60)
     print(f"Loading SCRFD (InsightFace {model_name})...")
+
+    img_bgr = cv2.imread(str(image_path))
+    if img_bgr is None:
+        print(f"ERROR: OpenCV could not decode image: {image_path.resolve()}")
+        sys.exit(1)
+    img_h, img_w = img_bgr.shape[:2]
 
     embedder = FaceEmbedder(
         model_name=model_name,
@@ -114,11 +149,16 @@ def run_single(
         for i, f in enumerate(sorted(raw_faces, key=lambda x: -x.det_score), 1):
             x1, y1, x2, y2 = f.bbox
             w, h = x2 - x1, y2 - y1
+            area_pct, w_pct, h_pct = face_bbox_percent_of_image(
+                (x1, y1, x2, y2), img_w, img_h
+            )
             kept = "KEEP" if f.det_score >= min_score else "drop"
             print(
                 f"  #{i}  score={f.det_score:.3f}  "
                 f"bbox=({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})  "
-                f"size={w:.0f}x{h:.0f}  [{kept}]"
+                f"size={w:.0f}x{h:.0f}  "
+                f"coverage={area_pct:.1f}% area "
+                f"({w_pct:.1f}%×{h_pct:.1f}% W×H)  [{kept}]"
             )
 
     print("=" * 60)

@@ -73,6 +73,7 @@
 - `type` / `productType` — отличить Reel от поста (`"Video"` + `"clips"` = Reel)
 - `commentsCount` — фильтр: обрабатываем только если >= min_comments
 - `timestamp` — фильтр по возрасту поста
+- `locationName` / `locationId` — **только если у поста есть геотег**; иначе полей нет
 - `latestComments[].ownerUsername` — ЛИДЫ (но только несколько последних комментов)
 - `shortCode` / `url` — для запроса полных комментариев отдельным актором
 
@@ -415,6 +416,9 @@ apidojo; его camelCase output нормализуется в louisdeconinck-ф
 | `onlyPostsNewerThan` | `string` | Нет | Фильтр по дате |
 | `skipPinnedPosts` | `bool` | Нет | Пропустить закреплённые посты |
 | `dataDetailLevel` | `enum` | Нет | `"basicData"` / `"detailedData"` |
+
+**Ответ (OUTPUT)** — как у hashtag-scraper по смыслу: у поста с геотегом могут быть
+`locationName` / `locationId`; у постов без места поля отсутствуют или пустые.
 
 **Цена:**
 - basicData: ~$0.0017/пост

@@ -1,7 +1,8 @@
 """Daily lead collection pipeline.
 
 Steps:
-  1. Fetch recent posts/reels (tracked realtors or hashtags — ``pipeline.step1.discovery_mode``)
+  1. Fetch recent posts/reels (realtors, hashtags, or cookie keyword search —
+     ``pipeline.step1.discovery_mode``)
   2. Score new posts via DeepSeek (relevance + CTA)
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
@@ -20,6 +21,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+
+import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -45,6 +48,12 @@ from src.ig_media_payload import (
     is_reel_payload,
     is_valid_video_url,
     merge_hashtag_items_by_shortcode,
+    post_location_label_from_item,
+)
+from src.instagram_cookie_search import (
+    cookies_json_string_for_actor,
+    dedupe_keyword_items_by_shortcode,
+    normalize_keyword_search_item,
 )
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -53,7 +62,11 @@ from src.sherlock_client import (
     SherlockError,
     make_sherlock_client,
 )
-from src.telegram_notifier import PipelineTelegramNotifier
+from src.telegram_notifier import (
+    PipelineTelegramNotifier,
+    build_step1_date_filter_section_lines,
+    build_step1_pipeline_summary_telegram_text,
+)
 from src.transcriber import NexaraTranscriber
 
 setup_logging()
@@ -78,7 +91,8 @@ DEFAULT_MIN_COMMENTS = 10
 # Override via ``pipeline.step1.post_scraper_results_limit`` (legacy:
 # ``apify.test_limits.post_scraper_results_limit`` still honored if step1 omits it).
 DEFAULT_POST_SCRAPER_RESULTS_LIMIT = 20
-# Step 1: ``pipeline.step1.discovery_mode`` — ``realtors`` | ``hashtags``.
+# Step 1: ``pipeline.step1.discovery_mode`` — ``realtors`` | ``hashtags`` |
+# ``cookie_keywords``.
 DEFAULT_STEP1_DISCOVERY_MODE = "realtors"
 
 # Step 3: comment re-scan growth threshold + the displayed cost
@@ -90,6 +104,9 @@ DEFAULT_COST_PER_COMMENT = 0.0005
 # Step 4: profile-scraper batch size + max new leads pulled per run.
 DEFAULT_PROFILE_BATCH_SIZE = 50
 DEFAULT_STEP4_BATCH_LIMIT = 1000
+# Minimum bbox area (percent of full raster) to accept the avatar as the
+# canonical face photo; below this, Step 4 uses the post-photo leader path.
+DEFAULT_MIN_AVATAR_FACE_AREA_PCT = 2.0
 
 # Step 5: max leads pulled per run from get_leads_for_sherlock.
 # Smaller than Step 4's effective rate because Sherlock tasks are
@@ -160,6 +177,25 @@ def caption_is_empty(caption: str | None) -> bool:
         return True
     without_hashtags = " ".join(w for w in caption.strip().split() if not w.startswith("#"))
     return len(without_hashtags.strip()) < 15
+
+
+def face_bbox_percent_of_image(
+    bbox: tuple[float, float, float, float],
+    image_width: int,
+    image_height: int,
+) -> tuple[float, float, float]:
+    """BBox vs full raster: ``(area_percent, width_percent, height_percent)``."""
+    x1, y1, x2, y2 = bbox
+    bw = max(0.0, float(x2 - x1))
+    bh = max(0.0, float(y2 - y1))
+    iw = float(image_width)
+    ih = float(image_height)
+    if iw <= 0.0 or ih <= 0.0:
+        return (0.0, 0.0, 0.0)
+    area_pct = 100.0 * (bw * bh) / (iw * ih)
+    w_pct = 100.0 * bw / iw
+    h_pct = 100.0 * bh / ih
+    return (area_pct, w_pct, h_pct)
 
 
 def _pick_post_images(
@@ -1110,6 +1146,11 @@ def main():
     fb_skip_videos = bool(fb_cfg.get("skip_videos", True))
     fb_keep_photos = bool(fb_cfg.get("keep_photos", False))
 
+    fd_cfg = cfg.get("face_detection") or {}
+    min_avatar_face_area_pct = float(
+        fd_cfg.get("min_avatar_face_area_pct", DEFAULT_MIN_AVATAR_FACE_AREA_PCT)
+    )
+
     # Per-step tuning knobs from config.yaml (``pipeline.stepN.*``).
     # Every value falls back to its DEFAULT_* module constant so a
     # missing section / key boots the pipeline with safe values.
@@ -1176,16 +1217,19 @@ def main():
     log.info("pipeline_start", **stats_before)
 
     # ============================================================
-    # STEP 1: Fetch posts (tracked realtors OR hashtag discovery)
+    # STEP 1: Fetch posts (realtors, hashtags, or cookie keyword search)
     # ============================================================
     actors_cfg = (cfg.get("apify") or {}).get("actors") or {}
     hashtag_actor_id = actors_cfg.get("hashtag", "apify/instagram-hashtag-scraper")
+    cookie_search_actor_id = actors_cfg.get(
+        "cookie_search_posts", "crawlerbros/instagram-keyword-search-scraper"
+    )
 
-    if discovery_mode not in ("realtors", "hashtags"):
+    if discovery_mode not in ("realtors", "hashtags", "cookie_keywords"):
         log.error("step1_invalid_discovery_mode", mode=discovery_mode)
         print(
-            "FAILED: pipeline.step1.discovery_mode must be 'realtors' or "
-            f"'hashtags', got {discovery_mode!r}."
+            "FAILED: pipeline.step1.discovery_mode must be 'realtors', "
+            f"'hashtags', or 'cookie_keywords', got {discovery_mode!r}."
         )
         issues.append(("Step 1", f"invalid discovery_mode: {discovery_mode}"))
         return
@@ -1195,6 +1239,8 @@ def main():
     reels_age_stats: dict[str, int] | None = None
     step1_empty_issue = "post-scraper returned 0 items"
     notify_secondary_count = 0
+    step1_age_dropped_client: int | None = None
+    step1_age_kept_missing_ts: int | None = None
 
     if discovery_mode == "realtors":
         _banner(f"STEP 1: Fetch posts (last {posts_max_age_days} days) [realtors]")
@@ -1238,7 +1284,7 @@ def main():
             cost_usd=detail.get("usageTotalUsd", 0),
             duration_ms=detail.get("stats", {}).get("durationMillis"),
         )
-    else:
+    elif discovery_mode == "hashtags":
         hashtags = list((cfg.get("search") or {}).get("hashtags") or [])
         _banner(
             f"STEP 1: Fetch posts via hashtags "
@@ -1318,6 +1364,12 @@ def main():
         )
 
         all_posts = merge_hashtag_items_by_shortcode(posts_filtered, reels_filtered)
+        step1_age_dropped_client = int(
+            (posts_age_stats or {}).get("dropped_too_old") or 0
+        ) + int((reels_age_stats or {}).get("dropped_too_old") or 0)
+        step1_age_kept_missing_ts = int(
+            (posts_age_stats or {}).get("kept_missing_timestamp") or 0
+        ) + int((reels_age_stats or {}).get("kept_missing_timestamp") or 0)
         step1_empty_issue = "hashtag-scraper returned 0 items after merge/filter"
         log.info(
             "step1_hashtag_merge",
@@ -1328,11 +1380,118 @@ def main():
             reels_age_stats=reels_age_stats,
         )
 
+    elif discovery_mode == "cookie_keywords":
+        search_cfg = cfg.get("search") or {}
+        cs_cfg = search_cfg.get("cookie_search") or {}
+        keywords = [str(k).strip() for k in (search_cfg.get("cookie_search_keywords") or []) if str(k).strip()]
+        _banner(
+            f"STEP 1: Fetch posts via cookie keyword search "
+            f"(≤{posts_max_age_days}d by timestamp) [cookie_keywords]"
+        )
+        if not keywords:
+            log.error("step1_no_cookie_search_keywords")
+            print(
+                "FAILED: search.cookie_search_keywords is empty in config "
+                "for discovery_mode=cookie_keywords."
+            )
+            issues.append(("Step 1", "search.cookie_search_keywords empty"))
+            return
+
+        cookie_var = str(cs_cfg.get("session_cookie_env_var", "INSTAGRAM_SESSION_COOKIE"))
+        cookies_raw = (os.environ.get(cookie_var) or "").strip()
+        if not cookies_raw:
+            log.error("step1_missing_instagram_session_cookie", env_var=cookie_var)
+            print(
+                f"FAILED: {cookie_var} is empty or unset. "
+                "Paste Instagram cookies into .env (see .env.example)."
+            )
+            issues.append(("Step 1", f"missing env {cookie_var} for cookie keyword search"))
+            return
+
+        try:
+            cookies_payload = cookies_json_string_for_actor(cookies_raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            log.error("step1_cookie_parse_failed", error=str(e))
+            print(f"FAILED: could not normalize cookies for the actor: {e}")
+            issues.append(("Step 1", f"cookie parse error: {e}"))
+            return
+
+        max_posts = int(cs_cfg.get("size_per_keyword", 5))
+        session_name = str(cs_cfg.get("session_name", "instalead_cookie_search"))
+
+        notify_secondary_count = len(keywords)
+        print(f"  Keywords:       {len(keywords)}")
+        log.info(
+            "step1_fetch_posts",
+            discovery_mode=discovery_mode,
+            keywords=len(keywords),
+            max_posts_per_keyword=max_posts,
+            max_age_days=posts_max_age_days,
+            cookie_env_var=cookie_var,
+        )
+
+        run_kw = apify.actor(cookie_search_actor_id).call(
+            run_input={
+                "keywords": keywords,
+                "maxPosts": max_posts,
+                "cookies": cookies_payload,
+                "sessionName": session_name,
+            }
+        )
+        detail_kw = apify.run(run_kw["id"]).get()
+        raw_items = list(apify.dataset(run_kw["defaultDatasetId"]).iterate_items())
+        step1_cost_usd = float(detail_kw.get("usageTotalUsd") or 0)
+
+        normalized: list[dict] = []
+        for row in raw_items:
+            if not isinstance(row, dict):
+                continue
+            n = normalize_keyword_search_item(row)
+            if n is not None:
+                normalized.append(n)
+
+        deduped = dedupe_keyword_items_by_shortcode(normalized)
+        all_posts, posts_age_stats = filter_items_within_max_age(
+            deduped, posts_max_age_days
+        )
+        step1_age_dropped_client = int((posts_age_stats or {}).get("dropped_too_old") or 0)
+        step1_age_kept_missing_ts = int(
+            (posts_age_stats or {}).get("kept_missing_timestamp") or 0
+        )
+        reels_age_stats = None
+        step1_empty_issue = (
+            "cookie keyword search returned 0 posts after normalize/dedupe/age-filter"
+        )
+
+        pipeline.log_run(
+            actor_id=cookie_search_actor_id,
+            run_id=run_kw["id"],
+            status=run_kw["status"],
+            input_params={
+                "keywords": len(keywords),
+                "maxPosts": max_posts,
+            },
+            items_count=len(raw_items),
+            cost_usd=detail_kw.get("usageTotalUsd", 0),
+            duration_ms=detail_kw.get("stats", {}).get("durationMillis"),
+        )
+        log.info(
+            "step1_cookie_keyword_merge",
+            raw_dataset_rows=len(raw_items),
+            normalized=len(normalized),
+            deduped=len(deduped),
+            after_age_filter=len(all_posts),
+            posts_age_stats=posts_age_stats,
+        )
+
     # Filter by min comments and register in DB
     new_posts = 0
     step1_new_post_items: list[dict] = []
     updated_posts = 0
     skipped_no_video_url = 0
+    step1_skip_low_comments = 0
+    step1_skip_no_shortcode = 0
+    step1_existing_unchanged = 0
     # In-memory bridge to step 2: shortcode -> fresh IG videoUrl. Used by
     # the transcription fallback. Stored only for the lifetime of this
     # run because IG CDN URLs are signed and expire in ~1-2 days.
@@ -1341,8 +1500,10 @@ def main():
         shortcode = (p.get("shortCode") or "").strip()
         comments_count = p.get("commentsCount") or 0
         if comments_count < min_comments:
+            step1_skip_low_comments += 1
             continue
         if not shortcode:
+            step1_skip_no_shortcode += 1
             continue
 
         is_reel = is_reel_payload(p)
@@ -1353,13 +1514,22 @@ def main():
                 continue
             post_videos[shortcode] = video_url
 
+        loc_label = post_location_label_from_item(p)
+
         existing = db.get_post(shortcode)
 
         if existing:
-            # Update comments_count if changed
+            update_fields: dict = {}
             if comments_count != (existing.get("comments_count") or 0):
-                db.upsert_post(shortcode, comments_count=comments_count)
-                updated_posts += 1
+                update_fields["comments_count"] = comments_count
+            if loc_label is not None:
+                update_fields["location"] = loc_label
+            if update_fields:
+                db.upsert_post(shortcode, **update_fields)
+                if "comments_count" in update_fields:
+                    updated_posts += 1
+            else:
+                step1_existing_unchanged += 1
         else:
             db.upsert_post(
                 shortcode,
@@ -1372,6 +1542,7 @@ def main():
                 post_type="reel" if is_reel else "post",
                 caption=p.get("caption"),
                 timestamp=p.get("timestamp"),
+                **({"location": loc_label} if loc_label is not None else {}),
             )
             new_posts += 1
             step1_new_post_items.append(p)
@@ -1384,9 +1555,15 @@ def main():
         updated=updated_posts,
         videos=len(post_videos),
         skipped_no_video_url=skipped_no_video_url,
+        skip_low_comments=step1_skip_low_comments,
+        skip_no_shortcode=step1_skip_no_shortcode,
+        existing_unchanged=step1_existing_unchanged,
         cost=step1_cost_usd,
         posts_age_stats=posts_age_stats,
         reels_age_stats=reels_age_stats,
+        posts_max_age_days=posts_max_age_days,
+        age_dropped_client=step1_age_dropped_client,
+        age_kept_missing_ts=step1_age_kept_missing_ts,
     )
     print(
         f"  DONE: fetched {len(all_posts)} posts "
@@ -1394,6 +1571,27 @@ def main():
         f"with_video={len(post_videos)}, skipped_no_video_url={skipped_no_video_url}) "
         f"cost=${step1_cost_usd:.4f}"
     )
+    print("  Step 1 · gate breakdown:")
+    print(
+        f"    skipped (comments < min_comments_per_post={min_comments}): "
+        f"{step1_skip_low_comments}"
+    )
+    print(f"    skipped (empty shortCode):              {step1_skip_no_shortcode}")
+    print(
+        f"    skipped (reel, no valid videoUrl):      {skipped_no_video_url}"
+    )
+    print(
+        f"    already in DB, comments unchanged:     {step1_existing_unchanged}"
+    )
+    print(f"    already in DB, comments_count updated: {updated_posts}")
+    print("  Step 1 · date filter:")
+    for df_line in build_step1_date_filter_section_lines(
+        discovery_mode=discovery_mode,
+        posts_max_age_days=posts_max_age_days,
+        age_dropped_client=step1_age_dropped_client,
+        age_kept_missing_ts=step1_age_kept_missing_ts,
+    ):
+        print(f"    {df_line}")
     if len(all_posts) == 0:
         issues.append(("Step 1", step1_empty_issue))
 
@@ -1401,6 +1599,23 @@ def main():
         new_posts,
         notify_secondary_count,
         discovery_mode=discovery_mode,
+        full_message=build_step1_pipeline_summary_telegram_text(
+            new_posts=new_posts,
+            source_count=notify_secondary_count,
+            discovery_mode=discovery_mode,
+            min_comments=min_comments,
+            fetched_total=len(all_posts),
+            updated_posts=updated_posts,
+            with_video_count=len(post_videos),
+            skipped_no_video_url=skipped_no_video_url,
+            step1_skip_low_comments=step1_skip_low_comments,
+            step1_skip_no_shortcode=step1_skip_no_shortcode,
+            step1_existing_unchanged=step1_existing_unchanged,
+            cost_usd=step1_cost_usd,
+            posts_max_age_days=posts_max_age_days,
+            age_dropped_client=step1_age_dropped_client,
+            age_kept_missing_ts=step1_age_kept_missing_ts,
+        ),
     )
     tg_notifier.notify_step1_new_posts(step1_new_post_items)
 
@@ -1458,16 +1673,15 @@ def main():
         raw_score = score_caption(deepseek, combined)
         relevance = _apply_score(db, post_id, raw_score)
 
-        if video_url:
-            post_link = (p.get("post_url") or "").strip()
-            if not post_link:
-                post_link = f"https://www.instagram.com/p/{post_id}/"
-            tg_notifier.notify_step2_scored_video(
-                post_url=post_link,
-                raw_score=raw_score,
-                resolved_relevance=relevance,
-                combined_text=combined,
-            )
+        post_link = (p.get("post_url") or "").strip()
+        if not post_link:
+            post_link = f"https://www.instagram.com/p/{post_id}/"
+        tg_notifier.notify_step2_scored_post(
+            post_url=post_link,
+            raw_score=raw_score,
+            resolved_relevance=relevance,
+            combined_text=combined,
+        )
 
     log.info(
         "step2_done",
@@ -1785,12 +1999,22 @@ def main():
                     )
                     if avatar_path:
                         avatars_downloaded += 1
-                        faces_count = avatar_embedder.count_faces(avatar_path)
+                        avatar_faces = avatar_embedder.embed_faces(avatar_path)
+                        faces_count = len(avatar_faces)
                         db.update_lead_avatar(username, avatar_path, faces_count)
 
+                        avatar_area_ok = False
                         if faces_count == 1:
+                            img_bgr = cv2.imread(str(avatar_path))
+                            if img_bgr is not None:
+                                ih, iw = img_bgr.shape[:2]
+                                area_pct, _, _ = face_bbox_percent_of_image(
+                                    avatar_faces[0].bbox, iw, ih
+                                )
+                                avatar_area_ok = area_pct >= min_avatar_face_area_pct
+
+                        if faces_count == 1 and avatar_area_ok:
                             single_face_new += 1
-                            # Avatar itself is a clean single-face photo.
                             db.update_lead_face(username, avatar_path)
                         elif uid_str:
                             # Fallback: probe the last N posts, pick the

@@ -138,6 +138,7 @@ class LeadDB:
                     has_cta             INTEGER,
                     cta_type            TEXT,
                     timestamp           TEXT,
+                    location            TEXT,
                     last_comments_count INTEGER,
                     last_scanned_at     TEXT,
                     processed_at        TEXT NOT NULL
@@ -176,6 +177,9 @@ class LeadDB:
             ],
             "lead_post_links": [
                 ("comment_pk", "TEXT"),
+            ],
+            "processed_posts": [
+                ("location", "TEXT"),
             ],
         }
         for table, columns in required.items():

@@ -36,7 +36,7 @@ Future (not yet implemented):
 |---|---|---|
 | `apify/instagram-profile-scraper` | Profile info, relatedProfiles, latestPosts | ~$0.0023/profile |
 | `apify/instagram-post-scraper` | Posts/reels from accounts (batch, date filter) | ~$0.0017/post |
-| `apify/instagram-hashtag-scraper` | Posts/reels by hashtag | ~$0.0023/post |
+| `crawlerbros/instagram-keyword-search-scraper` | Step 1 keyword search (cookie session; `search.cookie_search_keywords`) | Apify usage USD |
 | `louisdeconinck/instagram-comments-scraper` | Comments for posts (Step 3 primary) | ~$1/1K comments |
 | `apidojo/instagram-comments-scraper-api` | Comments for posts (Step 3 fallback) | $0.0075/post + $0.0005/comment (15 free per post) |
 
@@ -100,6 +100,12 @@ Step 1: Discover posts (config: pipeline.step1.discovery_mode)
         post_scraper_results_limit). Hashtag actor has no onlyPostsNewerThan;
         same max-age window applied client-side on item timestamps (UTC).
         Merge posts+reels datasets by shortCode (prefer row with valid videoUrl).
+        Mode "cookie_keywords": search.cookie_search_keywords → single run of
+        crawlerbros/instagram-keyword-search-scraper (Instagram cookies from .env;
+        see search.cookie_search). Rows are normalized to the same Apify-shaped dicts
+        as hashtags, deduped by shortCode, then the same client-side max-age filter
+        (pipeline.step1.posts_max_age_days) as hashtags. Reels need a valid CDN videoUrl
+        (from media_urls) like the hashtag path.
         Skip posts already in DB, update comments_count for existing.
         Filter: commentsCount >= pipeline.step1.min_comments_per_post.
         Video/Reel items (type Video or productType clips) require a valid
@@ -296,11 +302,14 @@ python scripts/test_face_leader.py --keep-photos
 
 - `config.yaml` — search parameters, Apify actor IDs, limits, filters
   - `pipeline.stepN.*` — per-step tuning knobs (post age, min comments,
-    Step 1 `discovery_mode` / `hashtag_results_limit`, growth threshold,
+    Step 1 `discovery_mode` (`realtors` | `hashtags` | `cookie_keywords`),
+    `hashtag_results_limit`, `search.cookie_search_keywords`, growth threshold,
     batch sizes, Sherlock cap). Every value falls back to a `DEFAULT_*`
     constant in `scripts/pipeline.py` if the key is missing, so a fresh /
     partial config still boots.
-- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`
+- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`;
+  optional `INSTAGRAM_SESSION_COOKIE` (or env from `search.cookie_search.session_cookie_env_var`)
+  when using Step 1 `discovery_mode=cookie_keywords`
 - Realtor accounts stored in DB table `tracked_realtors` (not config)
 
 ## Key Source Files
@@ -310,6 +319,10 @@ python scripts/test_face_leader.py --keep-photos
 - `src/ig_media_payload.py` — Apify Instagram media helpers shared by Step 1 and
   `scripts/test_hashtag_step1.py`: reel detection, video URL extract/validate,
   hashtag age filter on timestamps, merge posts+reels by shortCode
+- `src/instagram_cookie_search.py` — Instagram session cookie normalization for
+  Apify and mapping of crawlerbros keyword-search dataset rows to Apify-shaped
+  items (shared with `scripts/test_cookie_keyword_search.py` and Step 1
+  `discovery_mode=cookie_keywords`)
 - `src/pipeline_logger.py` — JSON pipeline logs (every API call → `logs/*.json`)
 - `src/contact_extractor.py` — regex extraction of phone/telegram/whatsapp/email from bio
 - `src/comment_normalizer.py` — `normalize_apidojo_api()` remaps the

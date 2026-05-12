@@ -27,6 +27,39 @@ def extract_video_url(item: dict) -> str | None:
     return None
 
 
+def post_location_label_from_item(item: dict) -> str | None:
+    """Human-readable geotag label from a Step 1 Apify-shaped post dict, if any.
+
+    ``apify/instagram-hashtag-scraper`` and ``apify/instagram-post-scraper`` use
+    ``locationName`` / ``locationId`` when the post has a place tag. Cookie keyword
+    search rows are normalized to the same keys in
+    ``src.instagram_cookie_search.normalize_keyword_search_item``.
+    Many posts have no geotag — then this returns ``None``.
+    """
+    name_raw = item.get("locationName")
+    name_s = name_raw.strip() if isinstance(name_raw, str) else ""
+    lid_raw = item.get("locationId")
+    lid_s = str(lid_raw).strip() if lid_raw is not None and str(lid_raw).strip() else ""
+
+    if name_s and lid_s:
+        return f"{name_s} (id {lid_s})"
+    if name_s:
+        return name_s
+    if lid_s:
+        return lid_s
+
+    loc = item.get("location")
+    if isinstance(loc, dict):
+        n = loc.get("name")
+        if isinstance(n, str) and n.strip():
+            pk = loc.get("id") if loc.get("id") is not None else loc.get("pk")
+            pk_s = str(pk).strip() if pk is not None and str(pk).strip() else ""
+            if pk_s:
+                return f"{n.strip()} (id {pk_s})"
+            return n.strip()
+    return None
+
+
 def is_valid_video_url(url: str | None) -> bool:
     """HTTPS URL accepted for Nexara / CDN-style Instagram video links."""
     if not url or not isinstance(url, str):

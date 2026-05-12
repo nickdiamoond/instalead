@@ -61,6 +61,102 @@ def truncate_for_telegram(text: str, limit: int = _TELEGRAM_MESSAGE_HARD_LIMIT) 
     return text[: max(0, limit - len(suffix))] + suffix
 
 
+def build_step1_date_filter_section_lines(
+    *,
+    discovery_mode: str,
+    posts_max_age_days: int,
+    age_dropped_client: int | None,
+    age_kept_missing_ts: int | None,
+) -> list[str]:
+    """Human-readable date / age filter lines for Step 1 (Telegram + terminal)."""
+    mode = (discovery_mode or "realtors").strip().lower()
+    out: list[str] = [
+        "Date filter",
+        f"Config: pipeline.step1.posts_max_age_days = {posts_max_age_days}",
+    ]
+    if mode == "realtors":
+        out.append(
+            "Applied on Apify as onlyPostsNewerThan "
+            f"(posts newer than {posts_max_age_days} day(s)); "
+            "client-side timestamp drop count is not available for this mode."
+        )
+        return out
+    if posts_max_age_days <= 0:
+        out.append("Client-side max-age filter: disabled (no items dropped for age).")
+        if age_dropped_client is not None:
+            out.append(f"Dropped — older than window: {age_dropped_client}")
+        return out
+    out.append(
+        "Client-side: items with parseable timestamp older than "
+        f"{posts_max_age_days} day(s) (UTC) are dropped after the Apify run."
+    )
+    if age_dropped_client is not None:
+        out.append(f"Dropped — older than window: {age_dropped_client}")
+    if age_kept_missing_ts is not None and age_kept_missing_ts > 0:
+        out.append(
+            "Kept — missing or unparseable timestamp "
+            f"(not evaluated against age window): {age_kept_missing_ts}"
+        )
+    return out
+
+
+def build_step1_pipeline_summary_telegram_text(
+    *,
+    new_posts: int,
+    source_count: int,
+    discovery_mode: str,
+    min_comments: int,
+    fetched_total: int,
+    updated_posts: int,
+    with_video_count: int,
+    skipped_no_video_url: int,
+    step1_skip_low_comments: int,
+    step1_skip_no_shortcode: int,
+    step1_existing_unchanged: int,
+    cost_usd: float,
+    posts_max_age_days: int,
+    age_dropped_client: int | None,
+    age_kept_missing_ts: int | None,
+) -> str:
+    """Single Step 1 Telegram message: headline + run totals + gate breakdown (``\\n``-separated)."""
+    mode = (discovery_mode or "realtors").strip().lower()
+    if mode == "hashtags":
+        searched = f"Searched {source_count} hashtag(s)."
+    elif mode == "cookie_keywords":
+        searched = f"Searched {source_count} keyword(s)."
+    else:
+        searched = f"Searched {source_count} active realtor(s)."
+
+    lines: list[str] = [
+        "Step 1",
+        "",
+        "Summary",
+        f"New post(s) saved: {new_posts}",
+        searched,
+        "",
+        "Run totals",
+        f"Posts fetched from Apify (this run): {fetched_total}",
+        f"Reels with usable video URL: {with_video_count}",
+        f"Step 1 Apify cost (USD): {cost_usd:.4f}",
+        "",
+        *build_step1_date_filter_section_lines(
+            discovery_mode=discovery_mode,
+            posts_max_age_days=posts_max_age_days,
+            age_dropped_client=age_dropped_client,
+            age_kept_missing_ts=age_kept_missing_ts,
+        ),
+        "",
+        "Gate breakdown",
+        f"Skipped — comments below min_comments_per_post ({min_comments}): "
+        f"{step1_skip_low_comments}",
+        f"Skipped — empty shortCode: {step1_skip_no_shortcode}",
+        f"Skipped — reel without valid videoUrl: {skipped_no_video_url}",
+        f"Already in DB — unchanged: {step1_existing_unchanged}",
+        f"Already in DB — comments_count updated: {updated_posts}",
+    ]
+    return "\n".join(lines)
+
+
 def step1_display_content_type(item: dict[str, Any]) -> str:
     """Map Apify ``type`` / ``productType`` to Image | Video | Sidecar."""
     raw = (item.get("type") or "").strip()
@@ -159,19 +255,59 @@ def build_step1_new_post_message(item: dict[str, Any]) -> str:
             ]
         )
 
+    sk = item.get("searchKeyword")
+    if isinstance(sk, str) and sk.strip():
+        lines.extend(["", "searchKeyword", sk.strip()])
+
+    csk = item.get("cookieSearchKeywords")
+    if isinstance(csk, list) and len(csk) > 1:
+        lines.extend(["", "cookieSearchKeywords", ", ".join(str(x) for x in csk if str(x).strip())])
+
+    cmt = item.get("cookieMediaType")
+    if isinstance(cmt, str) and cmt.strip():
+        lines.extend(["", "cookieMediaType", cmt.strip()])
+
+    prev = item.get("cookieMediaUrlsPreview")
+    if isinstance(prev, list) and prev:
+        lines.extend(["", "cookieMediaUrlsPreview"])
+        for i, u in enumerate(prev[:5]):
+            uu = str(u).strip()
+            if len(uu) > 120:
+                uu = uu[:119] + "…"
+            lines.append(f"  [{i}] {uu}")
+        if len(prev) > 5:
+            lines.append(f"  … +{len(prev) - 5} more (truncated in item)")
+
+    cap_prev = item.get("captionPreview")
+    if isinstance(cap_prev, str) and cap_prev.strip():
+        lines.extend(["", "captionPreview", cap_prev.strip()])
+
+    mentions = item.get("cookieMentions")
+    if isinstance(mentions, list) and mentions:
+        lines.extend(["", "mentions", ", ".join(mentions[:40])])
+        if len(mentions) > 40:
+            lines.append(f"… +{len(mentions) - 40} more")
+
+    vu = item.get("videoUrl")
+    if isinstance(vu, str) and vu.strip():
+        vv = vu.strip()
+        if len(vv) > 100:
+            vv = vv[:99] + "…"
+        lines.extend(["", "videoUrl", vv])
+
     return "\n".join(lines)
 
 
-def build_step2_scored_video_message(
+def build_step2_scored_post_message(
     post_url: str,
     raw_score: dict[str, Any],
     resolved_relevance: str,
     combined_text: str,
 ) -> str:
-    """One Telegram message per video scored in Step 2 (caption + transcript)."""
+    """One Telegram message per post scored in Step 2 (caption and/or transcript)."""
     link = (post_url or "").strip() or "(unknown)"
     lines: list[str] = [
-        "Step 2: scored video",
+        "Step 2: scored post",
         "",
         f"Link: {link}",
         "",
@@ -190,7 +326,7 @@ def build_step2_scored_video_message(
             "",
             f"Pipeline relevance: {resolved_relevance}",
             "",
-            "Video text (caption + transcript):",
+            "Scoring text (caption; transcript when available):",
             (combined_text or "").strip() or "(empty)",
         ]
     )
@@ -373,18 +509,28 @@ class PipelineTelegramNotifier:
         source_count: int,
         *,
         discovery_mode: str = "realtors",
+        full_message: str | None = None,
     ) -> None:
         if not self._enabled:
             return
-        if discovery_mode == "hashtags":
-            tail = f"searched {source_count} hashtag(s)."
+        if full_message is not None:
+            text = truncate_for_telegram(full_message)
         else:
-            tail = f"searched {source_count} active realtor(s)."
-        text = (
-            "Step 1: "
-            f"{new_posts} new post(s) saved;\n "
-            f"{tail}"
-        )
+            if discovery_mode == "hashtags":
+                tail = f"Searched {source_count} hashtag(s)."
+            elif discovery_mode == "cookie_keywords":
+                tail = f"Searched {source_count} keyword(s)."
+            else:
+                tail = f"Searched {source_count} active realtor(s)."
+            text = truncate_for_telegram(
+                "\n".join(
+                    [
+                        "Step 1",
+                        f"New post(s) saved: {new_posts}",
+                        tail,
+                    ]
+                )
+            )
         self._send_sync(text)
 
     def notify_step1_new_posts(self, items: list[dict[str, Any]]) -> None:
@@ -397,7 +543,7 @@ class PipelineTelegramNotifier:
             if i + 1 < len(items):
                 time.sleep(_STEP1_NEW_POST_MESSAGE_DELAY_SEC)
 
-    def notify_step2_scored_video(
+    def notify_step2_scored_post(
         self,
         *,
         post_url: str,
@@ -408,7 +554,7 @@ class PipelineTelegramNotifier:
         if not self._enabled:
             return
         text = truncate_for_telegram(
-            build_step2_scored_video_message(
+            build_step2_scored_post_message(
                 post_url, raw_score, resolved_relevance, combined_text
             )
         )
