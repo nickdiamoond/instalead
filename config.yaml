@@ -54,13 +54,10 @@ search:
   # Used when ``pipeline.step1.discovery_mode`` is ``cookie_keywords`` and by
   # ``scripts/test_cookie_keyword_search.py``.
   cookie_search_keywords:
-    - "Новостройка"
-    - "Ипотека"
-    - "Покупка квартиры"
-    - "Квартира"
+    - "новостройки"
   # Limits for ``apify.actors.cookie_search_posts`` (maps to actor input ``maxPosts`` per keyword).
   cookie_search:
-    size_per_keyword: 40
+    size_per_keyword: 20
     session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
     # Passed to crawlerbros actor ``sessionName`` (cookie session label).
     session_name: "instalead_cookie_search"
@@ -86,7 +83,8 @@ cycle:
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -1003926996735 #-5255644193
+  report_chat_id: -5255644193 #-1003926996735
+  result_chat_id: -5272096712
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. All values have safe defaults baked into the

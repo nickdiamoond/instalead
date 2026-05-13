@@ -13,9 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
+    _STEP1_NEW_POST_MESSAGE_DELAY_SEC,
     build_step1_date_filter_section_lines,
     build_step1_new_post_message,
     build_step1_pipeline_summary_telegram_text,
+    build_step2_human_confirm_body,
     build_step2_scored_post_message,
     step1_display_content_type,
 )
@@ -132,6 +134,70 @@ def test_build_step2_scored_post_message_shape() -> None:
     assert "Caption here" in msg and "Transcript here" in msg
 
 
+def test_build_step2_human_confirm_body_shape() -> None:
+    body = build_step2_human_confirm_body(
+        index=1, total=3, combined_text="Line one\n\nLine two"
+    )
+    assert body.startswith("[1/3]")
+    assert "ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ" in body
+    assert "Line one" in body and "Line two" in body
+
+
+def test_inline_confirm_token_and_chat_uses_result_chat_id() -> None:
+    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
+    assert n.inline_confirm_token_and_chat() == ("fake-token", -999)
+
+
+def test_inline_confirm_token_and_chat_falls_back_to_report() -> None:
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    assert n.inline_confirm_token_and_chat() == ("fake-token", -42)
+
+
+def test_inline_confirm_token_and_chat_disabled() -> None:
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=False)
+    assert n.inline_confirm_token_and_chat() is None
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_sherlock_lead_sends_summary_to_result_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
+    n.notify_sherlock_lead(
+        {"username": "someuser"},
+        {"status": "no_match"},
+        cfg=None,
+    )
+    assert mock_bot.send_message.await_count == 2
+    calls = mock_bot.send_message.await_args_list
+    assert calls[0].kwargs["chat_id"] == -42
+    assert calls[1].kwargs["chat_id"] == -999
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_sherlock_lead_both_messages_report_without_result_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    n.notify_sherlock_lead(
+        {"username": "u"},
+        {"status": "no_match"},
+        cfg=None,
+    )
+    assert mock_bot.send_message.await_count == 2
+    assert all(c.kwargs["chat_id"] == -42 for c in mock_bot.send_message.await_args_list)
+
+
 @patch("src.telegram_notifier.Bot")
 def test_notify_step2_scored_post_sends(mock_bot_class: MagicMock) -> None:
     mock_bot = MagicMock()
@@ -193,7 +259,7 @@ def test_notify_step1_new_posts_sleeps_between(
     )
 
     assert mock_bot.send_message.await_count == 2
-    mock_sleep.assert_called_once_with(0.5)
+    mock_sleep.assert_called_once_with(_STEP1_NEW_POST_MESSAGE_DELAY_SEC)
 
 
 @patch("src.telegram_notifier.Bot")

@@ -13,12 +13,14 @@ Uses DB for deduplication — safe to run repeatedly.
 """
 
 import argparse
+import asyncio
 import copy
 import json
 import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from apify_client import ApifyClient
 from dotenv import load_dotenv
+from lingua import Language, LanguageDetectorBuilder
 from openai import OpenAI
 
 from src.avatar_downloader import (
@@ -59,10 +62,17 @@ from src.instagram_cookie_search import (
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
 from src.sherlock_client import SherlockError, make_sherlock_client
+from src.telegram_inline_confirm import await_single_yes_no
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
+    STEP2_INLINE_BTN_CONFIRM,
+    STEP2_INLINE_BTN_DENY,
+    STEP2_INLINE_SUFFIX_APPROVED,
+    STEP2_INLINE_SUFFIX_DENIED,
     build_step1_date_filter_section_lines,
     build_step1_pipeline_summary_telegram_text,
+    build_step2_human_confirm_body,
+    truncate_step2_human_confirm_body,
 )
 from src.transcriber import NexaraTranscriber
 
@@ -149,76 +159,21 @@ DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 RELEVANCE_PROMPT = """\
-#Задача
-Ты — эксперт-аналитик постов риелторов в Instagram. Твоя задача — проанализировать описание поста/рилса и вернуть строго валидный JSON без markdown и лишнего текста.
+Ты анализируешь описание поста/рилса из Instagram от риелтора. Определи:
 
+1. is_real_estate — пост про недвижимость (продажа/покупка квартир, обзоры ЖК, ипотека)?
+2. has_call_to_action — есть ли призыв заинтересованным покупателям писать в комментарии/директ?
+3. call_to_action_type — тип призыва: "comment" / "direct" / "link" / "none"
 
-#Правила определения полей
+Если описание слишком короткое или непонятное — верни is_real_estate: null.
 
-1. is_real_estate
-true — пост только о покупке/продаже квартиры (или ипотеке) на первичном рынке (не вторичка) и не об аренде.
-Обязательные условия для true:
-
-Присутствуют явные или косвенные признаки сделки купли-продажи/ипотеки на квартиру: «продажа», «покупка», «купите», «ипотека», «стоимость квартиры», «цена», «ключи сразу», «новостройка», «ЖК», «сдача корпуса», «ДДУ», «переуступка прав», «от застройщика», «бронирование», «первичный рынок».
-
-Отсутствуют любые признаки аренды.
-
-Отсутствует явное указание на вторичный рынок.
-
-false в случаях:
-
-Пост про аренду квартиры: слова «аренда», «снять», «сдаётся», «сдам», «арендная плата», «в месяц» / «₽/мес.» при описании платы за проживание (не ипотечного платежа).
-
-Пост про покупку/продажу, но квартира явно вторичная: «вторичка», «вторичная квартира», «вторичный рынок», «квартира от собственника» в явном контексте вторички.
-
-Пост про жилую недвижимость, не относящуюся к квартирам (дома, коттеджи, таунхаусы, земля), даже если покупка.
-
-Пост вообще не о жилой недвижимости (коммерческая, офисы и т.п.).
-
-Пост написан не на Русском языке.
-
-null — если текст слишком короткий, неинформативный или невозможно однозначно определить, относится ли он к покупке/продаже квартиры (нет ни признаков покупки, ни аренды, ни вторички, либо контекст неясен).
-
-2. has_call_to_action
-true — в тексте есть явный призыв к потенциальным покупателям/клиентам написать в комментарии, директ или перейти по ссылке.
-Считаются призывами: «напишите в директ», «в Direct», «пишите в личку», «ставьте +», «комментируйте», «пишите в комментариях», «переходите по ссылке», «жми на ссылку», «ссылка в шапке профиля», «кликай по ссылке», «регистрируйтесь по ссылке».
-Не считаются: призывы позвонить, прийти на встречу, информационные сообщения без обращения.
-false — если ни одного призыва указанных типов нет.
-
-3. call_to_action_type
-"comment" — призыв написать в комментарии (включая «ставьте +», «напишите "хочу" в комментариях»).
-
-"direct" — призыв написать в директ (Direct, личные сообщения).
-
-"link" — призыв перейти по ссылке (активная ссылка, «ссылка в шапке», «кликай»).
-
-"none" — если призыв отсутствует или он не относится к указанным трём каналам.
-
-#Примеры для точной настройки
-
-Вход: «Продаётся 2-к квартира в ЖК «Солнечный», 45 м², цена 5 млн. Ипотека от 3,5%. Пишите в директ.»
-Выход: {"is_real_estate": true, "has_call_to_action": true, "call_to_action_type": "direct"}
-
-Вход: «Сдаётся уютная студия, 25 м² за 30 000 ₽/мес. Рядом метро. Вопросы в Direct.»
-Выход: {"is_real_estate": false, "has_call_to_action": true, "call_to_action_type": "direct"}
-
-Вход: «Продаётся вторичная квартира, 2-к, 65 м². Цена 10 млн. Все вопросы в комментарии.»
-Выход: {"is_real_estate": false, "has_call_to_action": true, "call_to_action_type": "comment"}
-
-Вход: «Выбирайте квартиру в новом ЖК. Планировки и цены по ссылке в шапке профиля.»
-Выход: {"is_real_estate": true, "has_call_to_action": true, "call_to_action_type": "link"}
-
-Вход: «Квартира в ипотеку, платёж от 22 000 ₽/мес. Ставьте +, пришлю расчёт.»
-Выход: {"is_real_estate": true, "has_call_to_action": true, "call_to_action_type": "comment"}
-
-Вход: «Звоните по поводу квартиры!»
-Выход: {"is_real_estate": null, "has_call_to_action": false, "call_to_action_type": "none"}
-(неясно, покупка или аренда; призыв к звонку не учитывается)
-
-#Формат ответа
-Выдай строго JSON без какого-либо оформления, без markdown:
+Ответь ТОЛЬКО валидным JSON без markdown:
 {"is_real_estate": true/false/null, "has_call_to_action": true/false, "call_to_action_type": "comment"|"direct"|"link"|"none"}
 """
+
+RUSSIAN_LANGUAGE_DETECTOR = (
+    LanguageDetectorBuilder.from_all_spoken_languages().build()
+)
 
 
 def shortcode_to_id(sc: str) -> int:
@@ -297,12 +252,13 @@ def _pick_post_images(
 def score_caption(client: OpenAI, caption: str) -> dict:
     try:
         resp = client.chat.completions.create(
-            model="deepseek-reasoner",
+            model="deepseek-chat",
             messages=[
                 {"role": "system", "content": RELEVANCE_PROMPT},
-                {"role": "user", "content": caption[:2000]},
+                {"role": "user", "content": caption[:3000]},
             ],
-            temperature=0
+            temperature=0,
+            max_tokens=100,
         )
         raw = resp.choices[0].message.content
         if not raw:
@@ -313,6 +269,24 @@ def score_caption(client: OpenAI, caption: str) -> dict:
         return json.loads(text)
     except Exception as e:
         return {"error": str(e)}
+
+
+def detect_scoring_text_language(
+    text: str,
+) -> tuple[Language | None, float | None, str | None]:
+    """Return Lingua's best guess plus Russian confidence for Step 2.
+
+    ``error`` is reserved for detector/runtime failures. A ``None``
+    language with ``error=None`` means Lingua could not decide reliably.
+    """
+    try:
+        detected = RUSSIAN_LANGUAGE_DETECTOR.detect_language_of(text)
+        russian_confidence = RUSSIAN_LANGUAGE_DETECTOR.compute_language_confidence(
+            text, Language.RUSSIAN
+        )
+        return detected, russian_confidence, None
+    except Exception as exc:  # noqa: BLE001
+        return None, None, f"{type(exc).__name__}: {exc}"
 
 
 def _apply_score(db: LeadDB, post_id: str, score: dict | None) -> str:
@@ -339,6 +313,70 @@ def _apply_score(db: LeadDB, post_id: str, score: dict | None) -> str:
         post_id, relevance=relevance, has_cta=has_cta, cta_type=cta_type
     )
     return relevance
+
+
+def _apply_language_gate_irrelevant(db: LeadDB, post_id: str) -> str:
+    """Persist Step 2 language-gate rejection as irrelevant."""
+    db.upsert_post(
+        post_id, relevance="irrelevant", has_cta=0, cta_type="none"
+    )
+    return "irrelevant"
+
+
+def _apply_human_irrelevant_override(db: LeadDB, post_id: str, raw_score: dict) -> None:
+    """Operator rejected ``is_real_estate=True``; force irrelevant, keep CTA columns."""
+    has_cta = 1 if raw_score.get("has_call_to_action") else 0
+    cta_type = raw_score.get("call_to_action_type") or "none"
+    db.upsert_post(
+        post_id, relevance="irrelevant", has_cta=has_cta, cta_type=cta_type
+    )
+
+
+async def _run_step2_human_confirmations(
+    db: LeadDB,
+    items: list[dict],
+    token: str,
+    chat_id: int,
+) -> dict[str, int]:
+    """Sequential inline confirm per post; ``2s`` pause between items."""
+    approved = 0
+    denied = 0
+    timed_out = 0
+    total = len(items)
+    for i, item in enumerate(items, start=1):
+        body = build_step2_human_confirm_body(
+            index=i,
+            total=total,
+            combined_text=str(item.get("combined") or ""),
+        )
+        text = truncate_step2_human_confirm_body(body)
+        result = await await_single_yes_no(
+            token,
+            chat_id,
+            text,
+            confirm_button_text=STEP2_INLINE_BTN_CONFIRM,
+            deny_button_text=STEP2_INLINE_BTN_DENY,
+            suffix_yes=STEP2_INLINE_SUFFIX_APPROVED,
+            suffix_no=STEP2_INLINE_SUFFIX_DENIED,
+        )
+        if result == "no":
+            _apply_human_irrelevant_override(
+                db, str(item["post_id"]), item["raw_score"]
+            )
+            denied += 1
+        elif result == "yes":
+            approved += 1
+        else:
+            timed_out += 1
+            log.warning(
+                "step2_human_confirm_timeout",
+                post_id=item.get("post_id"),
+                index=i,
+                total=total,
+            )
+        if i < total:
+            await asyncio.sleep(2.0)
+    return {"approved": approved, "denied": denied, "timeout": timed_out}
 
 
 def _build_scoring_text(caption: str | None, transcript: str | None) -> str:
@@ -1886,9 +1924,9 @@ def main():
     tg_notifier.notify_step1_new_posts(step1_new_post_items)
 
     # ============================================================
-    # STEP 2: Score new posts via DeepSeek (caption + transcript)
+    # STEP 2: Language-gate posts, then score Russian text via DeepSeek.
     # ============================================================
-    _banner("STEP 2: Score new posts (DeepSeek over caption + transcript)")
+    _banner("STEP 2: Score new posts (Lingua gate + DeepSeek)")
     with db._conn() as conn:
         unscored = conn.execute(
             "SELECT post_id, caption, post_url FROM processed_posts "
@@ -1905,6 +1943,11 @@ def main():
     transcribed = 0
     transcribe_failed = 0
     empty_skipped = 0
+    non_russian_skipped = 0
+    language_detect_failed = 0
+    deepseek_calls = 0
+    step2_is_re_audit: list[tuple[str, object]] = []
+    human_confirm_queue: list[dict] = []
 
     for p in unscored:
         post_id = p["post_id"]
@@ -1927,6 +1970,9 @@ def main():
                 transcribe_failed += 1
 
         combined = _build_scoring_text(caption, transcript)
+        post_link = (p.get("post_url") or "").strip()
+        if not post_link:
+            post_link = f"https://www.instagram.com/p/{post_id}/"
 
         # Nothing meaningful to send to DeepSeek (no caption / just
         # hashtags AND no usable transcript) -> mark unknown without
@@ -1936,12 +1982,52 @@ def main():
             _apply_score(db, post_id, None)
             continue
 
-        raw_score = score_caption(deepseek, combined)
-        relevance = _apply_score(db, post_id, raw_score)
+        detected_language, russian_confidence, language_error = (
+            detect_scoring_text_language(combined)
+        )
+        if language_error:
+            language_detect_failed += 1
+            log.warning(
+                "step2_language_detection_failed",
+                post_id=post_id,
+                error=language_error,
+            )
+        elif detected_language != Language.RUSSIAN:
+            non_russian_skipped += 1
+            relevance = _apply_language_gate_irrelevant(db, post_id)
+            detected_label = (
+                detected_language.name if detected_language is not None else "None"
+            )
+            confidence_text = (
+                f"{russian_confidence:.4f}"
+                if russian_confidence is not None
+                else "n/a"
+            )
+            tg_notifier.notify_step2_scored_post(
+                post_url=post_link,
+                raw_score={
+                    "error": (
+                        "skipped DeepSeek: Lingua detected "
+                        f"{detected_label}; russian_confidence={confidence_text}"
+                    )
+                },
+                resolved_relevance=relevance,
+                combined_text=combined,
+            )
+            log.info(
+                "step2_skipped_non_russian",
+                post_id=post_id,
+                detected_language=detected_label,
+                russian_confidence=russian_confidence,
+            )
+            continue
 
-        post_link = (p.get("post_url") or "").strip()
-        if not post_link:
-            post_link = f"https://www.instagram.com/p/{post_id}/"
+        deepseek_calls += 1
+        raw_score = score_caption(deepseek, combined)
+        if "error" not in raw_score:
+            step2_is_re_audit.append((post_id, raw_score.get("is_real_estate")))
+
+        relevance = _apply_score(db, post_id, raw_score)
         tg_notifier.notify_step2_scored_post(
             post_url=post_link,
             raw_score=raw_score,
@@ -1949,17 +2035,65 @@ def main():
             combined_text=combined,
         )
 
+        if raw_score.get("is_real_estate") is True and "error" not in raw_score:
+            human_confirm_queue.append(
+                {
+                    "post_id": post_id,
+                    "post_link": post_link,
+                    "combined": combined,
+                    "raw_score": dict(raw_score),
+                }
+            )
+
+    is_re_ctr = Counter(v for _, v in step2_is_re_audit)
+    human_stats = {"approved": 0, "denied": 0, "timeout": 0}
+    creds = tg_notifier.inline_confirm_token_and_chat()
+    if human_confirm_queue and creds:
+        token, chat_id = creds
+        human_stats = asyncio.run(
+            _run_step2_human_confirmations(
+                db, human_confirm_queue, token, chat_id
+            )
+        )
+    elif human_confirm_queue and not creds:
+        log.warning(
+            "step2_human_confirm_skipped",
+            reason="telegram_disabled_or_unconfigured",
+            queued=len(human_confirm_queue),
+        )
+
     log.info(
         "step2_done",
         scored=len(unscored),
+        deepseek_calls=deepseek_calls,
         transcribed=transcribed,
         transcribe_failed=transcribe_failed,
         empty_skipped=empty_skipped,
+        non_russian_skipped=non_russian_skipped,
+        language_detect_failed=language_detect_failed,
+        is_re_true=is_re_ctr.get(True, 0),
+        is_re_false=is_re_ctr.get(False, 0),
+        is_re_none=is_re_ctr.get(None, 0),
+        human_confirm_queued=len(human_confirm_queue),
+        human_confirm_approved=human_stats["approved"],
+        human_confirm_denied=human_stats["denied"],
+        human_confirm_timeout=human_stats["timeout"],
     )
     print(f"  DONE: scored {len(unscored)} "
-          f"(transcribed={transcribed}, "
+          f"(deepseek_calls={deepseek_calls}, "
+          f"transcribed={transcribed}, "
           f"transcribe_failed={transcribe_failed}, "
-          f"empty_skipped={empty_skipped})")
+          f"empty_skipped={empty_skipped}, "
+          f"non_russian_skipped={non_russian_skipped}, "
+          f"language_detect_failed={language_detect_failed})")
+    if human_confirm_queue:
+        print(
+            "  Step 2 human confirm: "
+            f"queued={len(human_confirm_queue)} "
+            f"approved={human_stats['approved']} "
+            f"denied={human_stats['denied']} "
+            f"timeout={human_stats['timeout']}"
+        )
     if transcribe_failed and transcribe_failed > transcribed:
         issues.append((
             "Step 2",
@@ -2326,7 +2460,7 @@ def main():
                     external_urls=p.get("externalUrls"),
                 )
                 if any(v for v in contacts.values()):
-                    db.update_lead_contacts(username=username, **{k: v for k, v in contacts.items() if v})
+                    #db.update_lead_contacts(username=username, **{k: v for k, v in contacts.items() if v})
                     contacts_found += 1
 
         log.info(
@@ -2388,16 +2522,16 @@ def main():
     # already Sherlock'd in prior runs. --keep-photos disables it
     # for debugging / forensic work.
 
-    #if args.keep_photos:
-    #    _banner("STEP 6: Cleanup spent face assets")
-    #    print("  SKIPPED by --keep-photos.")
-    #    log.info("step6_skipped_by_flag")
-    #else:
-    #    _step_6_cleanup_spent_face_assets(
-    #        db,
-    #        log=log,
-    #        issues=issues,
-    #    )
+    if args.keep_photos:
+        _banner("STEP 6: Cleanup spent face assets")
+        print("  SKIPPED by --keep-photos.")
+        log.info("step6_skipped_by_flag")
+    else:
+        _step_6_cleanup_spent_face_assets(
+            db,
+            log=log,
+            issues=issues,
+        )
 
     # ============================================================
     # SUMMARY

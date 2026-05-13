@@ -71,6 +71,7 @@ async def _drain_pending_updates(bot, *, batch_limit: int = 100, max_batches: in
     """Fetch consecutive update pages until empty or max_batches (Telegram buffer)."""
     all_updates: list = []
     offset: int | None = None
+    await bot.set_webhook(url="", allowed_updates=[])
     for _ in range(max_batches):
         batch = await bot.get_updates(limit=batch_limit, offset=offset, timeout=1)
         if not batch:

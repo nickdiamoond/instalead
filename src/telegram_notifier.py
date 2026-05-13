@@ -2,7 +2,9 @@
 
 Uses Bot API ``sendMessage`` via aiogram. Disabled when ``TELEGRAM_BOT_TOKEN``
 is missing or ``telegram.report_chat_id`` is absent/invalid — the pipeline
-keeps running."""
+keeps running. Step 2 human inline confirmations and the per-lead Sherlock
+Russian summary (last ``notify_sherlock_lead`` message) use ``telegram.result_chat_id``
+when set, otherwise ``report_chat_id``."""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +25,7 @@ from src.logger import get_logger
 log = get_logger("telegram_notifier")
 
 # Pause between Step 1 per-post Telegram messages (rate limits / UX).
-_STEP1_NEW_POST_MESSAGE_DELAY_SEC = 0.5
+_STEP1_NEW_POST_MESSAGE_DELAY_SEC = 2.0
 
 TOKEN_ENV_VAR = "TELEGRAM_BOT_TOKEN"
 
@@ -337,6 +339,33 @@ def build_step2_scored_post_message(
     return "\n".join(lines)
 
 
+# Step 2 human inline confirm (paired with ``src.telegram_inline_confirm``).
+STEP2_HUMAN_CONFIRM_HEADLINE = "ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ"
+STEP2_INLINE_BTN_CONFIRM = "✅ Подтвердить добавление"
+STEP2_INLINE_BTN_DENY = "❌ Нет"
+STEP2_INLINE_SUFFIX_APPROVED = " (одобрено)"
+STEP2_INLINE_SUFFIX_DENIED = " (отказано)"
+
+
+def build_step2_human_confirm_body(
+    *, index: int, total: int, combined_text: str
+) -> str:
+    """Telegram body before inline buttons (Step 2 manual target check)."""
+    header = f"[{index}/{total}]"
+    body = (combined_text or "").strip() or "(empty)"
+    return f"{header}\n\n{STEP2_HUMAN_CONFIRM_HEADLINE}\n\n{body}"
+
+
+def truncate_step2_human_confirm_body(body: str) -> str:
+    """Leave headroom for ``STEP2_INLINE_SUFFIX_*`` on ``editText`` after click."""
+    reserve = max(
+        len(STEP2_INLINE_SUFFIX_APPROVED), len(STEP2_INLINE_SUFFIX_DENIED)
+    )
+    return truncate_for_telegram(
+        body, limit=max(256, _TELEGRAM_MESSAGE_HARD_LIMIT - reserve)
+    )
+
+
 def build_sherlock_face_photo_caption(
     lead: dict, insightface_detection_percent: float | None
 ) -> str:
@@ -520,7 +549,7 @@ def build_sherlock_lead_result_summary_text(lead: dict, res: dict) -> str:
         lines.append(f"Имя пользователя из био инсты: {fn if fn else '—'}")
     elif status == _SH_FOUND_PHOTO:
         person = res.get("sherlock_person")
-        lines.append(f"person: {person if person is not None else '—'}")
+        lines.append(f"person: {person.rsplit(" ", 1)[0] if person is not None else '—'}")
         ph = str(res.get("phone") or "").strip()
         lines.append(f"Телефон: {ph if ph else '—'}")
     lines.append(f"совпадение: {match_label}")
@@ -539,6 +568,18 @@ def _parse_report_chat_id(cfg: dict[str, Any]) -> int | None:
         return None
 
 
+def _parse_result_chat_id(cfg: dict[str, Any]) -> int | None:
+    tg = cfg.get("telegram") or {}
+    raw = tg.get("result_chat_id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning("telegram_invalid_result_chat_id", raw=raw)
+        return None
+
+
 class PipelineTelegramNotifier:
     """Fire-and-forget messages to ``telegram.report_chat_id``."""
 
@@ -547,10 +588,12 @@ class PipelineTelegramNotifier:
         token: str | None,
         chat_id: int | None,
         *,
+        result_chat_id: int | None = None,
         enabled: bool = True,
     ) -> None:
         self._token = (token or "").strip() or None
         self._chat_id = chat_id
+        self._result_chat_id = result_chat_id
         has_pair = bool(self._token and self._chat_id is not None)
         self._enabled = bool(enabled and has_pair)
 
@@ -571,11 +614,23 @@ class PipelineTelegramNotifier:
                     reason="no_token_and_no_chat_id",
                 )
 
+    def inline_confirm_token_and_chat(self) -> tuple[str, int] | None:
+        """``(token, chat_id)`` for Step 2 inline polling; chat is ``result_chat_id`` if set."""
+        if not self._enabled or self._token is None or self._chat_id is None:
+            return None
+        confirm_chat = (
+            self._result_chat_id
+            if self._result_chat_id is not None
+            else self._chat_id
+        )
+        return (self._token, confirm_chat)
+
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> PipelineTelegramNotifier:
         token = os.environ.get(TOKEN_ENV_VAR)
         chat_id = _parse_report_chat_id(cfg)
-        return cls(token, chat_id)
+        result_chat_id = _parse_result_chat_id(cfg)
+        return cls(token, chat_id, result_chat_id=result_chat_id)
 
     def notify_step1(
         self,
@@ -608,7 +663,7 @@ class PipelineTelegramNotifier:
         self._send_sync(text)
 
     def notify_step1_new_posts(self, items: list[dict[str, Any]]) -> None:
-        """Send one message per new post; ``0.5s`` pause between sends."""
+        """Send one message per new post; ``2s`` pause between sends."""
         if not self._enabled or not items:
             return
         for i, raw in enumerate(items):
@@ -676,6 +731,12 @@ class PipelineTelegramNotifier:
         text3 = truncate_for_telegram(
             build_sherlock_lead_result_summary_text(lead, res)
         )
+        summary_chat = (
+            self._result_chat_id
+            if self._result_chat_id is not None
+            else self._chat_id
+        )
+        assert summary_chat is not None
         if (
             bool(res.get("photo_search_ran"))
             and cfg is not None
@@ -689,22 +750,33 @@ class PipelineTelegramNotifier:
                     limit=_TELEGRAM_PHOTO_CAPTION_LIMIT,
                 )
                 if self._send_sync_photo_then_text(
-                    photo_path, caption, text2, text3
+                    photo_path,
+                    caption,
+                    text2,
+                    text3,
+                    last_text_chat_id=summary_chat,
                 ):
                     return
         self._send_sync(text2)
-        self._send_sync(text3)
+        self._send_sync(text3, chat_id=summary_chat)
 
-    async def _send_message_once(self, text: str) -> None:
+    async def _send_message_once(
+        self, text: str, *, chat_id: int | None = None
+    ) -> None:
         assert self._token is not None and self._chat_id is not None
+        dest = self._chat_id if chat_id is None else chat_id
         async with Bot(token=self._token) as bot:
             await asyncio.wait_for(
-                bot.send_message(chat_id=self._chat_id, text=text),
+                bot.send_message(chat_id=dest, text=text),
                 timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
             )
 
     async def _send_photo_then_messages_once(
-        self, photo_path: str, caption: str, *message_texts: str
+        self,
+        photo_path: str,
+        caption: str,
+        *message_texts: str,
+        last_text_chat_id: int | None = None,
     ) -> None:
         assert self._token is not None and self._chat_id is not None
         async with Bot(token=self._token) as bot:
@@ -716,21 +788,42 @@ class PipelineTelegramNotifier:
                 ),
                 timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
             )
-            for msg in message_texts:
+            if not message_texts:
+                return
+            if last_text_chat_id is None:
+                for msg in message_texts:
+                    await asyncio.wait_for(
+                        bot.send_message(chat_id=self._chat_id, text=msg),
+                        timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
+                    )
+                return
+            *rest, last_msg = message_texts
+            for msg in rest:
                 await asyncio.wait_for(
                     bot.send_message(chat_id=self._chat_id, text=msg),
                     timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
                 )
+            await asyncio.wait_for(
+                bot.send_message(chat_id=last_text_chat_id, text=last_msg),
+                timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
+            )
 
     def _send_sync_photo_then_text(
-        self, photo_path: str, caption: str, *message_texts: str
+        self,
+        photo_path: str,
+        caption: str,
+        *message_texts: str,
+        last_text_chat_id: int | None = None,
     ) -> bool:
         max_attempts = 1 + _TELEGRAM_SEND_RETRIES
         for attempt in range(1, max_attempts + 1):
             try:
                 asyncio.run(
                     self._send_photo_then_messages_once(
-                        photo_path, caption, *message_texts
+                        photo_path,
+                        caption,
+                        *message_texts,
+                        last_text_chat_id=last_text_chat_id,
                     )
                 )
                 if attempt > 1:
@@ -759,11 +852,11 @@ class PipelineTelegramNotifier:
                 time.sleep(_TELEGRAM_RETRY_DELAY_SEC)
         return False
 
-    def _send_sync(self, text: str) -> None:
+    def _send_sync(self, text: str, *, chat_id: int | None = None) -> None:
         max_attempts = 1 + _TELEGRAM_SEND_RETRIES
         for attempt in range(1, max_attempts + 1):
             try:
-                asyncio.run(self._send_message_once(text))
+                asyncio.run(self._send_message_once(text, chat_id=chat_id))
                 if attempt > 1:
                     log.info("telegram_send_recovered_after_retry", attempt=attempt)
                 return
