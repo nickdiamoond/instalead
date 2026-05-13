@@ -140,6 +140,7 @@ def test_build_sherlock_result_summary_nick_hit() -> None:
     }
     s = build_sherlock_lead_result_summary_text(lead, res)
     assert s.startswith('Результат по "@AliceTG"')
+    assert "Профиль: https://www.instagram.com/alice/" in s
     assert "Ник в тг: @AliceTG" in s
     assert "Имя пользователя из био инсты: Alice Иванова" in s
     assert "совпадение: найден по нику" in s
@@ -156,16 +157,23 @@ def test_build_sherlock_result_summary_photo_exact() -> None:
     }
     s = build_sherlock_lead_result_summary_text(lead, res)
     assert 'Результат по "@bobtg"' in s
+    assert "Профиль: https://www.instagram.com/bob/" in s
     assert "person: Иван Иванов" in s
     assert "Телефон: +7999" in s
     assert "совпадение: точное совпадение" in s
 
 
 def test_build_sherlock_result_summary_no_match() -> None:
-    lead = {"username": "carol", "context_post_url": None}
+    lead = {
+        "username": "carol",
+        "full_name": "Кэрол Смит",
+        "context_post_url": None,
+    }
     res = {"status": "no_match"}
     s = build_sherlock_lead_result_summary_text(lead, res)
     assert 'Результат по "@carol"' in s
+    assert "Профиль: https://www.instagram.com/carol/" in s
+    assert "ФИО из Instagram: Кэрол Смит" in s
     assert "совпадение: пользователь не найден" in s
 
 

@@ -455,7 +455,7 @@ def _sherlock_result_summary_title_line(lead: dict, res: dict) -> str:
     ig = str(lead.get("username") or "").strip() or "unknown"
     if status == _SH_FOUND_NICK:
         h = _telegram_handle(str(res.get("telegram_username") or ""))
-        return f'Результат по "{h}"' if h else f'Результат по "{ig}"'
+        return f'Результат по "{h}"' if h else f'Результат по "{_telegram_handle(ig)}"'
     if status == _SH_FOUND_PHOTO:
         link = str(res.get("sherlock_link") or "").strip()
         m = re.search(
@@ -463,7 +463,7 @@ def _sherlock_result_summary_title_line(lead: dict, res: dict) -> str:
         )
         if m:
             return f'Результат по "{_telegram_handle(m.group(1))}"'
-    return f'Результат по "{ig}"'
+    return f'Результат по "{_telegram_handle(ig)}"'
 
 
 def _sherlock_match_label_ru(res: dict) -> str:
@@ -495,6 +495,10 @@ def build_sherlock_lead_result_summary_text(lead: dict, res: dict) -> str:
     lines.append(f"Юзернейм Instagram: {ig}" if ig != "(unknown)" else "Юзернейм Instagram: —")
     post_u = lead.get("context_post_url")
     lines.append(f"Пост: {post_u}" if post_u else "Пост: —")
+    if ig != "(unknown)":
+        lines.append(f"Профиль: https://www.instagram.com/{ig}/")
+    else:
+        lines.append("Профиль: —")
     sc = str(lead.get("context_post_shortcode") or "").strip()
     cpk = str(lead.get("context_comment_pk") or "").strip()
     if sc and cpk:
@@ -502,6 +506,11 @@ def build_sherlock_lead_result_summary_text(lead: dict, res: dict) -> str:
     else:
         lines.append("Комментарий: нет")
     lines.append("")
+
+    match_label = _sherlock_match_label_ru(res)
+    if match_label == "пользователь не найден":
+        fn_nf = str(lead.get("full_name") or "").strip()
+        lines.append(f"ФИО из Instagram: {fn_nf if fn_nf else '—'}")
 
     status = str(res.get("status") or "")
     if status == _SH_FOUND_NICK:
@@ -514,7 +523,7 @@ def build_sherlock_lead_result_summary_text(lead: dict, res: dict) -> str:
         lines.append(f"person: {person if person is not None else '—'}")
         ph = str(res.get("phone") or "").strip()
         lines.append(f"Телефон: {ph if ph else '—'}")
-    lines.append(f"совпадение: {_sherlock_match_label_ru(res)}")
+    lines.append(f"совпадение: {match_label}")
     return "\n".join(lines)
 
 

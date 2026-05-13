@@ -54,11 +54,13 @@ search:
   # Used when ``pipeline.step1.discovery_mode`` is ``cookie_keywords`` and by
   # ``scripts/test_cookie_keyword_search.py``.
   cookie_search_keywords:
-    - "Санкт-Петербург"
-
+    - "Новостройка"
+    - "Ипотека"
+    - "Покупка квартиры"
+    - "Квартира"
   # Limits for ``apify.actors.cookie_search_posts`` (maps to actor input ``maxPosts`` per keyword).
   cookie_search:
-    size_per_keyword: 5
+    size_per_keyword: 40
     session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
     # Passed to crawlerbros actor ``sessionName`` (cookie session label).
     session_name: "instalead_cookie_search"
@@ -84,7 +86,7 @@ cycle:
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -5255644193 #-1003926996735 
+  report_chat_id: -1003926996735 #-5255644193
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. All values have safe defaults baked into the
@@ -108,7 +110,7 @@ pipeline:
     # apify/instagram-post-scraper input "onlyPostsNewerThan = N days".
     # Realtors don't update old posts, so this both bounds the dataset
     # and keeps comments fresh enough for Step 3 to find new commenters.
-    posts_max_age_days: 14
+    posts_max_age_days: 60
     # Filter for processed_posts: posts with fewer than this many
     # comments aren't worth scoring (DeepSeek $) or scanning (Apify $).
     min_comments_per_post: 10
@@ -136,14 +138,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 5
+    batch_limit: 30
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
-    batch_limit: 5
+    batch_limit: 30
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to
     # restore parallel Step 5.
@@ -180,7 +182,7 @@ face_detection:
   # than this fraction of the image area (percent), skip promoting the
   # avatar to face_photo_path and run the last-posts face-leader fallback
   # instead. Post-photo path is unchanged.
-  min_avatar_face_area_pct: 0.5
+  min_avatar_face_area_pct: 1.5
 
 # Face leader fallback: when avatar face count is not exactly 1, probe the
 # last N post photos, keep only single-face ones, cluster them by cosine
