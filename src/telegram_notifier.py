@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,9 @@ def _is_retryable_telegram_send_error(exc: BaseException) -> bool:
 # Must match scripts/pipeline.py SH_STATUS_* labels (avoid importing pipeline).
 _SH_FOUND_NICK = "found_nick"
 _SH_FOUND_PHOTO = "found_photo"
+_SH_NO_MATCH = "no_match"
+_SH_NO_FACE_PHOTO = "no_face_photo"
+_SH_ERROR = "error"
 _TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 _TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
 
@@ -390,8 +394,6 @@ def build_sherlock_lead_notification_text(lead: dict, res: dict) -> str:
     if not isinstance(photo_task, dict):
         photo_task = {}
 
-    status = str(res.get("status") or "error")
-
     lines: list[str] = []
     lines.append(f"Step 5 (Sherlock): Insta username - {ig}\n")
     post_u = lead.get("context_post_url")
@@ -443,13 +445,76 @@ def build_sherlock_lead_notification_text(lead: dict, res: dict) -> str:
                 "a Telegram profile; photo stage did not run or did not finish."
             )
 
-    contact_saved_yes = status == _SH_FOUND_NICK or (
-        status == _SH_FOUND_PHOTO
-        and bool(res.get("phone") or res.get("telegram_username"))
-    )
-    lines.append("")
-    lines.append(f"Sherlock contact saved to DB: {'yes' if contact_saved_yes else 'no'}")
+    return "\n".join(lines)
 
+
+def _sherlock_result_summary_title_line(lead: dict, res: dict) -> str:
+    """First line of the Russian Step 5 summary: ``Результат по "handle"``."""
+    res = res or {}
+    status = str(res.get("status") or "")
+    ig = str(lead.get("username") or "").strip() or "unknown"
+    if status == _SH_FOUND_NICK:
+        h = _telegram_handle(str(res.get("telegram_username") or ""))
+        return f'Результат по "{h}"' if h else f'Результат по "{ig}"'
+    if status == _SH_FOUND_PHOTO:
+        link = str(res.get("sherlock_link") or "").strip()
+        m = re.search(
+            r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)", link, re.I
+        )
+        if m:
+            return f'Результат по "{_telegram_handle(m.group(1))}"'
+    return f'Результат по "{ig}"'
+
+
+def _sherlock_match_label_ru(res: dict) -> str:
+    """Value for the ``совпадение:`` line in the Russian summary."""
+    st = str(res.get("status") or "")
+    if st == _SH_FOUND_NICK:
+        return "найден по нику"
+    if st == _SH_FOUND_PHOTO:
+        kind = str(res.get("photo_match_kind") or "")
+        if kind == "exact":
+            return "точное совпадение"
+        if kind == "deepseek":
+            return "вероятное совпадение"
+        return "вероятное совпадение"
+    if st in (_SH_NO_MATCH, _SH_NO_FACE_PHOTO):
+        return "пользователь не найден"
+    if st == _SH_ERROR:
+        return "ошибка поиска"
+    return "пользователь не найден"
+
+
+def build_sherlock_lead_result_summary_text(lead: dict, res: dict) -> str:
+    """Russian follow-up for operators: Insta context + match outcome."""
+    res = res or {}
+    ig = str(lead.get("username") or "").strip() or "(unknown)"
+    lines: list[str] = []
+    lines.append(_sherlock_result_summary_title_line(lead, res))
+    lines.append("")
+    lines.append(f"Юзернейм Instagram: {ig}" if ig != "(unknown)" else "Юзернейм Instagram: —")
+    post_u = lead.get("context_post_url")
+    lines.append(f"Пост: {post_u}" if post_u else "Пост: —")
+    sc = str(lead.get("context_post_shortcode") or "").strip()
+    cpk = str(lead.get("context_comment_pk") or "").strip()
+    if sc and cpk:
+        lines.append(f"Комментарий: https://www.instagram.com/p/{sc}/c/{cpk}/")
+    else:
+        lines.append("Комментарий: нет")
+    lines.append("")
+
+    status = str(res.get("status") or "")
+    if status == _SH_FOUND_NICK:
+        tg_raw = str(res.get("telegram_username") or "").strip()
+        lines.append(f"Ник в тг: {_telegram_handle(tg_raw)}")
+        fn = str(lead.get("full_name") or "").strip()
+        lines.append(f"Имя пользователя из био инсты: {fn if fn else '—'}")
+    elif status == _SH_FOUND_PHOTO:
+        person = res.get("sherlock_person")
+        lines.append(f"person: {person if person is not None else '—'}")
+        ph = str(res.get("phone") or "").strip()
+        lines.append(f"Телефон: {ph if ph else '—'}")
+    lines.append(f"совпадение: {_sherlock_match_label_ru(res)}")
     return "\n".join(lines)
 
 
@@ -596,7 +661,12 @@ class PipelineTelegramNotifier:
     ) -> None:
         if not self._enabled:
             return
-        text = truncate_for_telegram(build_sherlock_lead_notification_text(lead, res))
+        text2 = truncate_for_telegram(
+            build_sherlock_lead_notification_text(lead, res)
+        )
+        text3 = truncate_for_telegram(
+            build_sherlock_lead_result_summary_text(lead, res)
+        )
         if (
             bool(res.get("photo_search_ran"))
             and cfg is not None
@@ -609,9 +679,12 @@ class PipelineTelegramNotifier:
                     build_sherlock_face_photo_caption(lead, pct),
                     limit=_TELEGRAM_PHOTO_CAPTION_LIMIT,
                 )
-                if self._send_sync_photo_then_text(photo_path, caption, text):
+                if self._send_sync_photo_then_text(
+                    photo_path, caption, text2, text3
+                ):
                     return
-        self._send_sync(text)
+        self._send_sync(text2)
+        self._send_sync(text3)
 
     async def _send_message_once(self, text: str) -> None:
         assert self._token is not None and self._chat_id is not None
@@ -621,8 +694,8 @@ class PipelineTelegramNotifier:
                 timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
             )
 
-    async def _send_photo_then_message_once(
-        self, photo_path: str, caption: str, message_text: str
+    async def _send_photo_then_messages_once(
+        self, photo_path: str, caption: str, *message_texts: str
     ) -> None:
         assert self._token is not None and self._chat_id is not None
         async with Bot(token=self._token) as bot:
@@ -634,20 +707,21 @@ class PipelineTelegramNotifier:
                 ),
                 timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
             )
-            await asyncio.wait_for(
-                bot.send_message(chat_id=self._chat_id, text=message_text),
-                timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
-            )
+            for msg in message_texts:
+                await asyncio.wait_for(
+                    bot.send_message(chat_id=self._chat_id, text=msg),
+                    timeout=_TELEGRAM_REQUEST_TIMEOUT_SEC,
+                )
 
     def _send_sync_photo_then_text(
-        self, photo_path: str, caption: str, message_text: str
+        self, photo_path: str, caption: str, *message_texts: str
     ) -> bool:
         max_attempts = 1 + _TELEGRAM_SEND_RETRIES
         for attempt in range(1, max_attempts + 1):
             try:
                 asyncio.run(
-                    self._send_photo_then_message_once(
-                        photo_path, caption, message_text
+                    self._send_photo_then_messages_once(
+                        photo_path, caption, *message_texts
                     )
                 )
                 if attempt > 1:

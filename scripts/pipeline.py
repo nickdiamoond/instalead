@@ -7,7 +7,7 @@ Steps:
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
   5. Resolve Telegram contacts for naked leads via Sherlock
-     (nick search first, photo fallback if face_photo_path exists)
+     (nick search first, photo fallback with exact-match or DeepSeek pick)
 
 Uses DB for deduplication — safe to run repeatedly.
 """
@@ -16,6 +16,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,11 +58,7 @@ from src.instagram_cookie_search import (
 )
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
-from src.sherlock_client import (
-    PHOTO_RESULT_STATUS_NO_MATCH,
-    SherlockError,
-    make_sherlock_client,
-)
+from src.sherlock_client import SherlockError, make_sherlock_client
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
     build_step1_date_filter_section_lines,
@@ -500,9 +497,14 @@ def _fetch_comments_with_fallback(
 #      we save the matched username + t.me link. Done.
 #
 #   2) Else, if face_photo_path is set, POST /v1/search/photo with the
-#      file. Look at result.results[0] only (per spec). If its `status`
-#      is anything OTHER than the exact Cyrillic string "не совпадение",
-#      save phone + link. Otherwise mark no_match.
+#      file. If ``results[0].status`` contains the Cyrillic substring
+#      "точное совпадение", we save ``phone`` + ``link`` from that row.
+#      Otherwise we collect every result row with a non-null ``person``,
+#      format names for DeepSeek (same prompt as
+#      ``scripts/test_profile_face_pick.py``), and save ``phone`` + ``link``
+#      only for the candidate the model picks (confidence gate in the
+#      prompt). No pick / no candidates / missing DeepSeek client →
+#      ``no_match`` without writing contacts.
 #
 # By default Step 5 runs one lead at a time (sequential) with a short
 # pause between leads; set ``pipeline.step5.sequential: false`` to fan
@@ -517,6 +519,126 @@ SH_STATUS_NO_MATCH = "no_match"
 SH_STATUS_NO_FACE_PHOTO = "no_face_photo"
 SH_STATUS_ERROR = "error"
 
+# First-row ``status`` substring for Sherlock photo ``result.results``;
+# mirrors ``scripts/test_profile_face_pick.py``.
+SHERLOCK_EXACT_MATCH_SUBSTRING = "точное совпадение"
+USERMATCH_PROMPT = """\
+#Задача: 
+Ты анализируешь Ник пользователя из Instagram(username) и его ФИО из профиля(если оно присутствует). А также пронумерованный список потенциальных кандидатов.
+Ты должен определить, кому из кандидатов принадлежит этот аккаунт.
+Может оказатья так, что ник пользователя из Instagram и его ФИО не принадлежат ни одному кандидату.
+Иногда бывает так, что ник ползователя(username) содержит в себе как минимум частично имя или фамилию кандидата. И если ФИО из профиля пустое, ты должен сопоставить юзернейм с кандидатами. Но если ФИО пользователя из Instagram присутствует, отдавай приоритет ему.
+
+#Данные:
+Ник пользователя из Instagram: "{username}"
+ФИО пользователя из Instagram: "{full_name}"
+
+Список потенциальных кандидатов: {candidates}
+
+#Формат ответа:
+В ответе ты должен указать номер кандидата, которому принадлежит этот аккаунт только в том случае, если ты уверен, что этот аккаунт принадлежит этому кандидату минимум на 7/10. Если ты не уверен, отдай 0.
+Если ты нашел совпадение, но в списке потенциальных кандидатов есть одинаковые ФИО, отдай номер первого из них.
+Ответь ТОЛЬКО одной цифрой, которая соответствует номеру кандидата, либо 0, если ник пользователя из Instagram и его ФИО не принадлежат ни одному кандидату.
+"""
+
+
+def _sherlock_photo_results_list(result: dict | None) -> list:
+    """Normalize ``result["results"]`` for photo search (dict or list)."""
+    if not result or not isinstance(result, dict):
+        return []
+    raw = result.get("results")
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+def _person_for_digest_list(person: object) -> object:
+    """Keep the substring before the last space (trim trailing tokens like a DOB)."""
+    if not isinstance(person, str):
+        return person
+    if " " not in person:
+        return person
+    return person.rsplit(" ", 1)[0]
+
+
+def _format_candidates_for_prompt(persons: list) -> str:
+    """``1) `` + name + ``\\n`` for each entry (1-based)."""
+    return "".join(f"{i}) {p}\n" for i, p in enumerate(persons, start=1))
+
+
+def _parse_usermatch_digit(raw: str) -> int | None:
+    """First signed integer in model output, or ``None`` if unparseable."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    m = re.search(r"-?\d+", text)
+    if not m:
+        return None
+    return int(m.group(0))
+
+
+def _deepseek_usermatch_pick_index(
+    client: OpenAI,
+    *,
+    ig_username: str,
+    ig_full_name: str,
+    persons: list,
+) -> int | None:
+    """Return 1-based candidate index, or ``None`` if model declines or call fails."""
+    candidates_block = _format_candidates_for_prompt(persons)
+    system_prompt = USERMATCH_PROMPT.format(
+        username=ig_username,
+        full_name=ig_full_name,
+        candidates=candidates_block,
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Ответь одной цифрой."},
+            ],
+            temperature=0,
+            max_tokens=16,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "step5_deepseek_usermatch_failed",
+            username=ig_username,
+            error=str(exc),
+        )
+        return None
+
+    pick = _parse_usermatch_digit(raw)
+    if pick is None:
+        log.warning(
+            "step5_deepseek_usermatch_unparseable",
+            username=ig_username,
+            raw=raw[:200],
+        )
+        return None
+    if pick == 0:
+        log.info(
+            "step5_deepseek_usermatch_zero",
+            username=ig_username,
+        )
+        return None
+    if pick < 1 or pick > len(persons):
+        log.warning(
+            "step5_deepseek_usermatch_out_of_range",
+            username=ig_username,
+            pick=pick,
+            n=len(persons),
+            raw=raw[:200],
+        )
+        return None
+    return pick
+
 
 def _resolve_one_lead_via_sherlock(
     sherlock,
@@ -525,6 +647,7 @@ def _resolve_one_lead_via_sherlock(
     nick_cfg: dict,
     photo_cfg: dict,
     task_cfg: dict,
+    deepseek: OpenAI | None = None,
 ) -> dict:
     """Run the full nick->photo flow for one lead.
 
@@ -533,6 +656,13 @@ def _resolve_one_lead_via_sherlock(
     every exception path resolves to ``status=error`` with a populated
     ``error`` message so a single misbehaving lead doesn't sink the
     whole batch.
+
+    Photo stage: if ``results[0].status`` contains "точное совпадение",
+    ``phone`` / ``link`` are taken from that row. Otherwise every row
+    with a non-null ``person`` is sent to DeepSeek (``USERMATCH_PROMPT``)
+    with the lead's Instagram ``username`` and ``full_name``; the model
+    picks at most one candidate. Missing client, no candidates, or no
+    confident pick → ``no_match`` without contact fields.
 
     Returned shape (orchestrator + Telegram):
       {
@@ -665,26 +795,96 @@ def _resolve_one_lead_via_sherlock(
                 or f"photo task ended status={final_status!r}"
             )
             return out
-        results = ((task.get("result") or {}).get("results")) or []
+        result_block = task.get("result") or {}
+        results = _sherlock_photo_results_list(result_block)
         if not results:
             out["status"] = SH_STATUS_NO_MATCH
             out["error"] = None
             return out
-        first = results[0] or {}
-        per_status = first.get("status") or ""
-        # Spec: anything OTHER than the exact Cyrillic
-        # "не совпадение" counts as a hit. Includes
-        # "вероятное совпадение", "возможное совпадение", etc.
-        if per_status == PHOTO_RESULT_STATUS_NO_MATCH:
+        first_raw = results[0]
+        first = first_raw if isinstance(first_raw, dict) else {}
+        first_status = str(first.get("status") or "")
+
+        if SHERLOCK_EXACT_MATCH_SUBSTRING in first_status:
+            out.update({
+                "status": SH_STATUS_FOUND_PHOTO,
+                "phone": first.get("phone"),
+                "sherlock_link": first.get("link"),
+                "error": None,
+                "photo_match_kind": "exact",
+                "sherlock_person": first.get("person"),
+            })
+            log.info(
+                "step5_sherlock_photo_outcome",
+                username=username,
+                branch="exact_match",
+            )
+            return out
+
+        persons: list = []
+        raw_persons: list = []
+        phones: list = []
+        links: list = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if "person" not in item or item.get("person") is None:
+                continue
+            persons.append(_person_for_digest_list(item.get("person")))
+            raw_persons.append(item.get("person"))
+            phones.append(item.get("phone"))
+            links.append(item.get("link"))
+
+        if not persons:
             out["status"] = SH_STATUS_NO_MATCH
             out["error"] = None
+            log.info(
+                "step5_sherlock_photo_outcome",
+                username=username,
+                branch="no_person_candidates",
+            )
             return out
+
+        if deepseek is None:
+            out["status"] = SH_STATUS_NO_MATCH
+            out["error"] = None
+            log.warning(
+                "step5_sherlock_photo_no_deepseek_client",
+                username=username,
+            )
+            return out
+
+        pick = _deepseek_usermatch_pick_index(
+            deepseek,
+            ig_username=username,
+            ig_full_name=str(lead.get("full_name") or ""),
+            persons=persons,
+        )
+        if pick is None:
+            out["status"] = SH_STATUS_NO_MATCH
+            out["error"] = None
+            log.info(
+                "step5_sherlock_photo_outcome",
+                username=username,
+                branch="no_contact_after_disambiguation",
+            )
+            return out
+
+        idx = pick - 1
         out.update({
             "status": SH_STATUS_FOUND_PHOTO,
-            "phone": first.get("phone"),
-            "sherlock_link": first.get("link"),
+            "phone": phones[idx],
+            "sherlock_link": links[idx],
             "error": None,
+            "photo_match_kind": "deepseek",
+            "sherlock_person": raw_persons[idx],
         })
+        log.info(
+            "step5_sherlock_photo_outcome",
+            username=username,
+            branch="deepseek_pick",
+            pick=pick,
+        )
         return out
     except (SherlockError, TimeoutError) as exc:
         out["status"] = SH_STATUS_ERROR
@@ -728,6 +928,7 @@ def _step_5_resolve_contacts_via_sherlock(
     log,
     issues: list[tuple[str, str]],
     tg_notifier: PipelineTelegramNotifier,
+    deepseek: OpenAI | None,
 ) -> None:
     """Run Sherlock contact resolution for naked leads (parallel or sequential).
 
@@ -759,6 +960,11 @@ def _step_5_resolve_contacts_via_sherlock(
     ``tg_notifier``: after each ``mark_lead_sherlock``, sends Telegram
     per lead from the main thread (photo + InsightFace caption, then text
     when photo stage ran — see :meth:`PipelineTelegramNotifier.notify_sherlock_lead`).
+
+    ``deepseek``: OpenAI client pointed at DeepSeek; used to pick among
+    photo-search rows when the first row is not an exact match. Pass
+    ``None`` only in tests — production ``main()`` always supplies the
+    same client as Step 2.
     """
     _banner("STEP 5: Resolve contacts via Sherlock")
 
@@ -927,6 +1133,7 @@ def _step_5_resolve_contacts_via_sherlock(
                         nick_cfg=nick_cfg,
                         photo_cfg=photo_cfg,
                         task_cfg=task_cfg,
+                        deepseek=deepseek,
                     )
                 except Exception as exc:  # noqa: BLE001
                     res = _worker_error_payload(username, exc)
@@ -943,6 +1150,7 @@ def _step_5_resolve_contacts_via_sherlock(
                         nick_cfg=nick_cfg,
                         photo_cfg=photo_cfg,
                         task_cfg=task_cfg,
+                        deepseek=deepseek,
                     ): lead
                     for lead in candidates
                 }
@@ -2112,6 +2320,7 @@ def main():
             log=log,
             issues=issues,
             tg_notifier=tg_notifier,
+            deepseek=deepseek,
         )
 
     # ============================================================

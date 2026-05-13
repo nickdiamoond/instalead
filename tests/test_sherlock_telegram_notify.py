@@ -12,6 +12,7 @@ from src.telegram_notifier import (
     PipelineTelegramNotifier,
     build_sherlock_face_photo_caption,
     build_sherlock_lead_notification_text,
+    build_sherlock_lead_result_summary_text,
     truncate_for_telegram,
 )
 
@@ -37,7 +38,7 @@ def test_build_nick_hit_includes_prefixed_handle() -> None:
     assert "Telegram match (nick search): @AliceTG" in txt
     assert "Photo search — full Sherlock task JSON" not in txt
     assert "Comment: https://www.instagram.com/p/ABC/c/123/" in txt
-    assert "Sherlock contact saved to DB: yes" in txt
+    assert "Sherlock contact saved to DB" not in txt
 
 
 def test_build_photo_search_has_json_when_no_nick_hit() -> None:
@@ -55,7 +56,7 @@ def test_build_photo_search_has_json_when_no_nick_hit() -> None:
     assert "Telegram nick not found for @bob; photo search." in txt
     assert '"status": "completed"' in txt
     assert '"id": "tid"' in txt
-    assert "Sherlock contact saved to DB: no" in txt
+    assert "Sherlock contact saved to DB" not in txt
 
 
 def test_build_nick_saved_normalizes_without_at_prefix() -> None:
@@ -122,7 +123,50 @@ def test_notify_sherlock_lead_dispatches(mock_bot_class: MagicMock) -> None:
             "nick_query": "@eve",
         },
     )
-    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_count == 2
+
+
+def test_build_sherlock_result_summary_nick_hit() -> None:
+    lead = {
+        "username": "alice",
+        "full_name": "Alice Иванова",
+        "context_post_url": "https://www.instagram.com/p/ABC/",
+        "context_post_shortcode": "ABC",
+        "context_comment_pk": "999",
+    }
+    res = {
+        "status": "found_nick",
+        "telegram_username": "AliceTG",
+    }
+    s = build_sherlock_lead_result_summary_text(lead, res)
+    assert s.startswith('Результат по "@AliceTG"')
+    assert "Ник в тг: @AliceTG" in s
+    assert "Имя пользователя из био инсты: Alice Иванова" in s
+    assert "совпадение: найден по нику" in s
+
+
+def test_build_sherlock_result_summary_photo_exact() -> None:
+    lead = {"username": "bob", "context_post_url": "https://ex/p/1/"}
+    res = {
+        "status": "found_photo",
+        "phone": "+7999",
+        "sherlock_link": "https://t.me/bobtg",
+        "photo_match_kind": "exact",
+        "sherlock_person": "Иван Иванов",
+    }
+    s = build_sherlock_lead_result_summary_text(lead, res)
+    assert 'Результат по "@bobtg"' in s
+    assert "person: Иван Иванов" in s
+    assert "Телефон: +7999" in s
+    assert "совпадение: точное совпадение" in s
+
+
+def test_build_sherlock_result_summary_no_match() -> None:
+    lead = {"username": "carol", "context_post_url": None}
+    res = {"status": "no_match"}
+    s = build_sherlock_lead_result_summary_text(lead, res)
+    assert 'Результат по "@carol"' in s
+    assert "совпадение: пользователь не найден" in s
 
 
 @patch("src.telegram_notifier.Bot")
@@ -156,6 +200,6 @@ def test_notify_sherlock_lead_photo_search_sends_photo_then_text(
         cfg={"face_detection": {}},
     )
     mock_bot.send_photo.assert_awaited_once()
-    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_count == 2
     pc = mock_bot.send_photo.await_args.kwargs["caption"]
     assert "@bob" in pc and "90.0%" in pc

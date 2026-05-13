@@ -12,6 +12,12 @@ The winning image is copied to ``facetest/profile_face_winner/`` so temp
 files under ``data/avatars`` and ``data/lead_photos`` stay aligned with the
 production layout while you still get a stable artifact for inspection.
 
+If a winner exists and ``SHERLOCK_API_KEY`` is set, the script then runs the
+same ``POST /v1/search/photo`` flow as ``scripts/test_sherlock_photo.py`` on
+that file (avatar winner vs post-leader uses ``face_kind`` ``avatar`` / ``post``
+for the optional local SCRFD preamble). No Sherlock call is made when there is
+no winner, or when the API key is missing.
+
 Edit ``INSTAGRAM_PROFILE_URL`` below, then run::
 
     python scripts/test_profile_face_pick.py
@@ -19,18 +25,35 @@ Edit ``INSTAGRAM_PROFILE_URL`` below, then run::
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import cv2
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import requests
+from openai import OpenAI
+
+from src.face_embedder import make_face_embedder
+from src.sherlock_client import (
+    API_KEY_ENV_VAR,
+    SherlockClient,
+    SherlockError,
+    make_sherlock_client,
+)
+
 # ---------------------------------------------------------------------------
 # Hardcoded test target — replace with any public Instagram profile URL.
 # ---------------------------------------------------------------------------
-INSTAGRAM_PROFILE_URL = "https://www.instagram.com/mmsh_14/"
+INSTAGRAM_PROFILE_URL = "https://www.instagram.com/nura_yadr/"
 
 # Output directory (under project root, separate from production DB paths).
 OUTPUT_REL = Path("facetest") / "profile_face_winner"
@@ -114,9 +137,428 @@ def face_bbox_percent_of_image(
     return (area_pct, w_pct, h_pct)
 
 
+def _mask_key(key: str) -> str:
+    if not key:
+        return "<empty>"
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}...{key[-4:]} (len={len(key)})"
+
+
+def _print_sherlock_result(result: dict | None) -> None:
+    if not result:
+        print("  result:  (empty)")
+        return
+    print("  result:")
+    formatted = json.dumps(result, indent=2, ensure_ascii=False)
+    for line in formatted.splitlines():
+        print("    " + line)
+
+
+# First-row ``status`` substring for Sherlock photo ``result.results`` (see
+# ``scripts/pipeline._resolve_one_lead_via_sherlock`` photo stage).
+SHERLOCK_EXACT_MATCH_SUBSTRING = "точное совпадение"
+USERMATCH_PROMPT = """\
+#Задача: 
+Ты анализируешь Ник пользователя из Instagram(username) и его ФИО из профиля(если оно присутствует). А также пронумерованный список потенциальных кандидатов.
+Ты должен определить, кому из кандидатов принадлежит этот аккаунт.
+Может оказатья так, что ник пользователя из Instagram и его ФИО не принадлежат ни одному кандидату.
+Иногда бывает так, что ник ползователя(username) содержит в себе как минимум частично имя или фамилию кандидата. И если ФИО из профиля пустое, ты должен сопоставить юзернейм с кандидатами. Но если ФИО пользователя из Instagram присутствует, отдавай приоритет ему.
+
+#Данные:
+Ник пользователя из Instagram: "{username}"
+ФИО пользователя из Instagram: "{full_name}"
+
+Список потенциальных кандидатов: {candidates}
+
+#Формат ответа:
+В ответе ты должен указать номер кандидата, которому принадлежит этот аккаунт только в том случае, если ты уверен, что этот аккаунт принадлежит этому кандидату минимум на 7/10. Если ты не уверен, отдай 0.
+Если ты нашел совпадение, но в списке потенциальных кандидатов есть одинаковые ФИО, отдай номер первого из них.
+Ответь ТОЛЬКО одной цифрой, которая соответствует номеру кандидата, либо 0, если ник пользователя из Instagram и его ФИО не принадлежат ни одному кандидату.
+"""
+
+
+def _sherlock_photo_results_list(result: dict | None) -> list:
+    """Normalize ``result["results"]`` like ``pipeline._resolve_one_lead_via_sherlock``."""
+    if not result or not isinstance(result, dict):
+        return []
+    raw = result.get("results")
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+def _person_for_digest_list(person: object) -> object:
+    """Keep the substring before the last space (trim trailing tokens like a DOB)."""
+    if not isinstance(person, str):
+        return person
+    if " " not in person:
+        return person
+    return person.rsplit(" ", 1)[0]
+
+
+def _format_candidates_for_prompt(persons: list) -> str:
+    """``1) `` + name + ``\\n`` for each entry (1-based), same order as ``persons``."""
+    return "".join(f"{i}) {p}\n" for i, p in enumerate(persons, start=1))
+
+
+def _parse_usermatch_digit(raw: str) -> int | None:
+    """First signed integer in model output, or ``None`` if unparseable."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    m = re.search(r"-?\d+", text)
+    if not m:
+        return None
+    return int(m.group(0))
+
+
+def _deepseek_usermatch_pick(
+    client: OpenAI,
+    *,
+    ig_username: str,
+    ig_full_name: str,
+    persons: list,
+    phones: list,
+    statuses: list,
+) -> None:
+    """Same transport as ``scripts.pipeline.score_caption`` (OpenAI client → DeepSeek API)."""
+    candidates_block = _format_candidates_for_prompt(persons)
+    system_prompt = USERMATCH_PROMPT.format(
+        username=ig_username,
+        full_name=ig_full_name,
+        candidates=candidates_block,
+    )
+    print("-" * 70)
+    print("DeepSeek user match (USERMATCH_PROMPT) ...")
+    try:
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Ответь одной цифрой."},
+            ],
+            temperature=0,
+            max_tokens=16,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as exc:
+        print(f"DeepSeek request failed: {exc}", file=sys.stderr)
+        return
+
+    pick = _parse_usermatch_digit(raw)
+    if pick is None:
+        print(f"DeepSeek: не удалось разобрать ответ ({raw!r}).")
+        return
+    if pick == 0:
+        print("Дипсик совпадений не нашел.")
+        return
+    idx = pick - 1
+    if idx < 0 or idx >= len(persons):
+        print(
+            f"DeepSeek: индекс {pick} вне диапазона "
+            f"(кандидатов {len(persons)}). Ответ: {raw!r}"
+        )
+        return
+    print("DeepSeek pick:")
+    print(f"  person:  {persons[idx]!r}")
+    print(f"  phone:   {phones[idx]!r}")
+    print(f"  status:  {statuses[idx]!r}")
+
+
+def _print_sherlock_photo_results_digest(
+    result: dict | None,
+    *,
+    ig_username: str,
+    ig_full_name: str,
+    deepseek: OpenAI | None,
+) -> None:
+    """After the full result JSON: branch on ``results[0].status`` (pipeline analogy)."""
+    results = _sherlock_photo_results_list(result)
+    print("-" * 70)
+    print("Sherlock results digest:")
+    if not results:
+        print("  (no result.results)")
+        return
+
+    first = results[0]
+    if not isinstance(first, dict):
+        first = {}
+    first_status = str(first.get("status") or "")
+
+    if SHERLOCK_EXACT_MATCH_SUBSTRING in first_status:
+        print(f"  person: {first.get('person')!r}")
+        print(f"  phone:  {first.get('phone')!r}")
+        print(f"  status: {first.get('status')!r}")
+        return
+
+    persons: list = []
+    phones: list = []
+    statuses: list = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        if "person" not in item or item.get("person") is None:
+            continue
+        persons.append(_person_for_digest_list(item.get("person")))
+        phones.append(item.get("phone"))
+        statuses.append(item.get("status"))
+
+    if not persons:
+        print("  (no candidates with a non-null ``person`` field)")
+        return
+    if deepseek is None:
+        print(
+            "  DEEPSEEK_API_KEY not set — skipping numbered-candidate match "
+            "(arrays not printed)."
+        )
+        return
+    _deepseek_usermatch_pick(
+        deepseek,
+        ig_username=ig_username,
+        ig_full_name=ig_full_name,
+        persons=persons,
+        phones=phones,
+        statuses=statuses,
+    )
+
+
+def describe_local_face_detection(
+    photo_path: Path,
+    cfg: dict,
+    kind: str,
+) -> None:
+    """Same pre-submit SCRFD pass as ``scripts/test_sherlock_photo.py``."""
+    fd = cfg.get("face_detection") or {}
+    min_score = float(fd.get("min_det_score", 0.6))
+    det_size = int(
+        fd.get(
+            "avatar_det_size" if kind == "avatar" else "post_det_size",
+            320 if kind == "avatar" else 640,
+        )
+    )
+
+    print(f"  kind:           {kind!r}  (det_size={det_size}x{det_size})")
+    print(f"  min_det_score:  {min_score}  (from config.yaml face_detection)")
+
+    embedder = make_face_embedder(cfg, kind=kind)
+    embedder.min_det_score = 0.0
+
+    t0 = time.monotonic()
+    faces = embedder.embed_faces(photo_path)
+    elapsed_ms = (time.monotonic() - t0) * 1000
+
+    embedder.close()
+
+    print(f"  raw detections: {len(faces)}  ({elapsed_ms:.0f} ms incl. cold load)")
+    if not faces:
+        print(
+            "  -> NO face detected at any score. Sherlock will likely "
+            "reject the photo or return zero matches."
+        )
+        return
+
+    kept = [f for f in faces if f.det_score >= min_score]
+    print(f"  above threshold: {len(kept)} / {len(faces)}")
+    print("  per-face:")
+    for i, f in enumerate(sorted(faces, key=lambda x: -x.det_score), 1):
+        x1, y1, x2, y2 = f.bbox
+        w, h = x2 - x1, y2 - y1
+        verdict = "KEEP" if f.det_score >= min_score else "drop"
+        print(
+            f"    #{i}  det_score={f.det_score:.3f}  "
+            f"bbox=({x1:.0f},{y1:.0f})-({x2:.0f},{y2:.0f})  "
+            f"size={w:.0f}x{h:.0f}  [{verdict}]"
+        )
+
+    if len(kept) == 0:
+        print(
+            "  -> face(s) found but all BELOW min_det_score "
+            f"({min_score}). For an avatar this usually means a side "
+            "view / occlusion / very small face — Sherlock may still "
+            "match but quality is uncertain."
+        )
+    elif len(kept) == 1:
+        print("  -> exactly 1 face above threshold = ideal Sherlock input.")
+    else:
+        print(
+            f"  -> {len(kept)} faces above threshold. Sherlock will "
+            "match against the largest/most-confident one."
+        )
+
+
+def _make_sherlock_poll_progress_callback():
+    def on_poll(poll_count: int, elapsed_s: float, task: dict) -> None:
+        status = (task.get("status") or "").lower()
+        attempts = task.get("attempts")
+        max_attempts = task.get("max_attempts")
+        account_id = task.get("account_id")
+        sys.stdout.write(
+            f"\r  [poll #{poll_count:>3}]  t+{elapsed_s:>5.1f}s  "
+            f"status={status:<10}  attempt={attempts}/{max_attempts}  "
+            f"account_id={account_id}    "
+        )
+        sys.stdout.flush()
+
+    return on_poll
+
+
+def _run_sherlock_photo_search(
+    photo_path: Path,
+    cfg: dict,
+    *,
+    face_kind: str,
+    ig_username: str,
+    ig_full_name: str,
+    deepseek: OpenAI | None,
+) -> int:
+    """POST ``/v1/search/photo`` and poll. Skips entirely if API key missing."""
+    api_key = os.environ.get(API_KEY_ENV_VAR, "").strip().strip("'\"")
+    if not api_key:
+        print(f"{API_KEY_ENV_VAR} not set — skipping Sherlock photo search.")
+        return 0
+
+    for _stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(_stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+    sh_cfg = cfg.get("sherlock") or {}
+    photo_cfg = sh_cfg.get("photo_search") or {}
+    task_cfg = sh_cfg.get("task") or {}
+    poll_interval = float(task_cfg.get("poll_interval_secs", 3))
+    max_wait = float(task_cfg.get("max_wait_secs", 300))
+    max_pages = int(photo_cfg.get("max_pages", 20))
+    max_attempts = int(photo_cfg.get("max_attempts", 3))
+    priority = int(photo_cfg.get("priority", 0))
+
+    client: SherlockClient
+    try:
+        client = make_sherlock_client(cfg, api_key=api_key)
+    except EnvironmentError as exc:
+        print(f"Sherlock client error: {exc}", file=sys.stderr)
+        return 1
+
+    base_url = client.base_url
+    http_timeout = client.http_timeout
+
+    size_kb = photo_path.stat().st_size / 1024
+    print("=" * 70)
+    print("Sherlock photo search (same flow as scripts/test_sherlock_photo.py)")
+    print(f"Base URL:      {base_url}")
+    print(f"Photo:         {photo_path.resolve()}  ({size_kb:.1f} KB)")
+    print(f"API key:       {_mask_key(api_key)}")
+    print(f"max_pages:     {max_pages}")
+    print(f"priority:      {priority}")
+    print(f"max_attempts:  {max_attempts}")
+    print(f"poll_interval: {poll_interval}s   max_wait: {max_wait}s")
+    print("=" * 70)
+
+    print("Step 0: local SCRFD face detection on winner photo ...")
+    try:
+        describe_local_face_detection(
+            photo_path=photo_path,
+            cfg=cfg,
+            kind=face_kind,
+        )
+    except Exception as exc:
+        print(f"  (face detection skipped: {exc})")
+    print("-" * 70)
+    print("Step 1: POST /v1/search/photo ...")
+
+    try:
+        enq = client.enqueue_photo(
+            photo_path,
+            max_pages=max_pages,
+            priority=priority,
+            max_attempts=max_attempts,
+        )
+    except (requests.RequestException, SherlockError) as exc:
+        print(f"ERROR: enqueue failed: {exc}", file=sys.stderr)
+        client.close()
+        return 1
+
+    task_id = enq.get("id")
+    if not task_id:
+        print(f"ERROR: enqueue response missing 'id': {enq}", file=sys.stderr)
+        client.close()
+        return 1
+
+    print(f"  -> task_id:   {task_id}")
+    print(f"     scenario:  {enq.get('scenario')!r}")
+    print(f"     status:    {enq.get('status')!r}")
+    print(f"     priority:  {enq.get('priority')}")
+    print(f"     created:   {enq.get('created_at')}")
+    print()
+    print("Step 2: polling task state until terminal status ...")
+
+    on_poll = _make_sherlock_poll_progress_callback()
+    t_poll_start = time.monotonic()
+    try:
+        task = client.wait_for_task(
+            task_id,
+            poll_interval=poll_interval,
+            max_wait=max_wait,
+            on_poll=on_poll,
+        )
+    except TimeoutError as exc:
+        sys.stdout.write("\n")
+        print(f"ERROR: {exc}", file=sys.stderr)
+        client.close()
+        return 1
+    except (requests.RequestException, SherlockError) as exc:
+        sys.stdout.write("\n")
+        print(f"ERROR: polling failed: {exc}", file=sys.stderr)
+        client.close()
+        return 1
+    elapsed = time.monotonic() - t_poll_start
+    sys.stdout.write("\n")
+
+    final_status = (task.get("status") or "").lower()
+    print()
+    print("=" * 70)
+    print(f"Step 3: task finished in {elapsed:.1f}s with status={final_status!r}")
+    print("-" * 70)
+    print(f"  account_id:    {task.get('account_id')}")
+    print(f"  attempts:      {task.get('attempts')}/{task.get('max_attempts')}")
+    print(f"  started_at:    {task.get('started_at')}")
+    print(f"  finished_at:   {task.get('finished_at')}")
+
+    if final_status == "completed":
+        res = task.get("result")
+        _print_sherlock_result(res)
+        _print_sherlock_photo_results_digest(
+            res,
+            ig_username=ig_username,
+            ig_full_name=ig_full_name,
+            deepseek=deepseek,
+        )
+    else:
+        err_code = task.get("error_code")
+        err_msg = task.get("error_message")
+        print(f"  error_code:    {err_code!r}")
+        print(f"  error_message: {err_msg!r}")
+        if task.get("result"):
+            res = task.get("result")
+            _print_sherlock_result(res)
+            _print_sherlock_photo_results_digest(
+                res,
+                ig_username=ig_username,
+                ig_full_name=ig_full_name,
+                deepseek=deepseek,
+            )
+
+    client.close()
+    print("=" * 70)
+    return 0 if final_status == "completed" else 1
+
+
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(repo_root))
+    repo_root = _REPO_ROOT
 
     from apify_client import ApifyClient
     from dotenv import load_dotenv
@@ -127,7 +569,6 @@ def main() -> int:
         download_post_photos,
     )
     from src.config import load_config
-    from src.face_embedder import make_face_embedder
     from src.face_leader import resolve_face_leader
     from src.logger import get_logger, setup_logging
 
@@ -181,6 +622,15 @@ def main() -> int:
     if p.get("private"):
         print(f"Profile @{username} is private — cannot download media.", file=sys.stderr)
         return 1
+
+    # From Apify item (for reuse / logging); URL-derived ``username`` stays the request handle.
+    profile_username = p.get("username")
+    profile_full_name = p.get("fullName")
+    print(
+        "Apify profile fields:\n"
+        f"\n\n  username: {profile_username!r}\n\n"
+        f"\n\n  fullName: {profile_full_name!r}\n\n"
+    )
 
     avatar_url = p.get("profilePicUrlHD") or p.get("profilePicUrl")
     uid = p.get("id") or p.get("pk")
@@ -261,7 +711,30 @@ def main() -> int:
         avatar_faces=faces_count,
         dest=str(dest),
     )
-    return 0
+
+    # Same /v1/search/photo flow as scripts/test_sherlock_photo.py on the winner file only.
+    face_kind = "avatar" if source == "avatar" else "post"
+    ds_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip().strip("'\"")
+    deepseek_client: OpenAI | None = None
+    if ds_key:
+        deepseek_client = OpenAI(
+            api_key=ds_key,
+            base_url="https://api.deepseek.com",
+        )
+    ig_u = (profile_username or username or "").strip()
+    ig_fn = (profile_full_name or "")
+    if isinstance(ig_fn, str):
+        ig_fn = ig_fn.strip()
+    else:
+        ig_fn = str(ig_fn) if ig_fn is not None else ""
+    return _run_sherlock_photo_search(
+        winner_path,
+        cfg,
+        face_kind=face_kind,
+        ig_username=ig_u,
+        ig_full_name=ig_fn,
+        deepseek=deepseek_client,
+    )
 
 
 if __name__ == "__main__":

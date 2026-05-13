@@ -58,7 +58,7 @@ search:
 
   # Limits for ``apify.actors.cookie_search_posts`` (maps to actor input ``maxPosts`` per keyword).
   cookie_search:
-    size_per_keyword: 15
+    size_per_keyword: 5
     session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
     # Passed to crawlerbros actor ``sessionName`` (cookie session label).
     session_name: "instalead_cookie_search"
@@ -136,14 +136,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 30
+    batch_limit: 5
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
-    batch_limit: 30
+    batch_limit: 5
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to
     # restore parallel Step 5.
@@ -180,7 +180,7 @@ face_detection:
   # than this fraction of the image area (percent), skip promoting the
   # avatar to face_photo_path and run the last-posts face-leader fallback
   # instead. Post-photo path is unchanged.
-  min_avatar_face_area_pct: 2.0
+  min_avatar_face_area_pct: 0.5
 
 # Face leader fallback: when avatar face count is not exactly 1, probe the
 # last N post photos, keep only single-face ones, cluster them by cosine
