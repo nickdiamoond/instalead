@@ -332,6 +332,14 @@ class LeadDB:
                 (avatar_path, faces_count, username),
             )
 
+    def clear_lead_avatar_path(self, username: str) -> None:
+        """Set ``avatar_path`` to NULL; keep ``faces_count`` (detection already ran)."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE lead_accounts SET avatar_path = NULL WHERE username = ?",
+                (username,),
+            )
+
     def update_lead_face(self, username: str, face_photo_path: str) -> None:
         """Persist the canonical single-face photo for a lead.
 
@@ -584,16 +592,20 @@ class LeadDB:
         }
 
     def get_leads_needing_avatar(self, limit: int = 1000) -> list[dict]:
-        """Leads that have profile data but no avatar processed yet.
+        """Leads that have profile data but never had a successful avatar pass.
+
+        Requires ``faces_count IS NULL`` so we do not re-queue leads whose
+        on-disk avatar was intentionally removed after Step 4 (orphan file
+        cleanup) while SCRFD results remain in ``faces_count``.
 
         Excludes leads Sherlock has already processed (terminal status set).
         Step 6 of the pipeline NULLs out ``avatar_path`` after Sherlock
-        finishes (except for ``error`` outcomes), so without this gate
-        ``backfill_avatars.py`` would re-fetch every cleaned lead via
-        Apify -- direct money loss. The retry path "clear
-        sherlock_processed_at to re-process" is documented on
-        :py:meth:`get_leads_for_sherlock` and naturally re-admits the
-        lead here once it's cleared.
+        finishes (except for ``error`` outcomes), so without the
+        ``sherlock_processed_at`` gate ``backfill_avatars.py`` would re-fetch
+        every cleaned lead via Apify -- direct money loss. The retry path
+        "clear sherlock_processed_at to re-process" is documented on
+        :py:meth:`get_leads_for_sherlock` and naturally re-admits the lead
+        here once it's cleared.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -601,6 +613,7 @@ class LeadDB:
                 "FROM lead_accounts "
                 "WHERE profile_fetched = 1 "
                 "  AND avatar_path IS NULL "
+                "  AND faces_count IS NULL "
                 "  AND sherlock_processed_at IS NULL "
                 "  AND COALESCE(is_private, 0) = 0 "
                 "LIMIT ?",

@@ -1,5 +1,10 @@
 """Backfill avatars + face detection for existing leads.
 
+Candidates are ``get_leads_needing_avatar()`` rows: profile fetched,
+non-private, Sherlock not finished, and no SCRFD pass yet
+(``faces_count IS NULL``) — leads whose on-disk avatar was removed after
+Step 4 orphan cleanup are not re-queued here.
+
 Two modes:
   --refetch (default): re-run apify/instagram-profile-scraper to get
                        fresh avatar URLs (Instagram CDN URLs expire in

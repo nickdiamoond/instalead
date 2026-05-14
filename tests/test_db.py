@@ -24,11 +24,11 @@ def test_init_tables(db):
 
 def test_post_dedup(db):
     assert not db.is_post_processed("abc123")
-    db.mark_post_processed("abc123", post_url="https://instagram.com/p/abc123/")
+    db.upsert_post("abc123", post_url="https://instagram.com/p/abc123/")
     assert db.is_post_processed("abc123")
 
     # Inserting again should not raise
-    db.mark_post_processed("abc123", post_url="https://instagram.com/p/abc123/")
+    db.upsert_post("abc123", post_url="https://instagram.com/p/abc123/")
     assert db.get_stats()["processed_posts"] == 1
 
 
@@ -69,3 +69,34 @@ def test_apify_run_upsert(db):
     db.log_apify_run(run_id="run1", actor_id="test", cost_usd=0.02)
     assert db.get_stats()["apify_runs"] == 1
     assert db.get_stats()["total_cost_usd"] == 0.02
+
+
+def test_clear_lead_avatar_path_keeps_faces_count(db):
+    db.add_lead_account("u_avatar", user_id="1")
+    db.update_lead_profile("u_avatar", full_name="A")
+    db.update_lead_avatar("u_avatar", "data/avatars/x.jpg", 2)
+    db.clear_lead_avatar_path("u_avatar")
+    with db._conn() as conn:
+        row = conn.execute(
+            "SELECT avatar_path, faces_count FROM lead_accounts WHERE username = ?",
+            ("u_avatar",),
+        ).fetchone()
+    assert row["avatar_path"] is None
+    assert row["faces_count"] == 2
+
+
+def test_get_leads_needing_avatar_excludes_detection_without_file(db):
+    """Orphan Step 4 cleanup: faces_count set, avatar_path NULL — no Apify re-queue."""
+    db.add_lead_account("orphan", user_id="99")
+    db.update_lead_profile("orphan", full_name="O")
+    db.update_lead_avatar("orphan", "/gone.jpg", 3)
+    db.clear_lead_avatar_path("orphan")
+    assert db.get_leads_needing_avatar(limit=10) == []
+
+
+def test_get_leads_needing_avatar_includes_never_detected(db):
+    db.add_lead_account("fresh", user_id="100")
+    db.update_lead_profile("fresh", full_name="F")
+    rows = db.get_leads_needing_avatar(limit=10)
+    assert len(rows) == 1
+    assert rows[0]["username"] == "fresh"

@@ -209,6 +209,48 @@ def face_bbox_percent_of_image(
     return (area_pct, w_pct, h_pct)
 
 
+def _same_disk_face_file(path_a: str, path_b: str) -> bool:
+    """True if both strings refer to the same on-disk file."""
+    try:
+        return Path(path_a).resolve() == Path(path_b).resolve()
+    except OSError:
+        return os.path.normcase(os.path.abspath(path_a)) == os.path.normcase(
+            os.path.abspath(path_b)
+        )
+
+
+def _reconcile_step4_ephemeral_avatar(
+    db: LeadDB,
+    log,
+    *,
+    username: str,
+    downloaded_avatar_path: str,
+    final_face_path: str | None,
+) -> None:
+    """Drop avatar file if it is not the canonical ``face_photo_path`` target.
+
+    When the avatar *is* the canonical photo, keep the file and ``avatar_path``
+    until Step 6 post-Sherlock cleanup.
+    """
+    if final_face_path is not None and _same_disk_face_file(
+        downloaded_avatar_path, final_face_path
+    ):
+        return
+    p = Path(downloaded_avatar_path)
+    try:
+        p.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning(
+            "step4_avatar_unlink_failed",
+            username=username,
+            path=str(p),
+            error=str(e),
+        )
+    db.clear_lead_avatar_path(username)
+    reason = "no_canonical_face" if final_face_path is None else "canonical_elsewhere"
+    log.info("step4_avatar_disk_released", username=username, reason=reason)
+
+
 def _pick_post_images(
     latest_posts: list[dict] | None,
     limit: int,
@@ -2402,6 +2444,7 @@ def main():
                         avatar_faces = avatar_embedder.embed_faces(avatar_path)
                         faces_count = len(avatar_faces)
                         db.update_lead_avatar(username, avatar_path, faces_count)
+                        final_face_path: str | None = None
 
                         avatar_area_ok = False
                         if faces_count == 1:
@@ -2416,6 +2459,7 @@ def main():
                         if faces_count == 1 and avatar_area_ok:
                             single_face_new += 1
                             db.update_lead_face(username, avatar_path)
+                            final_face_path = str(avatar_path)
                         elif uid_str:
                             # Fallback: probe the last N posts, pick the
                             # dominant face if there's an unambiguous leader.
@@ -2438,6 +2482,7 @@ def main():
                                 db.update_lead_face(
                                     username, str(result.photo_path)
                                 )
+                                final_face_path = str(result.photo_path)
                             else:
                                 fallback_skipped += 1
                                 no_suitable_photo += 1
@@ -2449,6 +2494,14 @@ def main():
                                 )
                         else:
                             no_suitable_photo += 1
+
+                        _reconcile_step4_ephemeral_avatar(
+                            db,
+                            log,
+                            username=username,
+                            downloaded_avatar_path=str(avatar_path),
+                            final_face_path=final_face_path,
+                        )
                     else:
                         no_suitable_photo += 1
                 else:
