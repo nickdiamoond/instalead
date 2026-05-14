@@ -49,12 +49,6 @@ search:
   # ``scripts/test_cookie_keyword_search.py``.
   cookie_search_keywords:
     - "новостройки"
-  # Limits for ``apify.actors.cookie_search_posts`` (maps to actor input ``maxPosts`` per keyword).
-  cookie_search:
-    size_per_keyword: 20
-    session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
-    # Passed to crawlerbros actor ``sessionName`` (cookie session label).
-    session_name: "instalead_cookie_search"
 
   # Instagram usernames (no @). Used by the daily pipeline when
   # ``pipeline.step1.discovery_mode`` is ``realtors`` (instagram-post-scraper).
@@ -65,27 +59,16 @@ search:
     - "realon_an"
     - "gubanova_estate"
 
-filters:
-  min_views: 1000
-  min_comments: 2
-  min_post_age_hours: 6
-  max_post_age_days: 14
-
-cycle:
-  interval_hours: 12
-  max_apify_requests_per_cycle: 50
-  max_accounts_per_cycle: 200
-
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
   report_chat_id: -5255644193 #-1003926996735
   result_chat_id: -5272096712
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
-# scripts/pipeline.py. All values have safe defaults baked into the
-# pipeline (DEFAULT_* module-level constants); this section is for
-# overrides without code edits. Missing keys / sections fall back to
-# the in-code default.
+# scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
+# script; ``pipeline.step1.posts_max_age_days`` and
+# ``pipeline.step1.min_comments_per_post`` fall back via ``src.config``.
+# Missing keys / sections keep the pipeline bootable on a fresh machine.
 pipeline:
   # When true (default), Step 3 and Step 5 ask ``Proceed? (y/n)`` in the
   # terminal before Apify comment scraping / Sherlock; if the run ends with
@@ -98,9 +81,15 @@ pipeline:
     # search.realtor_accounts), "hashtags" (instagram-hashtag-scraper on search.hashtags),
     # or "cookie_keywords" (crawlerbros/instagram-keyword-search-scraper on
     # search.cookie_search_keywords; requires INSTAGRAM_SESSION_COOKIE or env from
-    # search.cookie_search.session_cookie_env_var). For hashtags and cookie_keywords,
+    # pipeline.step1.cookie_search.session_cookie_env_var). For hashtags and cookie_keywords,
     # posts_max_age_days is applied client-side after fetch (see src.ig_media_payload).
     discovery_mode: cookie_keywords
+    # crawlerbros keyword-search actor (``apify.actors.cookie_search_posts``): maxPosts per
+    # keyword, cookie env var name, session label. Only used when discovery_mode=cookie_keywords.
+    cookie_search:
+      size_per_keyword: 20
+      session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
+      session_name: "instalead_cookie_search"
     # apify/instagram-post-scraper: resultsLimit per username (realtors mode).
     post_scraper_results_limit: 20
     # instagram-hashtag-scraper: resultsLimit per hashtag per resultsType (posts vs reels).

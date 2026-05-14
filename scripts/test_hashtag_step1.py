@@ -23,7 +23,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.apify_client_wrapper import DEFAULT_APIFY_WRAPPER_LIMITS, ApifyWrapper
-from src.config import load_config
+from src.config import (
+    load_config,
+    step1_min_comments_per_post,
+    step1_posts_max_age_days,
+)
 from src.db import LeadDB
 from src.ig_media_payload import filter_items_within_max_age, is_reel_payload
 from src.logger import get_logger, setup_logging
@@ -43,21 +47,6 @@ _ACTOR_OUTPUT_BLURB_RU = """
   • комментарии: firstComment, latestComments[] (только хвост, не вся лента комментов)
   • гео: locationName, locationId (если есть)
 """
-
-# Aligns with ``scripts/pipeline.py`` / ``pipeline.step1.posts_max_age_days`` default.
-_DEFAULT_POSTS_MAX_AGE_DAYS = 7
-
-
-def _min_comments_from_config(cfg: dict) -> int:
-    pipe = cfg.get("pipeline") or {}
-    s1 = pipe.get("step1") or {}
-    return int(s1.get("min_comments_per_post", 10))
-
-
-def _posts_max_age_days_from_config(cfg: dict) -> int:
-    pipe = cfg.get("pipeline") or {}
-    s1 = pipe.get("step1") or {}
-    return int(s1.get("posts_max_age_days", _DEFAULT_POSTS_MAX_AGE_DAYS))
 
 
 def _normalize_item(
@@ -270,13 +259,13 @@ def main() -> None:
 
     hashtags = cfg["search"]["hashtags"]
     limit = args.limit if args.limit is not None else apify.limits["results_limit"]
-    min_comments = _min_comments_from_config(cfg)
+    min_comments = step1_min_comments_per_post(cfg)
     if args.no_age_filter:
         max_age_days = 0
     elif args.max_age_days is not None:
         max_age_days = int(args.max_age_days)
     else:
-        max_age_days = _posts_max_age_days_from_config(cfg)
+        max_age_days = step1_posts_max_age_days(cfg)
     if max_age_days < 0:
         max_age_days = 0
 

@@ -302,12 +302,11 @@ python scripts/test_face_leader.py --keep-photos
 
 ## Configuration
 
-- `config.yaml` — search parameters, Apify actor IDs, limits, filters
+- `config.yaml` — search parameters, Apify actor IDs, and per-step limits under `pipeline.stepN.*` (Step 1 post age and min-comments fallbacks live in `src.config` when those keys are omitted).
   - `pipeline.stepN.*` — per-step tuning knobs (post age, min comments,
     Step 1 `discovery_mode` (`realtors` | `hashtags` | `cookie_keywords`),
     `hashtag_results_limit`, `search.realtor_accounts`, `search.cookie_search_keywords`, growth threshold,
-    batch sizes, Sherlock cap). Every value falls back to a `DEFAULT_*`
-    constant in `scripts/pipeline.py` if the key is missing, so a fresh /
+    batch sizes, Sherlock cap). Missing keys fall back to safe defaults (`pipeline.step1` post age / min comments via `src.config`; other steps still use `DEFAULT_*` constants in `scripts/pipeline.py`), so a fresh /
     partial config still boots.
 - `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`;
   optional `INSTAGRAM_SESSION_COOKIE` (or env from `search.cookie_search.session_cookie_env_var`)

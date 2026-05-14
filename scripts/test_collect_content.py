@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.apify_client_wrapper import ApifyWrapper
-from src.config import load_config
+from src.config import load_config, step1_posts_max_age_days
 from src.db import LeadDB
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -76,7 +76,7 @@ def main():
     pipeline = PipelineLogger(cfg["logging"]["pipeline_log_dir"], "collect_content")
     apify = ApifyWrapper(cfg, db, pipeline)
 
-    max_age = cfg["filters"]["max_post_age_days"]
+    max_age = step1_posts_max_age_days(cfg)
     all_content = []
 
     # ===== METHOD 1: Hashtags (posts + reels) =====

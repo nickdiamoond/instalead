@@ -2,7 +2,7 @@
 
 Flow:
   1. Search users by keywords ("квартиры спб", "новостройки спб", etc.)
-  2. Get their recent posts/reels (14 days)
+  2. Get their recent posts/reels (``pipeline.step1.posts_max_age_days``)
   3. Save everything to JSON for relevance review
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.apify_client_wrapper import ApifyWrapper
-from src.config import load_config
+from src.config import load_config, step1_posts_max_age_days
 from src.db import LeadDB
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -54,7 +54,7 @@ def main():
     pipeline = PipelineLogger(cfg["logging"]["pipeline_log_dir"], "find_realtors")
     apify = ApifyWrapper(cfg, db, pipeline)
 
-    max_age = cfg["filters"]["max_post_age_days"]
+    max_age = step1_posts_max_age_days(cfg)
     limit_per_query = apify.limits["search_limit"]
     posts_limit = apify.limits["results_limit"]
 

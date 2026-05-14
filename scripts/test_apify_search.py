@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.apify_client_wrapper import ApifyWrapper
-from src.config import load_config
+from src.config import load_config, step1_min_comments_per_post
 from src.db import LeadDB
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -25,6 +25,7 @@ def main():
     pipeline = PipelineLogger(cfg["logging"]["pipeline_log_dir"], "test_hashtag_search")
     apify = ApifyWrapper(cfg, db, pipeline)
 
+    min_comments = step1_min_comments_per_post(cfg)
     hashtags = cfg["search"]["hashtags"]
     limit = apify.limits["results_limit"]
 
@@ -49,7 +50,7 @@ def main():
 
         comments = p.get("commentsCount") or 0
         likes = p.get("likesCount") or 0
-        passes_filter = comments >= cfg["filters"]["min_comments"]
+        passes_filter = comments >= min_comments
 
         if passes_filter:
             qualifying += 1
@@ -81,7 +82,7 @@ def main():
         reels=reels_count,
         images=image_count,
         qualifying_posts=qualifying,
-        min_comments_filter=cfg["filters"]["min_comments"],
+        min_comments_filter=min_comments,
     )
 
     # Log first post's ALL keys to understand schema

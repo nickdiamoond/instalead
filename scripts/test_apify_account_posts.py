@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import load_config
+from src.config import load_config, step1_min_comments_per_post
 from src.db import LeadDB
 from src.logger import get_logger, setup_logging
 from src.pipeline_logger import PipelineLogger
@@ -25,6 +25,7 @@ def main():
 
     apify = ApifyWrapper(cfg, db, pipeline)
 
+    min_comments = step1_min_comments_per_post(cfg)
     accounts = cfg["search"]["realtor_accounts"]
     if not accounts:
         log.error("no_realtor_accounts", msg="Add realtor accounts to config.yaml")
@@ -49,14 +50,13 @@ def main():
 
             # Show which posts pass filters
             comments_count = p.get("commentsCount") or 0
-            likes_count = p.get("likesCount") or 0
-            passes_filter = comments_count >= cfg["filters"]["min_comments"]
+            passes_filter = comments_count >= min_comments
             log.info(
                 "filter_check",
                 shortcode=p.get("shortCode"),
                 passes=passes_filter,
                 comments=comments_count,
-                min_required=cfg["filters"]["min_comments"],
+                min_required=min_comments,
             )
 
         log.info("account_done", username=username, posts_count=len(posts))

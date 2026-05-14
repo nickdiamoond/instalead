@@ -17,6 +17,9 @@ from src.logger import get_logger, setup_logging
 setup_logging()
 log = get_logger("cost_analysis")
 
+# Hypothetical cap for the printed "cycle cost" line only (not read from config).
+_MAX_ACCOUNTS_PER_CYCLE_ESTIMATE = 200
+
 
 def load_all_runs(log_dir: str = "logs") -> list[dict]:
     """Load all run records from all JSON log files."""
@@ -78,14 +81,13 @@ def main():
     db_stats = db.get_stats()
     print(f"\nDB stats: {db_stats}")
 
-    # Estimate cycle cost
+    # Rough extrapolation for a fixed account cap (dev script only).
     print("\n--- Cycle cost estimate ---")
     if grand_items and grand_cost:
         avg_per_item = grand_cost / grand_items
-        max_accounts = cfg.get("cycle", {}).get("max_accounts_per_cycle", 200)
-        est = avg_per_item * max_accounts
+        est = avg_per_item * _MAX_ACCOUNTS_PER_CYCLE_ESTIMATE
         print(f"Avg cost per item:    ${avg_per_item:.6f}")
-        print(f"Max accounts/cycle:   {max_accounts}")
+        print(f"Max accounts/cycle:   {_MAX_ACCOUNTS_PER_CYCLE_ESTIMATE}")
         print(f"Estimated cycle cost: ${est:.2f}")
 
 

@@ -4,6 +4,7 @@ import json
 
 from apify_client import ApifyClient
 
+from src.config import step1_posts_max_age_days
 from src.db import LeadDB
 from src.logger import get_logger
 from src.pipeline_logger import PipelineLogger
@@ -156,7 +157,11 @@ class ApifyWrapper:
         self, usernames: list[str], limit: int | None = None, max_age_days: int | None = None
     ) -> list[dict]:
         """Get recent posts/reels for multiple accounts in one API call."""
-        age = max_age_days or self.config["filters"]["max_post_age_days"]
+        age = (
+            int(max_age_days)
+            if max_age_days is not None
+            else step1_posts_max_age_days(self.config)
+        )
         return self.run_actor(
             self.actors["posts"],
             {

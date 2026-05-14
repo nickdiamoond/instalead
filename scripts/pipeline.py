@@ -41,7 +41,12 @@ from src.avatar_downloader import (
     download_post_photos,
 )
 from src.comment_normalizer import normalize_apidojo_api
-from src.config import load_config
+from src.config import (
+    load_config,
+    step1_cookie_search_section,
+    step1_min_comments_per_post,
+    step1_posts_max_age_days,
+)
 from src.contact_extractor import extract_contacts
 from src.db import LeadDB
 from src.face_embedder import make_face_embedder
@@ -90,10 +95,8 @@ log = get_logger("pipeline")
 # is missing from a fresh config (e.g. on a brand-new machine before
 # the operator has copied the canonical YAML over).
 
-# Step 1: Apify post-scraper "onlyPostsNewerThan" + the post-level
-# comments filter that gates entry into ``processed_posts``.
-DEFAULT_POSTS_MAX_AGE_DAYS = 7
-DEFAULT_MIN_COMMENTS = 10
+# Step 1: numeric defaults for ``posts_max_age_days`` and
+# ``min_comments_per_post`` live in ``src.config`` (``step1_*`` helpers).
 # ``apify/instagram-post-scraper`` input ``resultsLimit`` (per username).
 # Override via ``pipeline.step1.post_scraper_results_limit``.
 DEFAULT_POST_SCRAPER_RESULTS_LIMIT = 20
@@ -1550,12 +1553,8 @@ def main():
     s4_cfg = pipe_cfg.get("step4") or {}
     s5_cfg = pipe_cfg.get("step5") or {}
 
-    posts_max_age_days = int(
-        s1_cfg.get("posts_max_age_days", DEFAULT_POSTS_MAX_AGE_DAYS)
-    )
-    min_comments = int(
-        s1_cfg.get("min_comments_per_post", DEFAULT_MIN_COMMENTS)
-    )
+    posts_max_age_days = step1_posts_max_age_days(cfg)
+    min_comments = step1_min_comments_per_post(cfg)
     post_scraper_results_limit = int(
         s1_cfg.get(
             "post_scraper_results_limit",
@@ -1775,7 +1774,7 @@ def main():
 
     elif discovery_mode == "cookie_keywords":
         search_cfg = cfg.get("search") or {}
-        cs_cfg = search_cfg.get("cookie_search") or {}
+        cs_cfg = step1_cookie_search_section(cfg)
         keywords = [str(k).strip() for k in (search_cfg.get("cookie_search_keywords") or []) if str(k).strip()]
         _banner(
             f"STEP 1: Fetch posts via cookie keyword search "

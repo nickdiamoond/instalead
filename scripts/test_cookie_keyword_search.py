@@ -2,7 +2,7 @@
 
 Runs one actor call with all keywords from ``config.yaml`` → ``search.cookie_search_keywords``.
 Requires ``APIFY_API_TOKEN`` and Instagram cookies in the env var named by
-``search.cookie_search.session_cookie_env_var`` (default ``INSTAGRAM_SESSION_COOKIE``).
+``pipeline.step1.cookie_search.session_cookie_env_var`` (default ``INSTAGRAM_SESSION_COOKIE``).
 
 Cookies may be either a browser JSON export (array of cookie objects) or a simple
 ``sessionid=...`` / ``a=b; c=d`` header-style string; the latter is wrapped into the JSON
@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from apify_client import ApifyClient
 from dotenv import load_dotenv
 
-from src.config import load_config
+from src.config import load_config, step1_cookie_search_section
 
 
 def _truncate(text: str | None, max_len: int = 200) -> str:
@@ -305,7 +305,7 @@ def main() -> int:
     actor_id = actors.get("cookie_search_posts", "crawlerbros/instagram-keyword-search-scraper")
 
     search = cfg.get("search") or {}
-    cs_cfg = search.get("cookie_search") or {}
+    cs_cfg = step1_cookie_search_section(cfg)
     max_posts = int(cs_cfg.get("size_per_keyword", 5))
     cookie_var = str(cs_cfg.get("session_cookie_env_var", "INSTAGRAM_SESSION_COOKIE"))
     session_name = str(cs_cfg.get("session_name", "instalead_cookie_search"))
