@@ -53,16 +53,66 @@ search:
   # Instagram usernames (no @). Used by the daily pipeline when
   # ``pipeline.step1.discovery_mode`` is ``realtors`` (instagram-post-scraper).
   realtor_accounts:
-    - "oxana.realtor.spb"
-    - "stasya_agent_spb"
-    - "efimova_realtor"
-    - "realon_an"
-    - "gubanova_estate"
+    - "tochno__partners"
+    - "tochno.life"
+    - "metriks_development"
+    - "1dogma"
+    - "sskuban"
+    - "incitydevelopment"
+    - "bauinvest_group"
+    - "gk.nvm.south"
+    - "darstroy.krasnodar"
+    - "gk_usi"
+    - "familia_dev"
+    - "garantiya.krasnodar"
+    - "avakrasnodar"
+    - "europeya.ru"
+    - "mooe_krasnodar"
+    - "novostroiki_krasnodara_"
+    - "valeria__pivovarova"
+    - "svoi.live"
+    - "smartrielt"
+    - "ayax.realty"
+    - "sashaipoteka"
+    - "krasnodar_kvartiry"
+    - "krasnodar_regina"
+    - "goncharov_nedvizhimost"
+    - "svoya.vkrasnodare"
+    - "proipoteka.ru"
+    - "kamila_ipoteka"
+    - "annet_fokina"
+    - "volkova_top_estate"
+    - "group_etalon"
+    - "mrgroup_rus"
+    - "pioneergroup"
+    - "sminex_developer"
+    - "capitalgroupcorp"
+    - "whitewillestate"
+    - "brusnika.company"
+    - "vesper_moscow"
+    - "forma.russia"
+    - "homexpert.me"
+    - "andreyneginskiy"
+    - "lsr.petersburg"
+    - "strana_com"
+    - "pik"
+    - "i.love.msk"
+    - "bigcity_moscow_"
+    - "svetlana.nedvizka"
+    - "ks_makarenko"
+    - "bozhenko_marina"
+    - "sofi_lubimova"
+    - "vasilii_kholodnyak"
+    - "sk_10_official"
+    - "donneftestroi161"
+    - "sk_smu1"
+    - "donneftestroi161"
+    - "msk_rostov"
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -5255644193 #-1003926996735
-  result_chat_id: -5272096712
+  report_chat_id: -1003909022341 #-1003926996735
+  result_chat_id: -1003926996735 #Chat for clear results and confirmations only no logs
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
@@ -83,7 +133,7 @@ pipeline:
     # search.cookie_search_keywords; requires INSTAGRAM_SESSION_COOKIE or env from
     # pipeline.step1.cookie_search.session_cookie_env_var). For hashtags and cookie_keywords,
     # posts_max_age_days is applied client-side after fetch (see src.ig_media_payload).
-    discovery_mode: cookie_keywords
+    discovery_mode: realtors
     # crawlerbros keyword-search actor (``apify.actors.cookie_search_posts``): maxPosts per
     # keyword, cookie env var name, session label. Only used when discovery_mode=cookie_keywords.
     cookie_search:
@@ -98,7 +148,7 @@ pipeline:
     # apify/instagram-post-scraper input "onlyPostsNewerThan = N days".
     # Realtors don't update old posts, so this both bounds the dataset
     # and keeps comments fresh enough for Step 3 to find new commenters.
-    posts_max_age_days: 60
+    posts_max_age_days: 7
     # Filter for processed_posts: posts with fewer than this many
     # comments aren't worth scoring (DeepSeek $) or scanning (Apify $).
     min_comments_per_post: 10
@@ -126,7 +176,7 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 30
+    batch_limit: 100
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
