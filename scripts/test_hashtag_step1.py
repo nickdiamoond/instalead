@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.apify_client_wrapper import ApifyWrapper
+from src.apify_client_wrapper import DEFAULT_APIFY_WRAPPER_LIMITS, ApifyWrapper
 from src.config import load_config
 from src.db import LeadDB
 from src.ig_media_payload import filter_items_within_max_age, is_reel_payload
@@ -244,7 +244,10 @@ def main() -> None:
         type=int,
         default=None,
         metavar="N",
-        help="Override apify.test_limits.results_limit for this run.",
+        help=(
+            "Override per-hashtag resultsLimit for this run "
+            f"(default: {DEFAULT_APIFY_WRAPPER_LIMITS['results_limit']})."
+        ),
     )
     parser.add_argument(
         "--no-age-filter",
@@ -266,7 +269,7 @@ def main() -> None:
     apify = ApifyWrapper(cfg, db, pipeline)
 
     hashtags = cfg["search"]["hashtags"]
-    limit = args.limit if args.limit is not None else cfg["apify"]["test_limits"]["results_limit"]
+    limit = args.limit if args.limit is not None else apify.limits["results_limit"]
     min_comments = _min_comments_from_config(cfg)
     if args.no_age_filter:
         max_age_days = 0

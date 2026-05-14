@@ -137,7 +137,8 @@
 > (Step 3) использует `louisdeconinck/instagram-comments-scraper` как primary
 > и `apidojo/instagram-comments-scraper-api` как fallback (см. секции 2a и 2b
 > ниже). `apify/instagram-comment-scraper` остался как `apify.actors.comments`
-> в `config.yaml` для legacy test-скриптов через `ApifyWrapper.get_comments()`.
+> в `config.yaml` для ad-hoc dev-скриптов через `ApifyWrapper.get_comments()`
+> (лимиты по умолчанию — константы в `src/apify_client_wrapper.py`).
 
 ---
 

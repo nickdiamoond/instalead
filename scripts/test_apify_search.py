@@ -26,7 +26,7 @@ def main():
     apify = ApifyWrapper(cfg, db, pipeline)
 
     hashtags = cfg["search"]["hashtags"]
-    limit = cfg["apify"]["test_limits"]["results_limit"]
+    limit = apify.limits["results_limit"]
 
     log.info("starting_hashtag_search", hashtags=hashtags, limit_per_hashtag=limit)
 

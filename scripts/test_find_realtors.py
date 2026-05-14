@@ -55,8 +55,8 @@ def main():
     apify = ApifyWrapper(cfg, db, pipeline)
 
     max_age = cfg["filters"]["max_post_age_days"]
-    limit_per_query = cfg["apify"]["test_limits"]["search_limit"]
-    posts_limit = cfg["apify"]["test_limits"]["results_limit"]
+    limit_per_query = apify.limits["search_limit"]
+    posts_limit = apify.limits["results_limit"]
 
     # ===== STEP 1: Find realtor accounts =====
     all_accounts = {}  # username -> profile dict (dedup)

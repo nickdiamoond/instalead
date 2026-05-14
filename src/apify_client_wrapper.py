@@ -10,6 +10,14 @@ from src.pipeline_logger import PipelineLogger
 
 log = get_logger("apify")
 
+# Dev defaults for ``ApifyWrapper`` convenience methods when ``limit=`` is omitted.
+# Optional ``apify.test_limits`` in config (same keys) overrides these for old forks.
+DEFAULT_APIFY_WRAPPER_LIMITS: dict[str, int] = {
+    "search_limit": 5,
+    "results_limit": 1,
+    "comments_limit": 15,
+}
+
 
 class ApifyWrapper:
     """Runs Apify actors with automatic logging, cost tracking, and dedup."""
@@ -27,7 +35,11 @@ class ApifyWrapper:
             else {}
         )
         self.actors = config["apify"]["actors"]
-        self.limits = config["apify"]["test_limits"]
+        tl = (config.get("apify") or {}).get("test_limits") or {}
+        self.limits = {**DEFAULT_APIFY_WRAPPER_LIMITS}
+        for key in DEFAULT_APIFY_WRAPPER_LIMITS:
+            if key in tl and tl[key] is not None:
+                self.limits[key] = int(tl[key])
 
     def run_actor(
         self,

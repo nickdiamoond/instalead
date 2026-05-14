@@ -30,12 +30,6 @@ apify:
     cookie_search_posts: "crawlerbros/instagram-keyword-search-scraper"
     posts: "apify/instagram-post-scraper"       # посты конкретного аккаунта
 
-  test_limits:
-    search_limit: 5       # макс. результатов поиска юзеров
-    # hashtag-scraper и прочие dev-скрипты через ApifyWrapper (не daily Step 1)
-    results_limit: 1     # макс. постов на хештег/аккаунт
-    comments_limit: 15    # макс. комментов на пост
-
 search:
   # Method 1: поиск по хештегам (через instagram-hashtag-scraper)
   hashtags:
@@ -93,6 +87,12 @@ telegram:
 # overrides without code edits. Missing keys / sections fall back to
 # the in-code default.
 pipeline:
+  # When true (default), Step 3 and Step 5 ask ``Proceed? (y/n)`` in the
+  # terminal before Apify comment scraping / Sherlock; if the run ends with
+  # issues, the script waits for Enter before exit. Set false for cron /
+  # unattended runs (no terminal prompts; expensive steps always run).
+  prompt_terminal_confirmation: true
+
   step1:
     # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on
     # search.realtor_accounts), "hashtags" (instagram-hashtag-scraper on search.hashtags),

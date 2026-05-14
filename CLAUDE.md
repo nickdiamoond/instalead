@@ -92,8 +92,7 @@ Daily pipeline (`scripts/pipeline.py`):
 Step 1: Discover posts (config: pipeline.step1.discovery_mode)
         Mode "realtors" (default): search.realtor_accounts in config.yaml →
         instagram-post-scraper batch, onlyPostsNewerThan = pipeline.step1.posts_max_age_days,
-        resultsLimit = pipeline.step1.post_scraper_results_limit (legacy fallback:
-        apify.test_limits.post_scraper_results_limit).
+        resultsLimit = pipeline.step1.post_scraper_results_limit (pipeline code default if omitted in yaml).
         Mode "hashtags": search.hashtags → two runs of
         apify/instagram-hashtag-scraper (resultsType posts + reels),
         resultsLimit = pipeline.step1.hashtag_results_limit (fallback:
@@ -319,7 +318,9 @@ python scripts/test_face_leader.py --keep-photos
 ## Key Source Files
 
 - `src/db.py` — SQLite DB with all tables, dedup logic, lead lifecycle methods
-- `src/apify_client_wrapper.py` — Apify wrapper with logging and cost tracking
+- `src/apify_client_wrapper.py` — Apify wrapper with logging and cost tracking;
+  dev defaults in `DEFAULT_APIFY_WRAPPER_LIMITS` when `limit=` is omitted (optional
+  `apify.test_limits` in yaml overrides the same keys for legacy configs)
 - `src/ig_media_payload.py` — Apify Instagram media helpers shared by Step 1 and
   `scripts/test_hashtag_step1.py`: reel detection, video URL extract/validate,
   hashtag age filter on timestamps, merge posts+reels by shortCode

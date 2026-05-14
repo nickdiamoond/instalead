@@ -81,7 +81,7 @@ def main():
 
     # ===== METHOD 1: Hashtags (posts + reels) =====
     hashtags = cfg["search"]["hashtags"]
-    limit = cfg["apify"]["test_limits"]["results_limit"]
+    limit = apify.limits["results_limit"]
 
     log.info("method1_hashtag_posts", hashtags=hashtags)
     posts = apify.search_by_hashtag(hashtags, results_type="posts", limit=limit)

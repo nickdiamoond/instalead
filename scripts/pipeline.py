@@ -95,8 +95,7 @@ log = get_logger("pipeline")
 DEFAULT_POSTS_MAX_AGE_DAYS = 7
 DEFAULT_MIN_COMMENTS = 10
 # ``apify/instagram-post-scraper`` input ``resultsLimit`` (per username).
-# Override via ``pipeline.step1.post_scraper_results_limit`` (legacy:
-# ``apify.test_limits.post_scraper_results_limit`` still honored if step1 omits it).
+# Override via ``pipeline.step1.post_scraper_results_limit``.
 DEFAULT_POST_SCRAPER_RESULTS_LIMIT = 20
 # Step 1: ``pipeline.step1.discovery_mode`` — ``realtors`` | ``hashtags`` |
 # ``cookie_keywords``.
@@ -155,6 +154,30 @@ DEFAULT_COMMENTS_FALLBACK_ACTOR = "apidojo/instagram-comments-scraper-api"
 # ``_fetch_comments_with_fallback``. Override via
 # ``pipeline.step3.louisdeconinck_comments_cap_per_post`` in config.
 DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000
+
+# When true, Step 3 / Step 5 ask ``Proceed? (y/n)`` before spendy work, and
+# the script waits for Enter after reporting issues. Set false in config for
+# cron / unattended runs (``pipeline.prompt_terminal_confirmation``).
+DEFAULT_PROMPT_TERMINAL_CONFIRMATION = True
+
+
+def _cfg_prompt_terminal_confirmation(value, default: bool = True) -> bool:
+    """Parse ``pipeline.prompt_terminal_confirmation`` (bool / int / str)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("false", "no", "n", "0", "off"):
+            return False
+        if s in ("true", "yes", "y", "1", "on"):
+            return True
+        return default
+    return default
+
 
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
@@ -1460,7 +1483,9 @@ def _parse_cli_args() -> argparse.Namespace:
         "-y",
         action="store_true",
         help="Auto-confirm Step 5's cost prompt (skip the y/n input). "
-             "Use only when running unattended.",
+             "Use only when running unattended. Same effect as "
+             "pipeline.prompt_terminal_confirmation: false for Step 5 only "
+             "(--yes does not skip Step 3 or the post-issues Enter pause).",
     )
     parser.add_argument(
         "--keep-photos",
@@ -1490,10 +1515,11 @@ def main():
     )
 
     # Issues are surfaced both per-step (loud banner at the failure point)
-    # and again in the final summary. Each entry is a (step, hint) tuple
-    # — when the list is non-empty at the end we hold the script open
-    # with `input()` so the operator can read the diagnostic instead of
-    # losing it to terminal scrollback.
+    # and again in the final summary. Each entry is a (step, hint) tuple.
+    # When ``pipeline.prompt_terminal_confirmation`` is true and the list
+    # is non-empty at the end we hold the script open with `input()` so the
+    # operator can read the diagnostic instead of losing it to terminal
+    # scrollback.
     issues: list[tuple[str, str]] = []
 
     # Two SCRFD instances with different det_size:
@@ -1530,14 +1556,10 @@ def main():
     min_comments = int(
         s1_cfg.get("min_comments_per_post", DEFAULT_MIN_COMMENTS)
     )
-    test_limits_cfg = (cfg.get("apify") or {}).get("test_limits") or {}
     post_scraper_results_limit = int(
         s1_cfg.get(
             "post_scraper_results_limit",
-            test_limits_cfg.get(
-                "post_scraper_results_limit",
-                DEFAULT_POST_SCRAPER_RESULTS_LIMIT,
-            ),
+            DEFAULT_POST_SCRAPER_RESULTS_LIMIT,
         )
     )
     discovery_mode = str(
@@ -1575,6 +1597,10 @@ def main():
             "request_gap_secs",
             DEFAULT_SHERLOCK_REQUEST_GAP_SECS,
         )
+    )
+    prompt_terminal_confirmation = _cfg_prompt_terminal_confirmation(
+        pipe_cfg.get("prompt_terminal_confirmation"),
+        DEFAULT_PROMPT_TERMINAL_CONFIRMATION,
     )
 
     stats_before = db.get_stats()
@@ -2184,7 +2210,10 @@ def main():
         print(f"  Posts to scan:        {len(posts_to_scan)}")
         print(f"  Estimated comments:   {total_comments}")
         print(f"  Estimated cost:       ${estimated_cost:.2f}")
-        confirm = input("  Proceed? (y/n): ").strip().lower()
+        if prompt_terminal_confirmation:
+            confirm = input("  Proceed? (y/n): ").strip().lower()
+        else:
+            confirm = "y"
 
         if confirm == "y":
             urls = [p["post_url"] for p in posts_to_scan if p.get("post_url")]
@@ -2582,7 +2611,7 @@ def main():
             workers_override=args.workers,
             sequential=sherlock_sequential,
             request_gap_secs=sherlock_request_gap_secs,
-            auto_yes=args.yes,
+            auto_yes=args.yes or not prompt_terminal_confirmation,
             log=log,
             issues=issues,
             tg_notifier=tg_notifier,
@@ -2640,10 +2669,11 @@ def main():
         # diagnostic instead of losing it to PowerShell scrollback when
         # the prompt returns. EOF (Ctrl-Z / closed pipe) is fine — we
         # swallow it to keep the script non-interactive-friendly.
-        try:
-            input("\nPress Enter to exit... ")
-        except EOFError:
-            pass
+        if prompt_terminal_confirmation:
+            try:
+                input("\nPress Enter to exit... ")
+            except EOFError:
+                pass
 
     avatar_embedder.close()
     post_embedder.close()
