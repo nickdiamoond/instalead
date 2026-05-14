@@ -62,7 +62,8 @@ search:
     # Passed to crawlerbros actor ``sessionName`` (cookie session label).
     session_name: "instalead_cookie_search"
 
-  # Method 2: список аккаунтов риелторов СПБ (найдены в предыдущих тестах)
+  # Instagram usernames (no @). Used by the daily pipeline when
+  # ``pipeline.step1.discovery_mode`` is ``realtors`` (instagram-post-scraper).
   realtor_accounts:
     - "oxana.realtor.spb"
     - "stasya_agent_spb"
@@ -93,8 +94,8 @@ telegram:
 # the in-code default.
 pipeline:
   step1:
-    # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on DB
-    # tracked_realtors), "hashtags" (instagram-hashtag-scraper on search.hashtags),
+    # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on
+    # search.realtor_accounts), "hashtags" (instagram-hashtag-scraper on search.hashtags),
     # or "cookie_keywords" (crawlerbros/instagram-keyword-search-scraper on
     # search.cookie_search_keywords; requires INSTAGRAM_SESSION_COOKIE or env from
     # search.cookie_search.session_cookie_env_var). For hashtags and cookie_keywords,

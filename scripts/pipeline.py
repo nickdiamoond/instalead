@@ -1,8 +1,8 @@
 """Daily lead collection pipeline.
 
 Steps:
-  1. Fetch recent posts/reels (realtors, hashtags, or cookie keyword search —
-     ``pipeline.step1.discovery_mode``)
+  1. Fetch recent posts/reels (realtor accounts from config, hashtags, or
+     cookie keyword search — ``pipeline.step1.discovery_mode``)
   2. Score new posts via DeepSeek (relevance + CTA)
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
@@ -443,6 +443,24 @@ def _banner(title: str, char: str = "=") -> None:
     print(f"\n{char * 60}")
     print(f"  {title}")
     print(f"{char * 60}")
+
+
+def _realtor_usernames_from_cfg(cfg: dict) -> list[str]:
+    """Instagram usernames for Step 1 ``discovery_mode=realtors``.
+
+    Reads ``search.realtor_accounts`` from config (same contract as
+    ``search.hashtags`` for the hashtag path): non-strings skipped,
+    stripped, empties dropped, duplicates removed with order preserved.
+    """
+    raw = list((cfg.get("search") or {}).get("realtor_accounts") or [])
+    out: list[str] = []
+    for x in raw:
+        if not isinstance(x, str):
+            continue
+        u = x.strip()
+        if u:
+            out.append(u)
+    return list(dict.fromkeys(out))
 
 
 def _run_apify_actor(
@@ -1590,11 +1608,14 @@ def main():
 
     if discovery_mode == "realtors":
         _banner(f"STEP 1: Fetch posts (last {posts_max_age_days} days) [realtors]")
-        realtors = db.get_active_realtors()
+        realtors = _realtor_usernames_from_cfg(cfg)
         if not realtors:
-            log.error("no_realtors", msg="Add realtors to tracked_realtors table first")
-            print("FAILED: no active realtors in DB. Add rows to tracked_realtors first.")
-            issues.append(("Step 1", "no active realtors in tracked_realtors"))
+            log.error("step1_no_realtor_accounts")
+            print(
+                "FAILED: search.realtor_accounts is empty in config for "
+                "discovery_mode=realtors."
+            )
+            issues.append(("Step 1", "search.realtor_accounts empty"))
             return
 
         notify_secondary_count = len(realtors)
@@ -2593,7 +2614,10 @@ def main():
     ps = pipeline.summary()
 
     _banner("PIPELINE COMPLETE")
-    print(f"Tracked realtors:     {stats_after['tracked_realtors']}")
+    print(
+        "Realtor accounts (config): "
+        f"{len(_realtor_usernames_from_cfg(cfg))}"
+    )
     print(f"Leads total:          {stats_after['leads_total']} (+{stats_after['leads_total'] - stats_before['leads_total']})")
     print(f"  with profile:       {stats_after['leads_with_profile']}")
     print(f"  with contacts:      {stats_after['leads_with_contacts']} "

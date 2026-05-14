@@ -90,8 +90,8 @@ Daily pipeline (`scripts/pipeline.py`):
 
 ```
 Step 1: Discover posts (config: pipeline.step1.discovery_mode)
-        Mode "realtors" (default): tracked_realtors → instagram-post-scraper
-        batch, onlyPostsNewerThan = pipeline.step1.posts_max_age_days,
+        Mode "realtors" (default): search.realtor_accounts in config.yaml →
+        instagram-post-scraper batch, onlyPostsNewerThan = pipeline.step1.posts_max_age_days,
         resultsLimit = pipeline.step1.post_scraper_results_limit (legacy fallback:
         apify.test_limits.post_scraper_results_limit).
         Mode "hashtags": search.hashtags → two runs of
@@ -227,8 +227,11 @@ face_photo_path IS NULL``.
 
 ## Database Schema (SQLite)
 
-**`tracked_realtors`** — monitored realtor accounts (source of posts)
-- `username` PK, `full_name`, `followers_count`, `found_via`, `is_active`
+**`tracked_realtors`** — reserved SQLite table (same columns as before: `username` PK,
+`full_name`, `followers_count`, `found_via`, `added_at`, `is_active`). The daily
+pipeline does **not** read it for Step 1; monitored usernames live in
+`config.yaml` under `search.realtor_accounts` when `discovery_mode` is `realtors`.
+The table remains for future features or manual experiments.
 
 **`processed_posts`** — all posts with 10+ comments
 - `post_id` PK (shortcode), `post_url`, `owner_username`, `comments_count`
@@ -303,14 +306,15 @@ python scripts/test_face_leader.py --keep-photos
 - `config.yaml` — search parameters, Apify actor IDs, limits, filters
   - `pipeline.stepN.*` — per-step tuning knobs (post age, min comments,
     Step 1 `discovery_mode` (`realtors` | `hashtags` | `cookie_keywords`),
-    `hashtag_results_limit`, `search.cookie_search_keywords`, growth threshold,
+    `hashtag_results_limit`, `search.realtor_accounts`, `search.cookie_search_keywords`, growth threshold,
     batch sizes, Sherlock cap). Every value falls back to a `DEFAULT_*`
     constant in `scripts/pipeline.py` if the key is missing, so a fresh /
     partial config still boots.
 - `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`;
   optional `INSTAGRAM_SESSION_COOKIE` (or env from `search.cookie_search.session_cookie_env_var`)
   when using Step 1 `discovery_mode=cookie_keywords`
-- Realtor accounts stored in DB table `tracked_realtors` (not config)
+- Step 1 realtor usernames: `search.realtor_accounts` in `config.yaml` when
+  `discovery_mode` is `realtors` (not the `tracked_realtors` table)
 
 ## Key Source Files
 

@@ -835,9 +835,6 @@ class LeadDB:
             leads_with_face_photo = conn.execute(
                 "SELECT COUNT(*) FROM lead_accounts WHERE face_photo_path IS NOT NULL"
             ).fetchone()[0]
-            realtors = conn.execute(
-                "SELECT COUNT(*) FROM tracked_realtors WHERE is_active = 1"
-            ).fetchone()[0]
             posts = conn.execute("SELECT COUNT(*) FROM processed_posts").fetchone()[0]
             post_links = conn.execute("SELECT COUNT(*) FROM lead_post_links").fetchone()[0]
             runs = conn.execute("SELECT COUNT(*) FROM apify_runs").fetchone()[0]
@@ -845,7 +842,6 @@ class LeadDB:
                 "SELECT COALESCE(SUM(cost_usd), 0) FROM apify_runs"
             ).fetchone()[0]
         return {
-            "tracked_realtors": realtors,
             "leads_total": leads,
             "leads_with_profile": leads_with_profile,
             "leads_with_contacts": leads_with_contacts,
