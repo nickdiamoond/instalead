@@ -1677,7 +1677,10 @@ def main():
     step1_age_kept_missing_ts: int | None = None
 
     if discovery_mode == "realtors":
-        _banner(f"STEP 1: Fetch posts (last {posts_max_age_days} days) [realtors]")
+        _banner(
+            f"STEP 1: Fetch posts (last {posts_max_age_days} days, "
+            f"≤{posts_max_age_days}d client filter) [realtors]"
+        )
         realtors = _realtor_usernames_from_cfg(cfg)
         if not realtors:
             log.error("step1_no_realtor_accounts")
@@ -1711,8 +1714,16 @@ def main():
             step="Step 1",
         )
         detail = apify.run(run["id"]).get()
-        all_posts = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
+        posts_fetched = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
+        all_posts, posts_age_stats = filter_items_within_max_age(
+            posts_fetched, posts_max_age_days
+        )
+        step1_age_dropped_client = int((posts_age_stats or {}).get("dropped_too_old") or 0)
+        step1_age_kept_missing_ts = int(
+            (posts_age_stats or {}).get("kept_missing_timestamp") or 0
+        )
         step1_cost_usd = float(detail.get("usageTotalUsd") or 0)
+        step1_empty_issue = "post-scraper returned 0 items after age filter"
 
         pipeline.log_run(
             actor_id="apify/instagram-post-scraper",
@@ -1721,10 +1732,17 @@ def main():
             input_params={
                 "realtors": len(realtors),
                 "resultsLimit": post_scraper_results_limit,
+                "max_age_days": posts_max_age_days,
             },
-            items_count=len(all_posts),
+            items_count=len(posts_fetched),
             cost_usd=detail.get("usageTotalUsd", 0),
             duration_ms=detail.get("stats", {}).get("durationMillis"),
+        )
+        log.info(
+            "step1_realtor_age_filter",
+            raw=len(posts_fetched),
+            after_filter=len(all_posts),
+            posts_age_stats=posts_age_stats,
         )
     elif discovery_mode == "hashtags":
         hashtags = list((cfg.get("search") or {}).get("hashtags") or [])

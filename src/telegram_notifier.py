@@ -98,11 +98,9 @@ def build_step1_date_filter_section_lines(
     ]
     if mode == "realtors":
         out.append(
-            "Applied on Apify as onlyPostsNewerThan "
-            f"(posts newer than {posts_max_age_days} day(s)); "
-            "client-side timestamp drop count is not available for this mode."
+            "Apify input: onlyPostsNewerThan "
+            f"(posts newer than {posts_max_age_days} day(s))."
         )
-        return out
     if posts_max_age_days <= 0:
         out.append("Client-side max-age filter: disabled (no items dropped for age).")
         if age_dropped_client is not None:

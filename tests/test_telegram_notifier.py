@@ -32,11 +32,14 @@ def test_build_step1_date_filter_realtors_vs_client() -> None:
     rel = build_step1_date_filter_section_lines(
         discovery_mode="realtors",
         posts_max_age_days=14,
-        age_dropped_client=None,
-        age_kept_missing_ts=None,
+        age_dropped_client=5,
+        age_kept_missing_ts=1,
     )
-    assert "onlyPostsNewerThan" in "\n".join(rel)
-    assert "not available" in "\n".join(rel)
+    rel_s = "\n".join(rel)
+    assert "onlyPostsNewerThan" in rel_s
+    assert "Client-side" in rel_s
+    assert "Dropped — older than window: 5" in rel_s
+    assert "missing or unparseable" in rel_s
 
     ht = build_step1_date_filter_section_lines(
         discovery_mode="hashtags",
