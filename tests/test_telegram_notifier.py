@@ -14,11 +14,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
     _STEP1_NEW_POST_MESSAGE_DELAY_SEC,
+    build_apify_run_alert_text,
+    build_deepseek_batch_all_failed_alert_text,
+    build_nexara_batch_all_failed_alert_text,
+    build_sherlock_batch_all_failed_alert_text,
     build_step1_date_filter_section_lines,
     build_step1_new_post_message,
     build_step1_pipeline_summary_telegram_text,
     build_step2_human_confirm_body,
     build_step2_scored_post_message,
+    is_apify_run_failure_status,
     step1_display_content_type,
 )
 
@@ -42,6 +47,260 @@ def test_build_step1_date_filter_realtors_vs_client() -> None:
     s = "\n".join(ht)
     assert "Dropped — older than window: 12" in s
     assert "missing or unparseable" in s
+
+
+def test_is_apify_run_failure_status() -> None:
+    assert is_apify_run_failure_status("FAILED")
+    assert is_apify_run_failure_status("TIMED-OUT")
+    assert is_apify_run_failure_status("timed_out")
+    assert is_apify_run_failure_status("ABORTED")
+    assert not is_apify_run_failure_status("SUCCEEDED")
+    assert not is_apify_run_failure_status("RUNNING")
+    assert not is_apify_run_failure_status(None)
+
+
+def test_build_apify_run_alert_text() -> None:
+    text = build_apify_run_alert_text(
+        step="Step 1",
+        actor_id="apify/instagram-post-scraper",
+        run_id="abc123",
+        status="FAILED",
+    )
+    assert "Apify run failed" in text
+    assert "Step: Step 1" in text
+    assert "Status: FAILED" in text
+    assert "Run: abc123" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_apify_run_failure_sends_to_alert_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_apify_run_failure(
+        {"id": "run1", "status": "FAILED"},
+        actor_id="apify/instagram-post-scraper",
+        step="Step 1",
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+    assert "Apify run failed" in mock_bot.send_message.await_args.kwargs["text"]
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_apify_run_failure_skips_succeeded(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=True,
+    )
+    n.maybe_notify_apify_run_failure(
+        {"id": "run1", "status": "SUCCEEDED"},
+        actor_id="apify/instagram-post-scraper",
+        step="Step 1",
+    )
+    mock_bot.send_message.assert_not_awaited()
+
+
+def test_build_deepseek_batch_all_failed_alert_text() -> None:
+    text = build_deepseek_batch_all_failed_alert_text(deepseek_calls=12)
+    assert "DeepSeek API error" in text
+    assert "Step: Step 2" in text
+    assert "All 12 DeepSeek" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_deepseek_batch_all_failed_sends_when_all_failed(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_deepseek_batch_all_failed(
+        deepseek_calls=12,
+        deepseek_succeeded=0,
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+
+
+def test_build_deepseek_batch_all_failed_alert_text_step5() -> None:
+    text = build_deepseek_batch_all_failed_alert_text(
+        deepseek_calls=3,
+        step="Step 5",
+        call_kind="usermatch call(s)",
+        outcome_label="usermatch picks",
+    )
+    assert "Step: Step 5" in text
+    assert "usermatch call(s)" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_deepseek_batch_all_failed_skips_partial_success(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_deepseek_batch_all_failed(
+        deepseek_calls=100,
+        deepseek_succeeded=1,
+    )
+    mock_bot.send_message.assert_not_awaited()
+
+
+def test_build_nexara_batch_all_failed_alert_text() -> None:
+    text = build_nexara_batch_all_failed_alert_text(transcription_attempts=10)
+    assert "Nexara API error" in text
+    assert "Step: Step 2" in text
+    assert "All 10 transcription" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_nexara_batch_all_failed_sends_when_all_failed(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_nexara_batch_all_failed(
+        transcription_attempts=10,
+        transcribed_count=0,
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_nexara_batch_all_failed_skips_partial_success(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_nexara_batch_all_failed(
+        transcription_attempts=100,
+        transcribed_count=1,
+    )
+    mock_bot.send_message.assert_not_awaited()
+
+
+def test_build_sherlock_batch_all_failed_alert_text() -> None:
+    text = build_sherlock_batch_all_failed_alert_text(leads_processed=5)
+    assert "Sherlock API error" in text
+    assert "Step: Step 5" in text
+    assert "All 5 lead(s)" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_sherlock_batch_all_failed_sends_when_every_lead_errored(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_sherlock_batch_all_failed(
+        leads_processed=5,
+        error_count=5,
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+    assert "All 5 lead(s)" in mock_bot.send_message.await_args.kwargs["text"]
+
+
+@patch("src.telegram_notifier.Bot")
+def test_maybe_notify_sherlock_batch_all_failed_skips_partial_errors(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.maybe_notify_sherlock_batch_all_failed(
+        leads_processed=5,
+        error_count=4,
+    )
+    mock_bot.send_message.assert_not_awaited()
+
+
+def test_maybe_notify_apify_run_failure_no_alert_chat() -> None:
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.maybe_notify_apify_run_failure(
+            {"id": "run1", "status": "FAILED"},
+            actor_id="apify/instagram-post-scraper",
+            step="Step 1",
+        )
+    mock_run.assert_not_called()
 
 
 def test_build_step1_pipeline_summary_telegram_multiline() -> None:
@@ -135,11 +394,19 @@ def test_build_step2_scored_post_message_shape() -> None:
 
 
 def test_build_step2_human_confirm_body_shape() -> None:
+    ig_url = "https://www.instagram.com/p/ABC123/"
     body = build_step2_human_confirm_body(
-        index=1, total=3, combined_text="Line one\n\nLine two"
+        index=1,
+        total=3,
+        post_url=ig_url,
+        combined_text="Line one\n\nLine two",
     )
     assert body.startswith("[1/3]")
     assert "ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ" in body
+    headline_pos = body.index("ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ")
+    link_pos = body.index(ig_url)
+    assert link_pos > headline_pos
+    assert body[headline_pos:link_pos].strip() == "ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ"
     assert "Line one" in body and "Line two" in body
 
 

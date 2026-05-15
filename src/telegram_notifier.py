@@ -29,6 +29,11 @@ _STEP1_NEW_POST_MESSAGE_DELAY_SEC = 2.0
 
 TOKEN_ENV_VAR = "TELEGRAM_BOT_TOKEN"
 
+# Terminal Apify run statuses that trigger ``telegram.alert_chat_id``.
+APIFY_RUN_ALERT_STATUSES = frozenset(
+    {"FAILED", "TIMED-OUT", "TIMED_OUT", "TIMEOUT", "ABORTED"}
+)
+
 # One initial attempt + this many retries; 20s pause after each failure.
 _TELEGRAM_SEND_RETRIES = 3
 _TELEGRAM_RETRY_DELAY_SEC = 40.0
@@ -348,12 +353,15 @@ STEP2_INLINE_SUFFIX_DENIED = " (отказано)"
 
 
 def build_step2_human_confirm_body(
-    *, index: int, total: int, combined_text: str
+    *, index: int, total: int, post_url: str, combined_text: str
 ) -> str:
     """Telegram body before inline buttons (Step 2 manual target check)."""
     header = f"[{index}/{total}]"
+    link = (post_url or "").strip() or "(unknown)"
     body = (combined_text or "").strip() or "(empty)"
-    return f"{header}\n\n{STEP2_HUMAN_CONFIRM_HEADLINE}\n\n{body}"
+    return (
+        f"{header}\n\n{STEP2_HUMAN_CONFIRM_HEADLINE}\n{link}\n\n{body}"
+    )
 
 
 def truncate_step2_human_confirm_body(body: str) -> str:
@@ -580,6 +588,89 @@ def _parse_result_chat_id(cfg: dict[str, Any]) -> int | None:
         return None
 
 
+def _parse_alert_chat_id(cfg: dict[str, Any]) -> int | None:
+    tg = cfg.get("telegram") or {}
+    raw = tg.get("alert_chat_id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning("telegram_invalid_alert_chat_id", raw=raw)
+        return None
+
+
+def _normalize_apify_run_status(status: str | None) -> str:
+    return (status or "").strip().upper().replace("_", "-")
+
+
+def is_apify_run_failure_status(status: str | None) -> bool:
+    """True when Apify finished with FAILED / TIMED-OUT / ABORTED (etc.)."""
+    return _normalize_apify_run_status(status) in APIFY_RUN_ALERT_STATUSES
+
+
+def build_apify_run_alert_text(
+    *,
+    step: str,
+    actor_id: str,
+    run_id: str,
+    status: str,
+) -> str:
+    """Short alert body for ``telegram.alert_chat_id``."""
+    lines = [
+        "Apify run failed",
+        f"Step: {step}",
+        f"Actor: {actor_id}",
+        f"Status: {status}",
+    ]
+    rid = (run_id or "").strip()
+    if rid:
+        lines.append(f"Run: {rid}")
+    return "\n".join(lines)
+
+
+def build_sherlock_batch_all_failed_alert_text(*, leads_processed: int) -> str:
+    """Alert when every lead in a Step 5 batch finished with ``sherlock_status=error``."""
+    return "\n".join(
+        [
+            "Sherlock API error",
+            "Step: Step 5",
+            f"All {leads_processed} lead(s) in the batch finished with API/task error",
+            "No successful nick/photo outcomes in this run.",
+        ]
+    )
+
+
+def build_nexara_batch_all_failed_alert_text(*, transcription_attempts: int) -> str:
+    """Alert when every Step 2 Nexara transcription attempt in the run failed."""
+    return "\n".join(
+        [
+            "Nexara API error",
+            "Step: Step 2",
+            f"All {transcription_attempts} transcription attempt(s) failed",
+            "No successful Nexara transcriptions in this run.",
+        ]
+    )
+
+
+def build_deepseek_batch_all_failed_alert_text(
+    *,
+    deepseek_calls: int,
+    step: str = "Step 2",
+    call_kind: str = "scoring call(s)",
+    outcome_label: str = "relevance scores",
+) -> str:
+    """Alert when every DeepSeek call in a pipeline step failed at the API layer."""
+    return "\n".join(
+        [
+            "DeepSeek API error",
+            f"Step: {step}",
+            f"All {deepseek_calls} DeepSeek {call_kind} failed",
+            f"No successful {outcome_label} in this run.",
+        ]
+    )
+
+
 class PipelineTelegramNotifier:
     """Fire-and-forget messages to ``telegram.report_chat_id``."""
 
@@ -589,13 +680,16 @@ class PipelineTelegramNotifier:
         chat_id: int | None,
         *,
         result_chat_id: int | None = None,
+        alert_chat_id: int | None = None,
         enabled: bool = True,
     ) -> None:
         self._token = (token or "").strip() or None
         self._chat_id = chat_id
         self._result_chat_id = result_chat_id
+        self._alert_chat_id = alert_chat_id
         has_pair = bool(self._token and self._chat_id is not None)
         self._enabled = bool(enabled and has_pair)
+        self._alerts_enabled = bool(self._token and self._alert_chat_id is not None)
 
         if not enabled:
             log.debug("telegram_notifier_disabled", reason="explicitly_disabled")
@@ -630,7 +724,118 @@ class PipelineTelegramNotifier:
         token = os.environ.get(TOKEN_ENV_VAR)
         chat_id = _parse_report_chat_id(cfg)
         result_chat_id = _parse_result_chat_id(cfg)
-        return cls(token, chat_id, result_chat_id=result_chat_id)
+        alert_chat_id = _parse_alert_chat_id(cfg)
+        return cls(
+            token,
+            chat_id,
+            result_chat_id=result_chat_id,
+            alert_chat_id=alert_chat_id,
+        )
+
+    def maybe_notify_apify_run_failure(
+        self,
+        run: dict[str, Any],
+        *,
+        actor_id: str,
+        step: str,
+    ) -> None:
+        """Send to ``alert_chat_id`` when Apify run status is a terminal failure."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        status = str(run.get("status") or "")
+        if not is_apify_run_failure_status(status):
+            return
+        run_id = str(run.get("id") or "")
+        text = truncate_for_telegram(
+            build_apify_run_alert_text(
+                step=step,
+                actor_id=actor_id,
+                run_id=run_id,
+                status=status,
+            )
+        )
+        log.warning(
+            "apify_run_failed_alert",
+            step=step,
+            actor_id=actor_id,
+            run_id=run_id,
+            status=status,
+        )
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def maybe_notify_sherlock_batch_all_failed(
+        self,
+        *,
+        leads_processed: int,
+        error_count: int,
+    ) -> None:
+        """Send to ``alert_chat_id`` only if every processed lead ended with ``error``."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        if leads_processed <= 0 or error_count != leads_processed:
+            return
+        text = truncate_for_telegram(
+            build_sherlock_batch_all_failed_alert_text(
+                leads_processed=leads_processed,
+            )
+        )
+        log.warning(
+            "sherlock_batch_all_failed_alert",
+            leads_processed=leads_processed,
+            error_count=error_count,
+        )
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def maybe_notify_nexara_batch_all_failed(
+        self,
+        *,
+        transcription_attempts: int,
+        transcribed_count: int,
+    ) -> None:
+        """Send to ``alert_chat_id`` only if every Nexara attempt in Step 2 failed."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        if transcription_attempts <= 0 or transcribed_count > 0:
+            return
+        text = truncate_for_telegram(
+            build_nexara_batch_all_failed_alert_text(
+                transcription_attempts=transcription_attempts,
+            )
+        )
+        log.warning(
+            "nexara_batch_all_failed_alert",
+            transcription_attempts=transcription_attempts,
+        )
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def maybe_notify_deepseek_batch_all_failed(
+        self,
+        *,
+        deepseek_calls: int,
+        deepseek_succeeded: int,
+        step: str = "Step 2",
+        call_kind: str = "scoring call(s)",
+        outcome_label: str = "relevance scores",
+    ) -> None:
+        """Send to ``alert_chat_id`` only if every DeepSeek call in the step failed."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        if deepseek_calls <= 0 or deepseek_succeeded > 0:
+            return
+        text = truncate_for_telegram(
+            build_deepseek_batch_all_failed_alert_text(
+                deepseek_calls=deepseek_calls,
+                step=step,
+                call_kind=call_kind,
+                outcome_label=outcome_label,
+            )
+        )
+        log.warning(
+            "deepseek_batch_all_failed_alert",
+            step=step,
+            deepseek_calls=deepseek_calls,
+        )
+        self._send_sync(text, chat_id=self._alert_chat_id)
 
     def notify_step1(
         self,
@@ -763,8 +968,10 @@ class PipelineTelegramNotifier:
     async def _send_message_once(
         self, text: str, *, chat_id: int | None = None
     ) -> None:
-        assert self._token is not None and self._chat_id is not None
-        dest = self._chat_id if chat_id is None else chat_id
+        assert self._token is not None
+        dest = chat_id if chat_id is not None else self._chat_id
+        if dest is None:
+            raise ValueError("telegram send requires chat_id or report_chat_id")
         async with Bot(token=self._token) as bot:
             await asyncio.wait_for(
                 bot.send_message(chat_id=dest, text=text),

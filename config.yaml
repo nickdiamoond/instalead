@@ -113,6 +113,7 @@ telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
   report_chat_id: -1003909022341 #-1003926996735
   result_chat_id: -1003926996735 #Chat for clear results and confirmations only no logs
+  alert_chat_id: -1003926996735 #Chat for alerts and notifications only no logs
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
@@ -124,7 +125,7 @@ pipeline:
   # terminal before Apify comment scraping / Sherlock; if the run ends with
   # issues, the script waits for Enter before exit. Set false for cron /
   # unattended runs (no terminal prompts; expensive steps always run).
-  prompt_terminal_confirmation: true
+  prompt_terminal_confirmation: false
 
   step1:
     # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on
@@ -166,7 +167,7 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 20000
+    louisdeconinck_comments_cap_per_post: 100
 
   step4:
     # apify/instagram-profile-scraper batch size. Apify accepts up

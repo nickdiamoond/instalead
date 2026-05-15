@@ -415,6 +415,7 @@ async def _run_step2_human_confirmations(
         body = build_step2_human_confirm_body(
             index=i,
             total=total,
+            post_url=str(item.get("post_link") or ""),
             combined_text=str(item.get("combined") or ""),
         )
         text = truncate_step2_human_confirm_body(body)
@@ -496,6 +497,8 @@ def _run_apify_actor(
     run_input: dict,
     *,
     log_input: dict | None = None,
+    tg_notifier: PipelineTelegramNotifier | None = None,
+    apify_step: str | None = None,
 ) -> tuple[list[dict], float, dict]:
     """Run an Apify actor and return ``(items, cost_usd, run_meta)``.
 
@@ -521,6 +524,10 @@ def _run_apify_actor(
         cost_usd=cost,
         duration_ms=detail.get("stats", {}).get("durationMillis"),
     )
+    if tg_notifier is not None and apify_step:
+        tg_notifier.maybe_notify_apify_run_failure(
+            run, actor_id=actor_id, step=apify_step
+        )
     return items, cost, run
 
 
@@ -532,6 +539,7 @@ def _fetch_comments_with_fallback(
     primary_actor: str,
     fallback_actor: str,
     louisdeconinck_cap_per_post: int,
+    tg_notifier: PipelineTelegramNotifier | None = None,
 ) -> tuple[list[dict], float, str, dict]:
     """Pull comments for ``urls`` with primary -> apidojo-api fallback.
 
@@ -588,6 +596,8 @@ def _fetch_comments_with_fallback(
             "urls_count": len(urls),
             "results_limit": louisdeconinck_cap_per_post,
         },
+        tg_notifier=tg_notifier,
+        apify_step="Step 3 (comments primary)",
     )
     debug = {
         "primary_actor": primary_actor,
@@ -625,6 +635,8 @@ def _fetch_comments_with_fallback(
             "proxy": {"useApifyProxy": True},
         },
         log_input={"startUrls_count": len(urls), "fallback": True},
+        tg_notifier=tg_notifier,
+        apify_step="Step 3 (comments fallback)",
     )
     debug.update(
         {
@@ -769,8 +781,14 @@ def _deepseek_usermatch_pick_index(
     ig_username: str,
     ig_full_name: str,
     persons: list,
-) -> int | None:
-    """Return 1-based candidate index, or ``None`` if model declines or call fails."""
+) -> tuple[int | None, str | None]:
+    """Return ``(pick, api_error)``.
+
+    * ``pick`` — 1-based candidate index, or ``None`` if the model declines
+      (digit ``0``) or the call failed.
+    * ``api_error`` — set when the HTTP call or response parsing failed;
+      ``None`` when the API returned a usable answer (including decline).
+    """
     candidates_block = _format_candidates_for_prompt(persons)
     system_prompt = USERMATCH_PROMPT.format(
         username=ig_username,
@@ -794,7 +812,7 @@ def _deepseek_usermatch_pick_index(
             username=ig_username,
             error=str(exc),
         )
-        return None
+        return None, str(exc)
 
     pick = _parse_usermatch_digit(raw)
     if pick is None:
@@ -803,13 +821,13 @@ def _deepseek_usermatch_pick_index(
             username=ig_username,
             raw=raw[:200],
         )
-        return None
+        return None, f"unparseable response: {raw[:200]}"
     if pick == 0:
         log.info(
             "step5_deepseek_usermatch_zero",
             username=ig_username,
         )
-        return None
+        return None, None
     if pick < 1 or pick > len(persons):
         log.warning(
             "step5_deepseek_usermatch_out_of_range",
@@ -818,8 +836,8 @@ def _deepseek_usermatch_pick_index(
             n=len(persons),
             raw=raw[:200],
         )
-        return None
-    return pick
+        return None, f"out of range: pick={pick} n={len(persons)}"
+    return pick, None
 
 
 def _resolve_one_lead_via_sherlock(
@@ -1036,12 +1054,14 @@ def _resolve_one_lead_via_sherlock(
             )
             return out
 
-        pick = _deepseek_usermatch_pick_index(
+        pick, deepseek_api_error = _deepseek_usermatch_pick_index(
             deepseek,
             ig_username=username,
             ig_full_name=str(lead.get("full_name") or ""),
             persons=persons,
         )
+        out["step5_deepseek_called"] = True
+        out["step5_deepseek_api_failed"] = deepseek_api_error is not None
         if pick is None:
             out["status"] = SH_STATUS_NO_MATCH
             out["error"] = None
@@ -1254,6 +1274,8 @@ def _step_5_resolve_contacts_via_sherlock(
             SH_STATUS_NO_FACE_PHOTO: 0,
             SH_STATUS_ERROR: 0,
         }
+        step5_deepseek_calls = 0
+        step5_deepseek_api_ok = 0
 
         def _worker_error_payload(username: str, exc: Exception) -> dict:
             return {
@@ -1281,6 +1303,10 @@ def _step_5_resolve_contacts_via_sherlock(
                 sherlock_link=res.get("sherlock_link"),
             )
             tg_notifier.notify_sherlock_lead(lead, res, cfg=cfg)
+            if res.get("step5_deepseek_called"):
+                step5_deepseek_calls += 1
+                if not res.get("step5_deepseek_api_failed"):
+                    step5_deepseek_api_ok += 1
             counters[res["status"]] = counters.get(res["status"], 0) + 1
             tag = res["status"]
             detail_bits: list[str] = []
@@ -1357,12 +1383,30 @@ def _step_5_resolve_contacts_via_sherlock(
         ):
             print(f"    {label:<18} {counters.get(label, 0)}")
 
-        log.info("step5_done", **{f"count_{k}": v for k, v in counters.items()})
+        log.info(
+            "step5_done",
+            step5_deepseek_calls=step5_deepseek_calls,
+            step5_deepseek_api_ok=step5_deepseek_api_ok,
+            **{f"count_{k}": v for k, v in counters.items()},
+        )
 
-        if counters.get(SH_STATUS_ERROR, 0):
+        error_count = counters.get(SH_STATUS_ERROR, 0)
+        tg_notifier.maybe_notify_sherlock_batch_all_failed(
+            leads_processed=n,
+            error_count=error_count,
+        )
+        tg_notifier.maybe_notify_deepseek_batch_all_failed(
+            deepseek_calls=step5_deepseek_calls,
+            deepseek_succeeded=step5_deepseek_api_ok,
+            step="Step 5",
+            call_kind="usermatch call(s)",
+            outcome_label="usermatch picks",
+        )
+
+        if error_count:
             issues.append((
                 "Step 5",
-                f"{counters[SH_STATUS_ERROR]} leads finished as error -- "
+                f"{error_count} leads finished as error -- "
                 "check logs for Sherlock task failures / timeouts",
             ))
     finally:
@@ -1660,6 +1704,11 @@ def main():
             "dataDetailLevel": "basicData",
             "proxy": {"useApifyProxy": True},
         })
+        tg_notifier.maybe_notify_apify_run_failure(
+            run,
+            actor_id="apify/instagram-post-scraper",
+            step="Step 1",
+        )
         detail = apify.run(run["id"]).get()
         all_posts = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
         step1_cost_usd = float(detail.get("usageTotalUsd") or 0)
@@ -1710,6 +1759,9 @@ def main():
         run_p = apify.actor(hashtag_actor_id).call(
             run_input={**run_base, "resultsType": "posts"}
         )
+        tg_notifier.maybe_notify_apify_run_failure(
+            run_p, actor_id=hashtag_actor_id, step="Step 1 (hashtag posts)"
+        )
         detail_p = apify.run(run_p["id"]).get()
         posts_fetched = list(apify.dataset(run_p["defaultDatasetId"]).iterate_items())
         posts_filtered, posts_age_stats = filter_items_within_max_age(
@@ -1733,6 +1785,9 @@ def main():
 
         run_r = apify.actor(hashtag_actor_id).call(
             run_input={**run_base, "resultsType": "reels"}
+        )
+        tg_notifier.maybe_notify_apify_run_failure(
+            run_r, actor_id=hashtag_actor_id, step="Step 1 (hashtag reels)"
         )
         detail_r = apify.run(run_r["id"]).get()
         reels_fetched = list(apify.dataset(run_r["defaultDatasetId"]).iterate_items())
@@ -1829,6 +1884,9 @@ def main():
                 "cookies": cookies_payload,
                 "sessionName": session_name,
             }
+        )
+        tg_notifier.maybe_notify_apify_run_failure(
+            run_kw, actor_id=cookie_search_actor_id, step="Step 1"
         )
         detail_kw = apify.run(run_kw["id"]).get()
         raw_items = list(apify.dataset(run_kw["defaultDatasetId"]).iterate_items())
@@ -2034,6 +2092,7 @@ def main():
     non_russian_skipped = 0
     language_detect_failed = 0
     deepseek_calls = 0
+    deepseek_failed = 0
     step2_is_re_audit: list[tuple[str, object]] = []
     human_confirm_queue: list[dict] = []
 
@@ -2112,7 +2171,9 @@ def main():
 
         deepseek_calls += 1
         raw_score = score_caption(deepseek, combined)
-        if "error" not in raw_score:
+        if "error" in raw_score:
+            deepseek_failed += 1
+        else:
             step2_is_re_audit.append((post_id, raw_score.get("is_real_estate")))
 
         relevance = _apply_score(db, post_id, raw_score)
@@ -2154,6 +2215,7 @@ def main():
         "step2_done",
         scored=len(unscored),
         deepseek_calls=deepseek_calls,
+        deepseek_failed=deepseek_failed,
         transcribed=transcribed,
         transcribe_failed=transcribe_failed,
         empty_skipped=empty_skipped,
@@ -2182,6 +2244,16 @@ def main():
             f"denied={human_stats['denied']} "
             f"timeout={human_stats['timeout']}"
         )
+    nexara_attempts = transcribed + transcribe_failed
+    tg_notifier.maybe_notify_nexara_batch_all_failed(
+        transcription_attempts=nexara_attempts,
+        transcribed_count=transcribed,
+    )
+    tg_notifier.maybe_notify_deepseek_batch_all_failed(
+        deepseek_calls=deepseek_calls,
+        deepseek_succeeded=deepseek_calls - deepseek_failed,
+    )
+
     if transcribe_failed and transcribe_failed > transcribed:
         issues.append((
             "Step 2",
@@ -2235,6 +2307,7 @@ def main():
                 primary_actor=primary_actor,
                 fallback_actor=fallback_actor,
                 louisdeconinck_cap_per_post=louisdeconinck_cap,
+                tg_notifier=tg_notifier,
             )
 
             # Bail out *before* marking anything as scanned if both the
@@ -2434,6 +2507,11 @@ def main():
             run = apify.actor("apify/instagram-profile-scraper").call(run_input={
                 "usernames": batch,
             })
+            tg_notifier.maybe_notify_apify_run_failure(
+                run,
+                actor_id="apify/instagram-profile-scraper",
+                step="Step 4",
+            )
             detail = apify.run(run["id"]).get()
             items = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
 
