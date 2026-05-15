@@ -3,8 +3,8 @@
 Uses Bot API ``sendMessage`` via aiogram. Disabled when ``TELEGRAM_BOT_TOKEN``
 is missing or ``telegram.report_chat_id`` is absent/invalid — the pipeline
 keeps running. Step 2 human inline confirmations and the per-lead Sherlock
-Russian summary (last ``notify_sherlock_lead`` message) use ``telegram.result_chat_id``
-when set, otherwise ``report_chat_id``."""
+Russian summary (last ``notify_sherlock_lead`` message on nick/photo hit) goes to
+``telegram.result_chat_id`` only; misses stay in the report chat."""
 from __future__ import annotations
 
 import asyncio
@@ -55,6 +55,12 @@ _SH_NO_MATCH = "no_match"
 _SH_NO_FACE_PHOTO = "no_face_photo"
 _SH_ERROR = "error"
 _TELEGRAM_MESSAGE_HARD_LIMIT = 4096
+
+
+def sherlock_lead_found(res: dict) -> bool:
+    """True when Step 5 resolved a Telegram contact (nick or photo stage)."""
+    st = str((res or {}).get("status") or "")
+    return st in (_SH_FOUND_NICK, _SH_FOUND_PHOTO)
 _TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
 
 
@@ -63,6 +69,11 @@ def _telegram_handle(handle: str) -> str:
     if not h:
         return ""
     return h if h.startswith("@") else f"@{h}"
+
+
+def _plain_telegram_username(handle: str) -> str:
+    """Username without leading ``@`` (Russian summary title line)."""
+    return (handle or "").strip().lstrip("@")
 
 
 def truncate_for_telegram(text: str, limit: int = _TELEGRAM_MESSAGE_HARD_LIMIT) -> str:
@@ -486,21 +497,21 @@ def build_sherlock_lead_notification_text(lead: dict, res: dict) -> str:
 
 
 def _sherlock_result_summary_title_line(lead: dict, res: dict) -> str:
-    """First line of the Russian Step 5 summary: ``Результат по "handle"``."""
+    """First line of the Russian Step 5 summary: ``Результат по "username"``."""
     res = res or {}
     status = str(res.get("status") or "")
     ig = str(lead.get("username") or "").strip() or "unknown"
     if status == _SH_FOUND_NICK:
-        h = _telegram_handle(str(res.get("telegram_username") or ""))
-        return f'Результат по "{h}"' if h else f'Результат по "{_telegram_handle(ig)}"'
+        h = _plain_telegram_username(str(res.get("telegram_username") or ""))
+        return f'Результат по "{h}"' if h else f'Результат по "{_plain_telegram_username(ig)}"'
     if status == _SH_FOUND_PHOTO:
         link = str(res.get("sherlock_link") or "").strip()
         m = re.search(
             r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)", link, re.I
         )
         if m:
-            return f'Результат по "{_telegram_handle(m.group(1))}"'
-    return f'Результат по "{_telegram_handle(ig)}"'
+            return f'Результат по "{_plain_telegram_username(m.group(1))}"'
+    return f'Результат по "{_plain_telegram_username(ig)}"'
 
 
 def _sherlock_match_label_ru(res: dict) -> str:
@@ -933,15 +944,17 @@ class PipelineTelegramNotifier:
         text2 = truncate_for_telegram(
             build_sherlock_lead_notification_text(lead, res)
         )
-        text3 = truncate_for_telegram(
-            build_sherlock_lead_result_summary_text(lead, res)
-        )
-        summary_chat = (
-            self._result_chat_id
-            if self._result_chat_id is not None
-            else self._chat_id
-        )
-        assert summary_chat is not None
+        text3: str | None = None
+        summary_chat: int | None = None
+        if sherlock_lead_found(res):
+            text3 = truncate_for_telegram(
+                build_sherlock_lead_result_summary_text(lead, res)
+            )
+            summary_chat = (
+                self._result_chat_id
+                if self._result_chat_id is not None
+                else self._chat_id
+            )
         if (
             bool(res.get("photo_search_ran"))
             and cfg is not None
@@ -954,16 +967,22 @@ class PipelineTelegramNotifier:
                     build_sherlock_face_photo_caption(lead, pct),
                     limit=_TELEGRAM_PHOTO_CAPTION_LIMIT,
                 )
-                if self._send_sync_photo_then_text(
-                    photo_path,
-                    caption,
-                    text2,
-                    text3,
-                    last_text_chat_id=summary_chat,
+                if text3 is not None and summary_chat is not None:
+                    if self._send_sync_photo_then_text(
+                        photo_path,
+                        caption,
+                        text2,
+                        text3,
+                        last_text_chat_id=summary_chat,
+                    ):
+                        return
+                elif self._send_sync_photo_then_text(
+                    photo_path, caption, text2
                 ):
                     return
         self._send_sync(text2)
-        self._send_sync(text3, chat_id=summary_chat)
+        if text3 is not None and summary_chat is not None:
+            self._send_sync(text3, chat_id=summary_chat)
 
     async def _send_message_once(
         self, text: str, *, chat_id: int | None = None

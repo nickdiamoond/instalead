@@ -139,7 +139,7 @@ def test_build_sherlock_result_summary_nick_hit() -> None:
         "telegram_username": "AliceTG",
     }
     s = build_sherlock_lead_result_summary_text(lead, res)
-    assert s.startswith('Результат по "@AliceTG"')
+    assert s.startswith('Результат по "AliceTG"')
     assert "Профиль: https://www.instagram.com/alice/" in s
     assert "Ник в тг: @AliceTG" in s
     assert "Имя пользователя из био инсты: Alice Иванова" in s
@@ -156,7 +156,7 @@ def test_build_sherlock_result_summary_photo_exact() -> None:
         "sherlock_person": "Иван Иванов",
     }
     s = build_sherlock_lead_result_summary_text(lead, res)
-    assert 'Результат по "@bobtg"' in s
+    assert 'Результат по "bobtg"' in s
     assert "Профиль: https://www.instagram.com/bob/" in s
     assert "person: Иван Иванов" in s
     assert "Телефон: +7999" in s
@@ -171,7 +171,7 @@ def test_build_sherlock_result_summary_no_match() -> None:
     }
     res = {"status": "no_match"}
     s = build_sherlock_lead_result_summary_text(lead, res)
-    assert 'Результат по "@carol"' in s
+    assert 'Результат по "carol"' in s
     assert "Профиль: https://www.instagram.com/carol/" in s
     assert "ФИО из Instagram: Кэрол Смит" in s
     assert "совпадение: пользователь не найден" in s
@@ -208,6 +208,6 @@ def test_notify_sherlock_lead_photo_search_sends_photo_then_text(
         cfg={"face_detection": {}},
     )
     mock_bot.send_photo.assert_awaited_once()
-    assert mock_bot.send_message.await_count == 2
+    assert mock_bot.send_message.await_count == 1
     pc = mock_bot.send_photo.await_args.kwargs["caption"]
     assert "@bob" in pc and "90.0%" in pc

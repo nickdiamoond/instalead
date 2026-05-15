@@ -1294,6 +1294,7 @@ def _step_5_resolve_contacts_via_sherlock(
             }
 
         def _apply_step5_result(lead: dict, res: dict, progress_i: int) -> None:
+            nonlocal step5_deepseek_calls, step5_deepseek_api_ok
             username = lead["username"]
             db.mark_lead_sherlock(
                 username=username,

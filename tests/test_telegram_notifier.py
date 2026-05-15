@@ -426,7 +426,28 @@ def test_inline_confirm_token_and_chat_disabled() -> None:
 
 
 @patch("src.telegram_notifier.Bot")
-def test_notify_sherlock_lead_sends_summary_to_result_chat(
+def test_notify_sherlock_lead_sends_summary_to_result_chat_on_hit(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
+    n.notify_sherlock_lead(
+        {"username": "someuser"},
+        {"status": "found_nick", "telegram_username": "SomeTG"},
+        cfg=None,
+    )
+    assert mock_bot.send_message.await_count == 2
+    calls = mock_bot.send_message.await_args_list
+    assert calls[0].kwargs["chat_id"] == -42
+    assert calls[1].kwargs["chat_id"] == -999
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_sherlock_lead_no_match_skips_result_chat(
     mock_bot_class: MagicMock,
 ) -> None:
     mock_bot = MagicMock()
@@ -440,10 +461,8 @@ def test_notify_sherlock_lead_sends_summary_to_result_chat(
         {"status": "no_match"},
         cfg=None,
     )
-    assert mock_bot.send_message.await_count == 2
-    calls = mock_bot.send_message.await_args_list
-    assert calls[0].kwargs["chat_id"] == -42
-    assert calls[1].kwargs["chat_id"] == -999
+    assert mock_bot.send_message.await_count == 1
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -42
 
 
 @patch("src.telegram_notifier.Bot")
@@ -461,8 +480,8 @@ def test_notify_sherlock_lead_both_messages_report_without_result_chat(
         {"status": "no_match"},
         cfg=None,
     )
-    assert mock_bot.send_message.await_count == 2
-    assert all(c.kwargs["chat_id"] == -42 for c in mock_bot.send_message.await_args_list)
+    assert mock_bot.send_message.await_count == 1
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -42
 
 
 @patch("src.telegram_notifier.Bot")
