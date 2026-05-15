@@ -53,61 +53,9 @@ search:
   # Instagram usernames (no @). Used by the daily pipeline when
   # ``pipeline.step1.discovery_mode`` is ``realtors`` (instagram-post-scraper).
   realtor_accounts:
-    - "tochno__partners"
-    - "tochno.life"
-    - "metriks_development"
-    - "1dogma"
-    - "sskuban"
-    - "incitydevelopment"
-    - "bauinvest_group"
-    - "gk.nvm.south"
-    - "darstroy.krasnodar"
-    - "gk_usi"
-    - "familia_dev"
-    - "garantiya.krasnodar"
-    - "avakrasnodar"
-    - "europeya.ru"
-    - "mooe_krasnodar"
-    - "novostroiki_krasnodara_"
-    - "valeria__pivovarova"
-    - "svoi.live"
-    - "smartrielt"
-    - "ayax.realty"
-    - "sashaipoteka"
-    - "krasnodar_kvartiry"
-    - "krasnodar_regina"
     - "goncharov_nedvizhimost"
-    - "svoya.vkrasnodare"
-    - "proipoteka.ru"
-    - "kamila_ipoteka"
     - "annet_fokina"
-    - "volkova_top_estate"
-    - "group_etalon"
-    - "mrgroup_rus"
-    - "pioneergroup"
-    - "sminex_developer"
-    - "capitalgroupcorp"
-    - "whitewillestate"
-    - "brusnika.company"
-    - "vesper_moscow"
-    - "forma.russia"
-    - "homexpert.me"
-    - "andreyneginskiy"
-    - "lsr.petersburg"
-    - "strana_com"
-    - "pik"
-    - "i.love.msk"
-    - "bigcity_moscow_"
-    - "svetlana.nedvizka"
-    - "ks_makarenko"
-    - "bozhenko_marina"
-    - "sofi_lubimova"
-    - "vasilii_kholodnyak"
-    - "sk_10_official"
-    - "donneftestroi161"
-    - "sk_smu1"
-    - "donneftestroi161"
-    - "msk_rostov"
+    - "sashaipoteka"
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
@@ -167,7 +115,7 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 100
+    louisdeconinck_comments_cap_per_post: 50
 
   step4:
     # apify/instagram-profile-scraper batch size. Apify accepts up
