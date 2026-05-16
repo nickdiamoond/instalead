@@ -431,6 +431,7 @@ def test_build_step2_human_confirm_body_shape() -> None:
         total=3,
         post_url=ig_url,
         combined_text="Line one\n\nLine two",
+        location="Москва",
     )
     assert body.startswith("[1/3]")
     assert "ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ" in body
@@ -438,7 +439,19 @@ def test_build_step2_human_confirm_body_shape() -> None:
     link_pos = body.index(ig_url)
     assert link_pos > headline_pos
     assert body[headline_pos:link_pos].strip() == "ПОДТВЕРДИТЕ, ЧТО ПОСТ ЦЕЛЕВОЙ"
+    loc_pos = body.index("Локация - Москва")
+    assert loc_pos > link_pos
     assert "Line one" in body and "Line two" in body
+
+
+def test_build_step2_human_confirm_body_missing_location() -> None:
+    body = build_step2_human_confirm_body(
+        index=1,
+        total=1,
+        post_url="https://www.instagram.com/p/X/",
+        combined_text="text",
+    )
+    assert "Локация - отсутствует" in body
 
 
 def test_inline_confirm_token_and_chat_uses_result_chat_id() -> None:

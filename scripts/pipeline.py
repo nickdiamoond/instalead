@@ -417,6 +417,7 @@ async def _run_step2_human_confirmations(
             total=total,
             post_url=str(item.get("post_link") or ""),
             combined_text=str(item.get("combined") or ""),
+            location=item.get("location"),
         )
         text = truncate_step2_human_confirm_body(body)
         result = await await_single_yes_no(
@@ -2140,7 +2141,7 @@ def main():
     _banner("STEP 2: Score new posts (Lingua gate + DeepSeek)")
     with db._conn() as conn:
         unscored = conn.execute(
-            "SELECT post_id, caption, post_url FROM processed_posts "
+            "SELECT post_id, caption, post_url, location FROM processed_posts "
             "WHERE relevance IS NULL"
         ).fetchall()
         unscored = [dict(r) for r in unscored]
@@ -2256,6 +2257,7 @@ def main():
                     "post_link": post_link,
                     "combined": combined,
                     "raw_score": dict(raw_score),
+                    "location": p.get("location"),
                 }
             )
 

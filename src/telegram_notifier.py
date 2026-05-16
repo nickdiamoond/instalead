@@ -401,15 +401,28 @@ STEP2_INLINE_SUFFIX_APPROVED = " (одобрено)"
 STEP2_INLINE_SUFFIX_DENIED = " (отказано)"
 
 
+def _step2_human_confirm_location_line(location: str | None) -> str:
+    label = (location or "").strip()
+    if not label:
+        return "Локация - отсутствует"
+    return f"Локация - {label}"
+
+
 def build_step2_human_confirm_body(
-    *, index: int, total: int, post_url: str, combined_text: str
+    *,
+    index: int,
+    total: int,
+    post_url: str,
+    combined_text: str,
+    location: str | None = None,
 ) -> str:
     """Telegram body before inline buttons (Step 2 manual target check)."""
     header = f"[{index}/{total}]"
     link = (post_url or "").strip() or "(unknown)"
+    loc_line = _step2_human_confirm_location_line(location)
     body = (combined_text or "").strip() or "(empty)"
     return (
-        f"{header}\n\n{STEP2_HUMAN_CONFIRM_HEADLINE}\n{link}\n\n{body}"
+        f"{header}\n\n{STEP2_HUMAN_CONFIRM_HEADLINE}\n{link}\n{loc_line}\n\n{body}"
     )
 
 
