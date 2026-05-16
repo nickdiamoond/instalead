@@ -42,6 +42,8 @@ from src.avatar_downloader import (
 )
 from src.comment_normalizer import normalize_apidojo_api
 from src.config import (
+    deepseek_relevance_prompt,
+    deepseek_usermatch_prompt,
     load_config,
     step1_cookie_search_section,
     step1_min_comments_per_post,
@@ -191,19 +193,6 @@ def _cfg_prompt_terminal_confirmation(value, default: bool = True) -> bool:
 
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
-RELEVANCE_PROMPT = """\
-Ты анализируешь описание поста/рилса из Instagram от риелтора. Определи:
-
-1. is_real_estate — пост про недвижимость (продажа/покупка квартир, обзоры ЖК, ипотека)?
-2. has_call_to_action — есть ли призыв заинтересованным покупателям писать в комментарии/директ?
-3. call_to_action_type — тип призыва: "comment" / "direct" / "link" / "none"
-
-Если описание слишком короткое или непонятное — верни is_real_estate: null.
-
-Ответь ТОЛЬКО валидным JSON без markdown:
-{"is_real_estate": true/false/null, "has_call_to_action": true/false, "call_to_action_type": "comment"|"direct"|"link"|"none"}
-"""
-
 RUSSIAN_LANGUAGE_DETECTOR = (
     LanguageDetectorBuilder.from_all_spoken_languages().build()
 )
@@ -324,12 +313,14 @@ def _pick_post_images(
     return urls
 
 
-def score_caption(client: OpenAI, caption: str) -> dict:
+def score_caption(
+    client: OpenAI, caption: str, *, relevance_prompt: str
+) -> dict:
     try:
         resp = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": RELEVANCE_PROMPT},
+                {"role": "system", "content": relevance_prompt},
                 {"role": "user", "content": caption[:3000]},
             ],
             temperature=0,
@@ -461,7 +452,7 @@ def _build_scoring_text(caption: str | None, transcript: str | None) -> str:
 
     Order is fixed: caption first, transcript second, separated by a
     blank line. Either part may be missing. The result is what gets
-    sent to ``RELEVANCE_PROMPT``.
+    sent to ``deepseek.relevance_prompt``.
     """
     parts: list[str] = []
     if caption and caption.strip():
@@ -728,73 +719,6 @@ SH_STATUS_ERROR = "error"
 # First-row ``status`` substring for Sherlock photo ``result.results``;
 # mirrors ``scripts/test_profile_face_pick.py``.
 SHERLOCK_EXACT_MATCH_SUBSTRING = "точное совпадение"
-USERMATCH_PROMPT = """\
-# Задача
-Ты анализируешь Ник пользователя из Instagram (username) и его ФИО из профиля (если оно присутствует), а также пронумерованный список потенциальных кандидатов.
-Ты должен определить, кому из кандидатов принадлежит этот аккаунт, либо вернуть 0, если аккаунт не удалось уверенно сопоставить ни с одним кандидатом.
-
-Иногда ник содержит (частично) имя или фамилию кандидата. Если ФИО в профиле пустое или состоит из неинформативных слов (например, «блогер», «рилсмейкер»), приоритет отдаётся нику.
-Если ФИО присутствует и похоже на реальное имя, оно получает приоритет, но ник может использоваться для уточнения.
-
-# Алгоритм анализа
-Выполняй шаги строго по порядку.
-
-1. **Извлеки значимые части из ФИО пользователя.**
-   - Удали из строки всё, что не является именем или фамилией (слова вроде «блогер», «рилсмейкер», «official», эмодзи и т.п.).
-   - Оставшиеся слова считай набором значимых частей (порядок не фиксирован). Их может быть 0, 1, 2 или более.
-   - Если значимых частей нет, считай ФИО пустым.
-
-2. **Сопоставление по ФИО.**
-   - Если в ФИО есть два или более значащих слов, проверь, содержатся ли среди них одновременно имя и фамилия какого-либо кандидата (порядок слов в ФИО и у кандидата роли не играет). При полном совпадении (найдены и имя, и фамилия одного кандидата) уверенность 10/10 – сразу верни номер этого кандидата. Если таких кандидатов несколько (одинаковые ФИО), верни номер первого из них.
-   - Если значимое слово одно, сравни его с именами и фамилиями всех кандидатов. Возможные ситуации:
-     - Слово совпало с именем одного кандидата (и с фамилиями не совпадает) – зафиксируй «имя найдено» и переходи к шагу 3, используя найденное имя.
-     - Слово совпало с фамилией одного кандидата (и с именами не совпадает) – зафиксируй «фамилия найдена» и переходи к шагу 3.
-     - Слово совпало с именем одного кандидата и с фамилией другого – однозначного сопоставления нет, уверенность <7/10, верни 0.
-     - Если слово не совпало ни с одним именем или фамилией – переходи к шагу 3, считая ФИО не давшим зацепок.
-
-3. **Анализ ника.**
-   - Преобразуй ник из латиницы в вероятные русские варианты (транслитерация с латиницы на кириллицу). Используй стандартную обратную транслитерацию, учитывая типичные для Instagram сокращения:
-     - `ov` → `ов`, `ev` → `ев`, `iy`/`y` на конце → `ий`/`ый`, `a` → `а`, `o` → `о`, `e` → `е` (или `э`), `zh` → `ж`, `sh` → `ш`, `ch` → `ч`, `ya` → `я`, `yu` → `ю`, `kh` → `х`, `ts` → `ц` и т.д.
-     - Примеры: `ivanov` → `Иванов`, `oleg` → `Олег`, `smirnoff` → `Смирнов`, `anna.petrova` → `Анна Петрова` (разделитель `.` / `_` / `-` можно трактовать как пробел).
-   - Полученную русскую строку (или набор слов, если были разделители) сравни с именами и фамилиями кандидатов.
-
-   Далее действуй по ситуации (с учётом того, что ФИО могло дать зацепки на шаге 2):
-
-   **А) Если из ФИО уже известно имя** (одно слово совпало с именем кандидата):
-      - Среди кандидатов с таким же именем найди того, чья фамилия (полностью или начальная часть) содержится в транслитерированном нике. Например, имя `Олег` и ник `oleg.ivanov` → фамилия `Иванов` найдена.
-      - Если такой кандидат ровно один, уверенность 9/10 – верни его номер.
-      - Если подходящих кандидатов несколько (однофамильцы с разными именами не могут быть, т.к. мы уже отфильтровали по имени; остаются только дубли ФИО) – верни номер первого из них.
-      - Если ник не содержит фамилии ни одного из кандидатов с этим именем, уверенность ниже 7/10 – верни 0.
-
-   **Б) Если из ФИО известна только фамилия** (одно слово совпало с фамилией):
-      - Проверь, содержит ли транслитерированный ник ещё и имя того кандидата, чья фамилия найдена.
-      - Если имя кандидата обнаружено в нике (вместе с фамилией) и такой кандидат один – уверенность 9/10, верни его номер.
-      - Если имя не найдено, но фамилия уникальна (встречается ровно у одного кандидата) – уверенность 8/10, верни номер.
-      - Если фамилия есть у нескольких кандидатов **с разными именами** – уверенность ниже 7/10, верни 0.
-      - Если фамилия есть у нескольких кандидатов **с одинаковыми ФИО** (дубли) – считай это одним кандидатом и верни номер первого.
-
-   **В) Если ФИО полностью отсутствует или не дало зацепок:**
-      - Ищи в транслитерированном нике одновременно имя и фамилию одного кандидата (в любом порядке, возможно с разделителями). При уникальном совпадении – уверенность 9/10, верни номер.
-      - Если найдена только фамилия и она принадлежит ровно одному кандидату – уверенность 8/10, верни его номер.
-      - Если найдена только фамилия, но она есть у нескольких кандидатов с разными именами – уверенность ниже 7/10, верни 0. Если же это дубли (одинаковые ФИО), верни номер первого.
-      - Если найдено только имя, а кандидатов с таким именем больше одного – уверенность ниже 7/10, верни 0.
-
-4. **Финальная проверка уверенности.**
-   - Возвращай номер кандидата, только если уверенность по описанным правилам не ниже 7 из 10.
-   - Если ни один из шагов не дал достаточной уверенности, верни 0.
-   - **Всегда, когда в списке есть кандидаты с полностью одинаковыми ФИО, при совпадении отдавай номер первого из них.**
-
-#Данные:
-Ник пользователя из Instagram: "{username}"
-ФИО пользователя из Instagram: "{full_name}"
-
-Список потенциальных кандидатов: {candidates}
-
-#Формат ответа:
-В ответе ты должен указать номер кандидата, которому принадлежит этот аккаунт только в том случае, если ты уверен, что этот аккаунт принадлежит этому кандидату минимум на 7/10. Если ты не уверен, отдай 0.
-Если ты нашел совпадение, но в списке потенциальных кандидатов есть еще такие же одинаковые ФИО, отдай номер первого из них.
-Ответь ТОЛЬКО одной цифрой, которая соответствует номеру кандидата, либо 0, если ник пользователя из Instagram и его ФИО не принадлежат ни одному кандидату.
-"""
 
 
 def _sherlock_photo_results_list(result: dict | None) -> list:
@@ -842,6 +766,7 @@ def _deepseek_usermatch_pick_index(
     ig_username: str,
     ig_full_name: str,
     persons: list,
+    usermatch_prompt: str,
 ) -> tuple[int | None, str | None]:
     """Return ``(pick, api_error)``.
 
@@ -851,7 +776,7 @@ def _deepseek_usermatch_pick_index(
       ``None`` when the API returned a usable answer (including decline).
     """
     candidates_block = _format_candidates_for_prompt(persons)
-    system_prompt = USERMATCH_PROMPT.format(
+    system_prompt = usermatch_prompt.format(
         username=ig_username,
         full_name=ig_full_name,
         candidates=candidates_block,
@@ -909,6 +834,7 @@ def _resolve_one_lead_via_sherlock(
     photo_cfg: dict,
     task_cfg: dict,
     deepseek: OpenAI | None = None,
+    usermatch_prompt: str,
 ) -> dict:
     """Run the full nick->photo flow for one lead.
 
@@ -920,7 +846,7 @@ def _resolve_one_lead_via_sherlock(
 
     Photo stage: if ``results[0].status`` contains "точное совпадение",
     ``phone`` / ``link`` are taken from that row. Otherwise every row
-    with a non-null ``person`` is sent to DeepSeek (``USERMATCH_PROMPT``)
+    with a non-null ``person`` is sent to DeepSeek (``deepseek.usermatch_prompt``)
     with the lead's Instagram ``username`` and ``full_name``; the model
     picks at most one candidate. Missing client, no candidates, or no
     confident pick → ``no_match`` without contact fields.
@@ -1120,6 +1046,7 @@ def _resolve_one_lead_via_sherlock(
             ig_username=username,
             ig_full_name=str(lead.get("full_name") or ""),
             persons=persons,
+            usermatch_prompt=usermatch_prompt,
         )
         out["step5_deepseek_called"] = True
         out["step5_deepseek_api_failed"] = deepseek_api_error is not None
@@ -1192,6 +1119,7 @@ def _step_5_resolve_contacts_via_sherlock(
     issues: list[tuple[str, str]],
     tg_notifier: PipelineTelegramNotifier,
     deepseek: OpenAI | None,
+    usermatch_prompt: str,
 ) -> None:
     """Run Sherlock contact resolution for naked leads (parallel or sequential).
 
@@ -1404,6 +1332,7 @@ def _step_5_resolve_contacts_via_sherlock(
                         photo_cfg=photo_cfg,
                         task_cfg=task_cfg,
                         deepseek=deepseek,
+                        usermatch_prompt=usermatch_prompt,
                     )
                 except Exception as exc:  # noqa: BLE001
                     res = _worker_error_payload(username, exc)
@@ -1421,6 +1350,7 @@ def _step_5_resolve_contacts_via_sherlock(
                         photo_cfg=photo_cfg,
                         task_cfg=task_cfg,
                         deepseek=deepseek,
+                        usermatch_prompt=usermatch_prompt,
                     ): lead
                     for lead in candidates
                 }
@@ -1607,6 +1537,8 @@ def main():
     args = _parse_cli_args()
     load_dotenv()
     cfg = load_config()
+    relevance_prompt = deepseek_relevance_prompt(cfg)
+    usermatch_prompt = deepseek_usermatch_prompt(cfg)
     tg_notifier = PipelineTelegramNotifier.from_config(cfg)
     apify = ApifyClient(os.environ["APIFY_API_TOKEN"])
     deepseek = OpenAI(
@@ -2253,7 +2185,9 @@ def main():
             continue
 
         deepseek_calls += 1
-        raw_score = score_caption(deepseek, combined)
+        raw_score = score_caption(
+            deepseek, combined, relevance_prompt=relevance_prompt
+        )
         if "error" in raw_score:
             deepseek_failed += 1
         else:
@@ -2789,6 +2723,7 @@ def main():
             issues=issues,
             tg_notifier=tg_notifier,
             deepseek=deepseek,
+            usermatch_prompt=usermatch_prompt,
         )
 
     # ============================================================
