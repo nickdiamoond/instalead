@@ -1421,17 +1421,14 @@ def _step_5_resolve_contacts_via_sherlock(
                         res = _worker_error_payload(username, exc)
                     _apply_step5_result(lead, res, i)
 
-        # Final breakdown.
-        print()
-        print(f"  DONE: {n} processed")
-        for label in (
-            SH_STATUS_FOUND_NICK,
-            SH_STATUS_FOUND_PHOTO,
-            SH_STATUS_NO_MATCH,
-            SH_STATUS_NO_FACE_PHOTO,
-            SH_STATUS_ERROR,
-        ):
-            print(f"    {label:<18} {counters.get(label, 0)}")
+        print(f"\n  DONE: {n} lead(s) processed via Sherlock")
+        tg_notifier.notify_step5_sherlock_summary(
+            pulled=n,
+            batch_limit=batch_limit,
+            counters=counters,
+            step5_deepseek_calls=step5_deepseek_calls,
+            step5_deepseek_api_ok=step5_deepseek_api_ok,
+        )
 
         log.info(
             "step5_done",

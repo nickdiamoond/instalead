@@ -177,6 +177,46 @@ def build_step1_pipeline_summary_telegram_text(
     return "\n".join(lines)
 
 
+def build_step5_sherlock_summary_telegram_text(
+    *,
+    pulled: int,
+    batch_limit: int,
+    counters: dict[str, int],
+    step5_deepseek_calls: int = 0,
+    step5_deepseek_api_ok: int = 0,
+) -> str:
+    """Single Step 5 Telegram message: run totals after Sherlock batch (``\\n``-separated)."""
+    found_nick = counters.get("found_nick", 0)
+    found_photo = counters.get("found_photo", 0)
+    no_match = counters.get("no_match", 0)
+    no_face = counters.get("no_face_photo", 0)
+    errors = counters.get("error", 0)
+    found_total = found_nick + found_photo
+    not_found = no_match + no_face
+
+    lines: list[str] = [
+        "Step 5",
+        "",
+        "Sherlock summary",
+        f"Leads pulled from DB (this run): {pulled} (batch limit {batch_limit})",
+        f"Contact found (total): {found_total}",
+        f"Found via nick: {found_nick}",
+        f"Found via photo: {found_photo}",
+        f"Not found: {not_found}",
+    ]
+    if no_match or no_face:
+        lines.append(f"  no_match: {no_match}")
+        lines.append(f"  no_face_photo: {no_face}")
+    if errors:
+        lines.append(f"Errors: {errors}")
+    if step5_deepseek_calls:
+        lines.append(
+            f"DeepSeek usermatch: {step5_deepseek_api_ok}/"
+            f"{step5_deepseek_calls} API ok"
+        )
+    return "\n".join(lines)
+
+
 def step1_display_content_type(item: dict[str, Any]) -> str:
     """Map Apify ``type`` / ``productType`` to Image | Video | Sidecar."""
     raw = (item.get("type") or "").strip()
@@ -931,6 +971,29 @@ class PipelineTelegramNotifier:
             f"{without_suitable_photo} lead(s) without suitable photo; \n"
             f"{contacts_from_bio} lead(s) with bio/contact fields from "
             "extract_contacts."
+        )
+        self._send_sync(text)
+
+    def notify_step5_sherlock_summary(
+        self,
+        *,
+        pulled: int,
+        batch_limit: int,
+        counters: dict[str, int],
+        step5_deepseek_calls: int = 0,
+        step5_deepseek_api_ok: int = 0,
+    ) -> None:
+        """Post-run Step 5 totals to ``telegram.report_chat_id``."""
+        if not self._enabled or pulled <= 0:
+            return
+        text = truncate_for_telegram(
+            build_step5_sherlock_summary_telegram_text(
+                pulled=pulled,
+                batch_limit=batch_limit,
+                counters=counters,
+                step5_deepseek_calls=step5_deepseek_calls,
+                step5_deepseek_api_ok=step5_deepseek_api_ok,
+            )
         )
         self._send_sync(text)
 

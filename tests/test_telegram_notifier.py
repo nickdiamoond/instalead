@@ -21,6 +21,7 @@ from src.telegram_notifier import (
     build_step1_date_filter_section_lines,
     build_step1_new_post_message,
     build_step1_pipeline_summary_telegram_text,
+    build_step5_sherlock_summary_telegram_text,
     build_step2_human_confirm_body,
     build_step2_scored_post_message,
     is_apify_run_failure_status,
@@ -329,6 +330,33 @@ def test_build_step1_pipeline_summary_telegram_multiline() -> None:
     assert "posts_max_age_days = 7" in text
     assert "Dropped — older than window: 9" in text
     assert "Gate breakdown" in text
+
+
+def test_build_step5_sherlock_summary_telegram_multiline() -> None:
+    text = build_step5_sherlock_summary_telegram_text(
+        pulled=42,
+        batch_limit=1000,
+        counters={
+            "found_nick": 3,
+            "found_photo": 4,
+            "no_match": 31,
+            "no_face_photo": 2,
+            "error": 2,
+        },
+        step5_deepseek_calls=2,
+        step5_deepseek_api_ok=1,
+    )
+    assert "\n" in text
+    assert "Step 5" in text
+    assert "Sherlock summary" in text
+    assert "Leads pulled from DB (this run): 42 (batch limit 1000)" in text
+    assert "Contact found (total): 7" in text
+    assert "Found via nick: 3" in text
+    assert "Found via photo: 4" in text
+    assert "Not found: 33" in text
+    assert "no_match: 31" in text
+    assert "Errors: 2" in text
+    assert "DeepSeek usermatch: 1/2 API ok" in text
 
 
 def test_step1_display_content_type_known() -> None:
@@ -689,6 +717,57 @@ def test_notifier_step4_sends_via_bot(mock_bot_class: MagicMock) -> None:
     assert "5 face photo(s) via face_leader" in text
     assert "25 lead(s) without suitable photo" in text
     assert "10 lead(s) with bio/contact" in text
+
+
+def test_notifier_step5_summary_skips_when_no_token() -> None:
+    n = PipelineTelegramNotifier(None, -123, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.notify_step5_sherlock_summary(
+            pulled=10,
+            batch_limit=1000,
+            counters={"found_nick": 1, "found_photo": 0, "no_match": 9},
+        )
+    mock_run.assert_not_called()
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notifier_step5_summary_sends_via_bot(mock_bot_class: MagicMock) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -1, enabled=True)
+    n.notify_step5_sherlock_summary(
+        pulled=5,
+        batch_limit=100,
+        counters={
+            "found_nick": 1,
+            "found_photo": 2,
+            "no_match": 2,
+            "no_face_photo": 0,
+            "error": 0,
+        },
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "Step 5" in text
+    assert "Sherlock summary" in text
+    assert "Leads pulled from DB (this run): 5 (batch limit 100)" in text
+    assert "Found via nick: 1" in text
+    assert "Found via photo: 2" in text
+
+
+def test_notifier_step5_summary_skips_zero_pulled() -> None:
+    n = PipelineTelegramNotifier("fake-token", -1, enabled=True)
+    with patch("src.telegram_notifier.asyncio.run") as mock_run:
+        n.notify_step5_sherlock_summary(
+            pulled=0,
+            batch_limit=1000,
+            counters={},
+        )
+    mock_run.assert_not_called()
 
 
 def test_send_sync_retries_on_network_error() -> None:
