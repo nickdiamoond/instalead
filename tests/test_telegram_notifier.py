@@ -14,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
     _STEP1_NEW_POST_MESSAGE_DELAY_SEC,
+    _STEP3_COMMENT_CAP_ALERT_DELAY_SEC,
     build_apify_run_alert_text,
     build_deepseek_batch_all_failed_alert_text,
     build_nexara_batch_all_failed_alert_text,
     build_sherlock_batch_all_failed_alert_text,
+    build_step3_comment_cap_alert_text,
     build_step1_date_filter_section_lines,
     build_step1_new_post_message,
     build_step1_pipeline_summary_telegram_text,
@@ -294,6 +296,71 @@ def test_maybe_notify_sherlock_batch_all_failed_skips_partial_errors(
         error_count=4,
     )
     mock_bot.send_message.assert_not_awaited()
+
+
+def test_build_step3_comment_cap_alert_text() -> None:
+    text = build_step3_comment_cap_alert_text(
+        "https://www.instagram.com/p/ABC/",
+        1200,
+        50,
+    )
+    assert "https://www.instagram.com/p/ABC/" in text
+    assert "1200 комментариев" in text
+    assert "50 комментариев" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_step3_posts_over_comment_cap_sends_to_alert_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.notify_step3_posts_over_comment_cap(
+        [{"post_url": "https://www.instagram.com/p/X/", "comments_count": 600}],
+        cap_per_post=50,
+    )
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+    assert "600 комментариев" in mock_bot.send_message.await_args.kwargs["text"]
+    assert "50 комментариев" in mock_bot.send_message.await_args.kwargs["text"]
+
+
+@patch("src.telegram_notifier.time.sleep")
+@patch("src.telegram_notifier.Bot")
+def test_notify_step3_posts_over_comment_cap_sleeps_between(
+    mock_bot_class: MagicMock, mock_sleep: MagicMock
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.notify_step3_posts_over_comment_cap(
+        [
+            {"post_url": "https://www.instagram.com/p/A/", "comments_count": 600},
+            {"post_url": "https://www.instagram.com/p/B/", "comments_count": 800},
+        ],
+        cap_per_post=50,
+    )
+
+    assert mock_bot.send_message.await_count == 2
+    mock_sleep.assert_called_once_with(_STEP3_COMMENT_CAP_ALERT_DELAY_SEC)
 
 
 def test_maybe_notify_apify_run_failure_no_alert_chat() -> None:

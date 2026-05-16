@@ -26,6 +26,8 @@ log = get_logger("telegram_notifier")
 
 # Pause between Step 1 per-post Telegram messages (rate limits / UX).
 _STEP1_NEW_POST_MESSAGE_DELAY_SEC = 2.0
+# Pause between Step 3 comment-cap alerts to ``telegram.alert_chat_id``.
+_STEP3_COMMENT_CAP_ALERT_DELAY_SEC = 3.0
 
 TOKEN_ENV_VAR = "TELEGRAM_BOT_TOKEN"
 
@@ -733,6 +735,18 @@ def build_deepseek_batch_all_failed_alert_text(
     )
 
 
+def build_step3_comment_cap_alert_text(
+    post_url: str,
+    comments_count: int,
+    cap_per_post: int,
+) -> str:
+    """Alert when a queued post exceeds ``louisdeconinck_comments_cap_per_post``."""
+    return (
+        f"Пост {post_url} содержит {comments_count} комментариев. "
+        f"Мы обработаем только {cap_per_post} комментариев."
+    )
+
+
 class PipelineTelegramNotifier:
     """Fire-and-forget messages to ``telegram.report_chat_id``."""
 
@@ -898,6 +912,38 @@ class PipelineTelegramNotifier:
             deepseek_calls=deepseek_calls,
         )
         self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def notify_step3_posts_over_comment_cap(
+        self,
+        posts: list[dict[str, Any]],
+        *,
+        cap_per_post: int,
+    ) -> None:
+        """Alert ``telegram.alert_chat_id`` for posts above the louisdeconinck cap."""
+        if not self._alerts_enabled or self._alert_chat_id is None or not posts:
+            return
+        actionable = [
+            p
+            for p in posts
+            if (p.get("post_url") or p.get("post_id") or "").strip()
+        ]
+        for i, post in enumerate(actionable):
+            post_url = (post.get("post_url") or post.get("post_id") or "").strip()
+            comments_count = int(post.get("comments_count") or 0)
+            text = truncate_for_telegram(
+                build_step3_comment_cap_alert_text(
+                    post_url, comments_count, cap_per_post
+                )
+            )
+            log.warning(
+                "step3_post_over_comment_cap_alert",
+                post_url=post_url,
+                comments_count=comments_count,
+                cap_per_post=cap_per_post,
+            )
+            self._send_sync(text, chat_id=self._alert_chat_id)
+            if i + 1 < len(actionable):
+                time.sleep(_STEP3_COMMENT_CAP_ALERT_DELAY_SEC)
 
     def notify_step1(
         self,

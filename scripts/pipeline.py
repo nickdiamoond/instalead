@@ -2373,6 +2373,17 @@ def main():
         if confirm == "y":
             urls = [p["post_url"] for p in posts_to_scan if p.get("post_url")]
 
+            posts_over_comment_cap = [
+                p
+                for p in posts_to_scan
+                if (p.get("comments_count") or 0) > louisdeconinck_cap
+            ]
+            if posts_over_comment_cap:
+                tg_notifier.notify_step3_posts_over_comment_cap(
+                    posts_over_comment_cap,
+                    cap_per_post=louisdeconinck_cap,
+                )
+
             # Read actor IDs from config so swapping primary/fallback
             # is a config edit, not a code change. Defaults preserve
             # the historical behavior if the keys are missing.
