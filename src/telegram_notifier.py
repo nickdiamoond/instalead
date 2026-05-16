@@ -50,7 +50,7 @@ def _is_retryable_telegram_send_error(exc: BaseException) -> bool:
         return True
     return False
 
-# Must match scripts/pipeline.py SH_STATUS_* labels (avoid importing pipeline).
+# Must match scripts/pipeline_lib.constants SH_STATUS_* labels (avoid importing pipeline).
 _SH_FOUND_NICK = "found_nick"
 _SH_FOUND_PHOTO = "found_photo"
 _SH_NO_MATCH = "no_match"

@@ -59,9 +59,9 @@ search:
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -1003909022341 #-1003926996735
-  result_chat_id: -1003926996735 #Chat for clear results and confirmations only no logs
-  alert_chat_id: -1003926996735 #Chat for alerts and notifications only no logs
+  report_chat_id: -5255644193 #-1003909022341 #-1003926996735
+  result_chat_id: -5272096712 #-1003926996735 #Chat for clear results and confirmations only no logs
+  alert_chat_id: -5272096712 #-1003926996735 #Chat for alerts and notifications only no logs
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
@@ -115,10 +115,10 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 50
+    louisdeconinck_comments_cap_per_post: 20
     # Step 3 fallback (apidojo-api): actor input maxItems is a run-wide
     # total, not per-post. Pipeline sends maxItems = cap * posts_in_batch.
-    apidojo_comments_cap_per_post: 10000
+    apidojo_comments_cap_per_post: 1000
 
   step4:
     # apify/instagram-profile-scraper batch size. Apify accepts up
@@ -128,14 +128,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 100
+    batch_limit: 20
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
-    batch_limit: 30
+    batch_limit: 5
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to
     # restore parallel Step 5.
