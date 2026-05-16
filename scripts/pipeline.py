@@ -146,7 +146,8 @@ DEFAULT_COMMENTS_FALLBACK_ACTOR = "apidojo/instagram-comments-scraper-api"
 # louisdeconinck silently returns 0 items with status=SUCCEEDED if its
 # input is missing a per-post comment cap -- bisected via
 # ``scripts/test_comment_scrapers.py`` (recipe 1 -> recipe 3). The
-# fallback (apidojo-api) has no such requirement and is left alone.
+# fallback (apidojo-api) uses ``maxItems`` (run-wide); see
+# ``DEFAULT_APIFY_COMMENTS_CAP_PER_POST`` / ``apidojo_comments_cap_per_post``.
 #
 # 10_000 is a *ceiling*, not a target: the actor returns only
 # comments that actually exist on the post, so a higher cap doesn't
@@ -157,6 +158,12 @@ DEFAULT_COMMENTS_FALLBACK_ACTOR = "apidojo/instagram-comments-scraper-api"
 # ``_fetch_comments_with_fallback``. Override via
 # ``pipeline.step3.louisdeconinck_comments_cap_per_post`` in config.
 DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST = 10_000
+
+# apidojo-api (Step 3 fallback) exposes ``maxItems`` as a run-wide total,
+# not per-post. The pipeline sets ``maxItems = cap * len(urls)`` so the
+# knob mirrors louisdeconinck's per-post ceiling. Override via
+# ``pipeline.step3.apidojo_comments_cap_per_post`` in config.
+DEFAULT_APIFY_COMMENTS_CAP_PER_POST = 10_000
 
 # When true, Step 3 / Step 5 ask ``Proceed? (y/n)`` before spendy work, and
 # the script waits for Enter after reporting issues. Set false in config for
@@ -540,6 +547,7 @@ def _fetch_comments_with_fallback(
     primary_actor: str,
     fallback_actor: str,
     louisdeconinck_cap_per_post: int,
+    apidojo_cap_per_post: int,
     tg_notifier: PipelineTelegramNotifier | None = None,
 ) -> tuple[list[dict], float, str, dict]:
     """Pull comments for ``urls`` with primary -> apidojo-api fallback.
@@ -578,11 +586,9 @@ def _fetch_comments_with_fallback(
     #   actor: omitting them is the actual reason Step 3 has been
     #   silently returning 0 items even with proxy on (recipe 3
     #   confirmed it -- the cap is what makes the actor commit
-    #   instead of bailing out). The fallback (apidojo-api) does
-    #   NOT need this and intentionally keeps its uncapped shape.
-    #   ``louisdeconinck_cap_per_post`` is set well above any
-    #   per-post comment count we've ever seen, so it acts as a
-    #   safety ceiling rather than a real cap.
+    #   instead of bailing out). ``louisdeconinck_cap_per_post`` is
+    #   set well above any per-post comment count we've ever seen,
+    #   so it acts as a safety ceiling rather than a real cap.
     primary_items, primary_cost, primary_run = _run_apify_actor(
         apify,
         pipeline,
@@ -621,21 +627,26 @@ def _fetch_comments_with_fallback(
         msg="primary returned 0 items, retrying via fallback",
     )
 
+    apidojo_max_items = apidojo_cap_per_post * max(len(urls), 1)
     fb_raw, fb_cost, fb_run = _run_apify_actor(
         apify,
         pipeline,
         fallback_actor,
-        # apidojo-api takes ``startUrls`` (flat string array) + ``maxItems``.
-        # Omitting maxItems lets it fetch every comment, matching the
-        # primary's "no per-post cap" behavior. ``proxy: useApifyProxy``
-        # is harmless if the actor's input schema doesn't declare it
-        # (Apify silently drops unknown fields) and matches the rest of
-        # the pipeline's Apify calls -- see the primary above.
+        # apidojo-api: ``startUrls`` + run-wide ``maxItems``. We derive
+        # maxItems from ``apidojo_cap_per_post`` × post count so the
+        # config knob matches louisdeconinck's per-post ceiling in spirit.
+        # ``proxy: useApifyProxy`` is harmless if undeclared in schema.
         run_input={
             "startUrls": urls,
             "proxy": {"useApifyProxy": True},
+            "maxItems": apidojo_max_items,
         },
-        log_input={"startUrls_count": len(urls), "fallback": True},
+        log_input={
+            "startUrls_count": len(urls),
+            "max_items": apidojo_max_items,
+            "apidojo_cap_per_post": apidojo_cap_per_post,
+            "fallback": True,
+        },
         tg_notifier=tg_notifier,
         apify_step="Step 3 (comments fallback)",
     )
@@ -1671,6 +1682,12 @@ def main():
             DEFAULT_LOUISDECONINCK_COMMENTS_CAP_PER_POST,
         )
     )
+    apidojo_cap = int(
+        s3_cfg.get(
+            "apidojo_comments_cap_per_post",
+            DEFAULT_APIFY_COMMENTS_CAP_PER_POST,
+        )
+    )
     profile_batch_size = int(
         s4_cfg.get("profile_batch_size", DEFAULT_PROFILE_BATCH_SIZE)
     )
@@ -2374,6 +2391,7 @@ def main():
                 primary_actor=primary_actor,
                 fallback_actor=fallback_actor,
                 louisdeconinck_cap_per_post=louisdeconinck_cap,
+                apidojo_cap_per_post=apidojo_cap,
                 tg_notifier=tg_notifier,
             )
 

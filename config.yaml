@@ -116,6 +116,9 @@ pipeline:
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
     louisdeconinck_comments_cap_per_post: 50
+    # Step 3 fallback (apidojo-api): actor input maxItems is a run-wide
+    # total, not per-post. Pipeline sends maxItems = cap * posts_in_batch.
+    apidojo_comments_cap_per_post: 10000
 
   step4:
     # apify/instagram-profile-scraper batch size. Apify accepts up
