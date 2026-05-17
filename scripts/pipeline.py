@@ -110,6 +110,26 @@ from scripts.pipeline_lib.step6_cleanup import _step_6_cleanup_spent_face_assets
 
 setup_logging()
 
+
+def _step1_apify_actor_call(
+    apify: ApifyClient,
+    tg_notifier: PipelineTelegramNotifier,
+    issues: list[tuple[str, str]],
+    *,
+    actor_id: str,
+    run_input: dict,
+) -> dict | None:
+    """Run a Step 1 Apify actor; on exception alert, log, and return None."""
+    try:
+        return apify.actor(actor_id).call(run_input=run_input)
+    except Exception as e:
+        log.error("step1_apify_call_failed", actor_id=actor_id, error=str(e))
+        print(f"FAILED: Step 1 Apify call ({actor_id}): {e}")
+        tg_notifier.notify_step1_apify_call_error(e)
+        issues.append(("Step 1", f"Apify call error ({actor_id}): {e}"))
+        return None
+
+
 def main():
     args = _parse_cli_args()
     load_dotenv()
@@ -274,13 +294,21 @@ def main():
             post_scraper_results_limit=post_scraper_results_limit,
         )
 
-        run = apify.actor("apify/instagram-post-scraper").call(run_input={
-            "username": realtors,
-            "resultsLimit": post_scraper_results_limit,
-            "onlyPostsNewerThan": f"{posts_max_age_days} days",
-            "dataDetailLevel": "basicData",
-            "proxy": {"useApifyProxy": True},
-        })
+        run = _step1_apify_actor_call(
+            apify,
+            tg_notifier,
+            issues,
+            actor_id="apify/instagram-post-scraper",
+            run_input={
+                "username": realtors,
+                "resultsLimit": post_scraper_results_limit,
+                "onlyPostsNewerThan": f"{posts_max_age_days} days",
+                "dataDetailLevel": "basicData",
+                "proxy": {"useApifyProxy": True},
+            },
+        )
+        if run is None:
+            return
         tg_notifier.maybe_notify_apify_run_failure(
             run,
             actor_id="apify/instagram-post-scraper",
@@ -348,9 +376,15 @@ def main():
             "proxy": proxy_in,
         }
 
-        run_p = apify.actor(hashtag_actor_id).call(
-            run_input={**run_base, "resultsType": "posts"}
+        run_p = _step1_apify_actor_call(
+            apify,
+            tg_notifier,
+            issues,
+            actor_id=hashtag_actor_id,
+            run_input={**run_base, "resultsType": "posts"},
         )
+        if run_p is None:
+            return
         tg_notifier.maybe_notify_apify_run_failure(
             run_p, actor_id=hashtag_actor_id, step="Step 1 (hashtag posts)"
         )
@@ -375,9 +409,15 @@ def main():
             duration_ms=detail_p.get("stats", {}).get("durationMillis"),
         )
 
-        run_r = apify.actor(hashtag_actor_id).call(
-            run_input={**run_base, "resultsType": "reels"}
+        run_r = _step1_apify_actor_call(
+            apify,
+            tg_notifier,
+            issues,
+            actor_id=hashtag_actor_id,
+            run_input={**run_base, "resultsType": "reels"},
         )
+        if run_r is None:
+            return
         tg_notifier.maybe_notify_apify_run_failure(
             run_r, actor_id=hashtag_actor_id, step="Step 1 (hashtag reels)"
         )
@@ -469,14 +509,20 @@ def main():
             cookie_env_var=cookie_var,
         )
 
-        run_kw = apify.actor(cookie_search_actor_id).call(
+        run_kw = _step1_apify_actor_call(
+            apify,
+            tg_notifier,
+            issues,
+            actor_id=cookie_search_actor_id,
             run_input={
                 "keywords": keywords,
                 "maxPosts": max_posts,
                 "cookies": cookies_payload,
                 "sessionName": session_name,
-            }
+            },
         )
+        if run_kw is None:
+            return
         tg_notifier.maybe_notify_apify_run_failure(
             run_kw, actor_id=cookie_search_actor_id, step="Step 1"
         )
@@ -906,16 +952,24 @@ def main():
                 "comments_fallback", DEFAULT_COMMENTS_FALLBACK_ACTOR
             )
 
-            items, cost, source, debug = _fetch_comments_with_fallback(
-                apify,
-                pipeline,
-                urls,
-                primary_actor=primary_actor,
-                fallback_actor=fallback_actor,
-                louisdeconinck_cap_per_post=louisdeconinck_cap,
-                apidojo_cap_per_post=apidojo_cap,
-                tg_notifier=tg_notifier,
-            )
+            step3_fetch_ok = True
+            try:
+                items, cost, source, debug = _fetch_comments_with_fallback(
+                    apify,
+                    pipeline,
+                    urls,
+                    primary_actor=primary_actor,
+                    fallback_actor=fallback_actor,
+                    louisdeconinck_cap_per_post=louisdeconinck_cap,
+                    apidojo_cap_per_post=apidojo_cap,
+                    tg_notifier=tg_notifier,
+                )
+            except Exception as e:
+                step3_fetch_ok = False
+                log.error("step3_fetch_comments_failed", error=str(e))
+                print(f"FAILED: Step 3 comment fetch: {e}")
+                tg_notifier.notify_step3_apify_call_error(e)
+                issues.append(("Step 3", f"Apify comment fetch error: {e}"))
 
             # Bail out *before* marking anything as scanned if both the
             # primary and the fallback returned an empty dataset.
@@ -927,7 +981,7 @@ def main():
             # tens of thousands of real commenters. Treat as a transient
             # failure and leave the queue untouched so the next run
             # retries them.
-            if source == "both-empty":
+            if step3_fetch_ok and source == "both-empty":
                 log.warning(
                     "step3_empty_after_fallback",
                     posts=len(posts_to_scan),
@@ -968,7 +1022,7 @@ def main():
                     f"fallback {debug.get('fallback_run_id')}); "
                     f"queue preserved for retry",
                 ))
-            else:
+            elif step3_fetch_ok:
                 # Surface the fallback path (if it fired) at the top of
                 # the success block so the operator sees right away that
                 # we paid twice -- once for the empty primary, once for
@@ -1111,9 +1165,20 @@ def main():
         for i in range(0, len(usernames), profile_batch_size):
             batch = usernames[i:i + profile_batch_size]
 
-            run = apify.actor("apify/instagram-profile-scraper").call(run_input={
-                "usernames": batch,
-            })
+            try:
+                run = apify.actor("apify/instagram-profile-scraper").call(
+                    run_input={"usernames": batch}
+                )
+            except Exception as e:
+                log.error(
+                    "step4_fetch_profiles_failed",
+                    batch_size=len(batch),
+                    error=str(e),
+                )
+                print(f"FAILED: Step 4 profile fetch (batch): {e}")
+                tg_notifier.notify_step4_apify_call_error(e)
+                issues.append(("Step 4", f"Apify profile fetch error: {e}"))
+                continue
             tg_notifier.maybe_notify_apify_run_failure(
                 run,
                 actor_id="apify/instagram-profile-scraper",

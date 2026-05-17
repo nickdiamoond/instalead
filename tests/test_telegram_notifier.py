@@ -16,6 +16,9 @@ from src.telegram_notifier import (
     _STEP1_NEW_POST_MESSAGE_DELAY_SEC,
     _STEP3_COMMENT_CAP_ALERT_DELAY_SEC,
     build_apify_run_alert_text,
+    build_step1_apify_call_error_alert_text,
+    build_step3_apify_call_error_alert_text,
+    build_step4_apify_call_error_alert_text,
     build_deepseek_batch_all_failed_alert_text,
     build_nexara_batch_all_failed_alert_text,
     build_sherlock_batch_all_failed_alert_text,
@@ -76,6 +79,96 @@ def test_build_apify_run_alert_text() -> None:
     assert "Step: Step 1" in text
     assert "Status: FAILED" in text
     assert "Run: abc123" in text
+
+
+def test_build_step1_apify_call_error_alert_text() -> None:
+    text = build_step1_apify_call_error_alert_text(error="connection reset")
+    assert "ошибка на первом этапе APIFY" in text
+    assert "connection reset" in text
+
+
+def test_build_step3_apify_call_error_alert_text() -> None:
+    text = build_step3_apify_call_error_alert_text(error="rate limit")
+    assert "ошибка в шаге 3" in text
+    assert "rate limit" in text
+
+
+def test_build_step4_apify_call_error_alert_text() -> None:
+    text = build_step4_apify_call_error_alert_text(error="timeout")
+    assert "ошибка в шаге 4" in text
+    assert "timeout" in text
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_step1_apify_call_error_sends_to_alert_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.notify_step1_apify_call_error(RuntimeError("actor timeout"))
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+    body = mock_bot.send_message.await_args.kwargs["text"]
+    assert "ошибка на первом этапе APIFY" in body
+    assert "actor timeout" in body
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_step3_apify_call_error_sends_to_alert_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.notify_step3_apify_call_error(ValueError("bad dataset"))
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+    body = mock_bot.send_message.await_args.kwargs["text"]
+    assert "ошибка в шаге 3" in body
+    assert "bad dataset" in body
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_step4_apify_call_error_sends_to_alert_chat(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier(
+        "fake-token",
+        -42,
+        alert_chat_id=-777,
+        enabled=False,
+    )
+    n.notify_step4_apify_call_error(OSError("connection refused"))
+
+    mock_bot.send_message.assert_awaited_once()
+    assert mock_bot.send_message.await_args.kwargs["chat_id"] == -777
+    body = mock_bot.send_message.await_args.kwargs["text"]
+    assert "ошибка в шаге 4" in body
+    assert "connection refused" in body
 
 
 @patch("src.telegram_notifier.Bot")

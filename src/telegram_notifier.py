@@ -693,6 +693,24 @@ def build_apify_run_alert_text(
     return "\n".join(lines)
 
 
+def build_step1_apify_call_error_alert_text(*, error: str) -> str:
+    """Alert when Step 1 ``actor.call()`` raises before a run dict is returned."""
+    err = (error or "").strip() or "(no details)"
+    return f"ошибка на первом этапе APIFY\n{err}"
+
+
+def build_step3_apify_call_error_alert_text(*, error: str) -> str:
+    """Alert when Step 3 comment fetch raises before returning items."""
+    err = (error or "").strip() or "(no details)"
+    return f"ошибка в шаге 3\n{err}"
+
+
+def build_step4_apify_call_error_alert_text(*, error: str) -> str:
+    """Alert when Step 4 profile scraper ``actor.call()`` raises."""
+    err = (error or "").strip() or "(no details)"
+    return f"ошибка в шаге 4\n{err}"
+
+
 def build_sherlock_batch_all_failed_alert_text(*, leads_processed: int) -> str:
     """Alert when every lead in a Step 5 batch finished with ``sherlock_status=error``."""
     return "\n".join(
@@ -837,6 +855,39 @@ class PipelineTelegramNotifier:
             run_id=run_id,
             status=status,
         )
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def notify_step1_apify_call_error(self, error: BaseException | str) -> None:
+        """Send to ``alert_chat_id`` when Step 1 ``actor.call()`` raises."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        err_text = str(error) if not isinstance(error, str) else error
+        text = truncate_for_telegram(
+            build_step1_apify_call_error_alert_text(error=err_text)
+        )
+        log.warning("step1_apify_call_error_alert", error=err_text)
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def notify_step3_apify_call_error(self, error: BaseException | str) -> None:
+        """Send to ``alert_chat_id`` when Step 3 comment fetch raises."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        err_text = str(error) if not isinstance(error, str) else error
+        text = truncate_for_telegram(
+            build_step3_apify_call_error_alert_text(error=err_text)
+        )
+        log.warning("step3_apify_call_error_alert", error=err_text)
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def notify_step4_apify_call_error(self, error: BaseException | str) -> None:
+        """Send to ``alert_chat_id`` when Step 4 profile scraper ``actor.call()`` raises."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        err_text = str(error) if not isinstance(error, str) else error
+        text = truncate_for_telegram(
+            build_step4_apify_call_error_alert_text(error=err_text)
+        )
+        log.warning("step4_apify_call_error_alert", error=err_text)
         self._send_sync(text, chat_id=self._alert_chat_id)
 
     def maybe_notify_sherlock_batch_all_failed(

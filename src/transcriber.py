@@ -26,8 +26,8 @@ from src.pipeline_logger import PipelineLogger
 log = get_logger("transcriber")
 
 NEXARA_ENDPOINT = "https://api.nexara.ru/api/v1/audio/transcriptions"
-DEFAULT_HTTP_TIMEOUT = 30
-DEFAULT_API_TIMEOUT = 180
+DEFAULT_HTTP_TIMEOUT = 60
+DEFAULT_API_TIMEOUT = 300
 
 # Same UA as avatar_downloader — IG CDN otherwise returns 403 on
 # unauthenticated bot-flavored requests.
