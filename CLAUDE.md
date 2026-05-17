@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Instagram lead checker for real estate buyers (SPB focus). The system collects Instagram accounts of people interested in buying property (based on their comments on realtor reels/posts), then finds their contact information via Telegram.
 
 **Two main modules:**
-- **Module 1 (Instagram Collector):** Finds potential lead Instagram accounts by monitoring realtor accounts, collecting their posts/reels, scoring relevance via AI, and extracting commenters as leads.
-- **Module 2 (Contact Finder):** *(future)* Resolves Instagram accounts to phone numbers/Telegram contacts using Telegram SearchGlobalRequest and a face-recognition bot ("Sherlock bot").
+- **Module 1 (Instagram Collector):** Finds potential lead Instagram accounts by monitoring realtor accounts (or hashtags / cookie keyword search), collecting their posts/reels, scoring relevance via AI, and extracting commenters as leads.
+- **Module 2 (Contact Finder):** Resolves Instagram accounts to Telegram contacts via the external **Sherlock API** (Step 5: nick search, then photo search when `face_photo_path` exists). Bio contacts from Step 4 are tried first. **Telethon** (`SearchGlobalRequest`) is still future — not used in the daily pipeline.
 
 ## Tech Stack
 
@@ -24,21 +24,27 @@ Instagram lead checker for real estate buyers (SPB focus). The system collects I
 - InsightFace + onnxruntime — SCRFD face detection + ArcFace 512-d
  embeddings for same-person search (single detector across avatars and
  post photos)
+- Lingua — Step 2 language gate (non-Russian captions → `irrelevant` without DeepSeek)
+- Sherlock API — Step 5 contact resolution (`src/sherlock_client.py`)
+- Aiogram — Telegram bot notifications and Step 2/3 inline confirmations
+  (`src/telegram_notifier.py`, `src/telegram_inline_confirm.py`)
 
 Future (not yet implemented):
 - Telethon — Telegram client (SearchGlobalRequest)
-- Aiogram — Telegram bot for notifications
 - replicate.com — avatar upscaling
 
 ## Apify Actors Used
 
 | Actor | Purpose | Price |
 |---|---|---|
-| `apify/instagram-profile-scraper` | Profile info, relatedProfiles, latestPosts | ~$0.0023/profile |
-| `apify/instagram-post-scraper` | Posts/reels from accounts (batch, date filter) | ~$0.0017/post |
-| `crawlerbros/instagram-keyword-search-scraper` | Step 1 keyword search (cookie session; `search.cookie_search_keywords`) | Apify usage USD |
+| `apify/instagram-hashtag-scraper` | Step 1 posts/reels by hashtag (`discovery_mode=hashtags`) | ~$0.0023/post |
+| `apify/instagram-post-scraper` | Step 1 posts/reels from realtor accounts (`discovery_mode=realtors`) | ~$0.0017/post (basicData) |
+| `crawlerbros/instagram-keyword-search-scraper` | Step 1 keyword search (`discovery_mode=cookie_keywords`; `search.cookie_search_keywords`) | Apify usage USD |
 | `louisdeconinck/instagram-comments-scraper` | Comments for posts (Step 3 primary) | ~$1/1K comments |
 | `apidojo/instagram-comments-scraper-api` | Comments for posts (Step 3 fallback) | $0.0075/post + $0.0005/comment (15 free per post) |
+| `apify/instagram-profile-scraper` | Profile info, relatedProfiles, latestPosts (Step 4) | ~$0.0026/profile |
+
+Actor IDs are overridable via `config.yaml` → `apify.actors.*`. Legacy `apify/instagram-comment-scraper` is for dev/`ApifyWrapper` only — not the daily pipeline. See `docs/apify_api_schemas.md` for request/response shapes.
 
 **Comment scraper preference:** `louisdeconinck` is the **primary** because its
 snake_case Instagram-raw schema (`user.full_name`, `is_private`, `created_at_utc`,
@@ -64,14 +70,19 @@ either of these — bisected via `scripts/test_comment_scrapers.py`:
   downside.
 
 Both fields are applied **only on the primary call** in
-`_fetch_comments_with_fallback`. The fallback (`apidojo-api`) does not
-need them and intentionally keeps an uncapped shape.
+`scripts/pipeline_lib/apify_runner.py` → `_fetch_comments_with_fallback`.
+
+**apidojo-api fallback input** (same module): `startUrls` (post URLs), `proxy:
+{ useApifyProxy: true }`, and `maxItems = pipeline.step3.apidojo_comments_cap_per_post
+× len(urls)` (run-wide cap, default multiplier from
+`DEFAULT_APIFY_COMMENTS_CAP_PER_POST` in `scripts/pipeline_lib/defaults.py`). It does
+**not** use `resultsLimit` / `maxComments`.
 
 `apidojo/instagram-comments-scraper-api` is the **fallback** that fires when the
-primary returns 0 items per URL with `status=SUCCEEDED` (the historical failure
-mode -- now rare since we honor the input contract above, but kept as a safety
-net). Its camelCase output (`message`, `createdAt`, `userId`, `user.fullName`,
-...) is remapped to louisdeconinck's shape via
+primary returns **0 items for the entire batch** with `status=SUCCEEDED` (the
+historical failure mode -- now rare since we honor the primary input contract above,
+but kept as a safety net). Its camelCase output (`message`, `createdAt`, `userId`,
+`user.fullName`, ...) is remapped to louisdeconinck's shape via
 `src.comment_normalizer.normalize_apidojo_api` before saving, so the rest of
 Step 3 is actor-agnostic. Apidojo also exposes `postId` directly (= shortcode),
 so the synthesized `media_id` is exact and the fuzzy match is a no-op for
@@ -86,43 +97,40 @@ test code -- just swap the dict.
 
 ## Pipeline Architecture
 
-Daily pipeline (`scripts/pipeline.py`):
+Daily pipeline entrypoint: `scripts/pipeline.py` (orchestration). Step logic is
+split into `scripts/pipeline_lib/` (`defaults.py`, `apify_runner.py`, `scoring.py`,
+`step4_faces.py`, `step5_sherlock.py`, `step6_cleanup.py`, …).
 
 ```
 Step 1: Discover posts (config: pipeline.step1.discovery_mode)
-        Mode "realtors" (default): search.realtor_accounts in config.yaml →
-        instagram-post-scraper batch, onlyPostsNewerThan = pipeline.step1.posts_max_age_days,
-        resultsLimit = pipeline.step1.post_scraper_results_limit (pipeline code default if omitted in yaml).
-        Mode "hashtags": search.hashtags → two runs of
-        apify/instagram-hashtag-scraper (resultsType posts + reels),
-        resultsLimit = pipeline.step1.hashtag_results_limit (fallback:
-        post_scraper_results_limit). Hashtag actor has no onlyPostsNewerThan;
-        same max-age window applied client-side on item timestamps (UTC).
-        Merge posts+reels datasets by shortCode (prefer row with valid videoUrl).
-        Mode "cookie_keywords": search.cookie_search_keywords → single run of
-        crawlerbros/instagram-keyword-search-scraper (Instagram cookies from .env;
-        see search.cookie_search). Rows are normalized to the same Apify-shaped dicts
-        as hashtags, deduped by shortCode, then the same client-side max-age filter
-        (pipeline.step1.posts_max_age_days) as hashtags. Reels need a valid CDN videoUrl
-        (from media_urls) like the hashtag path.
-        Skip posts already in DB, update comments_count for existing.
-        Filter: commentsCount >= pipeline.step1.min_comments_per_post.
-        Video/Reel items (type Video or productType clips) require a valid
-        HTTPS Instagram/Facebook CDN videoUrl — otherwise skipped (not upserted).
+        Mode "realtors" (default): search.realtor_accounts →
+        apify/instagram-post-scraper: username[], resultsLimit,
+        onlyPostsNewerThan = "{posts_max_age_days} days", dataDetailLevel basicData,
+        proxy useApifyProxy. Plus client-side max-age filter on timestamp (UTC)
+        via src.ig_media_payload.filter_items_within_max_age (same helper as other modes).
+        Mode "hashtags": search.hashtags → two runs of apify/instagram-hashtag-scraper
+        (resultsType posts + reels), resultsLimit = hashtag_results_limit (fallback:
+        post_scraper_results_limit), proxy useApifyProxy. Hashtag actor has no
+        onlyPostsNewerThan — age filter client-side. Merge posts+reels by shortCode
+        (prefer row with valid videoUrl).
+        Mode "cookie_keywords": search.cookie_search_keywords →
+        crawlerbros/instagram-keyword-search-scraper (cookies from env;
+        pipeline.step1.cookie_search: size_per_keyword, session_cookie_env_var,
+        session_name). Normalize via src.instagram_cookie_search, dedupe by shortCode,
+        client-side age filter. Reels need valid CDN videoUrl from media_urls.
+        All modes: skip/update existing posts in DB; commentsCount >= min_comments;
+        reels require valid HTTPS Instagram/Facebook CDN videoUrl or not upserted.
 
-Step 2: Score new posts via DeepSeek (caption + transcript combined)
- Only posts with relevance=NULL.
- If the post has a fresh `videoUrl` from Step 1's in-memory pass,
- always download the video and transcribe it via Nexara (no
- caption-based gating). The pipeline then concatenates the two
- strings -- caption first, transcript second, separated by a
- blank line -- and runs RELEVANCE_PROMPT on the combined payload
- in a single DeepSeek call.
- IG video URLs are signed and expire in ~1-2 days, so transcription
- only fires for posts fetched in the *current* run. Older
- `relevance IS NULL` leftovers fall back to caption-only scoring
- on subsequent runs (or "unknown" if the caption is too short).
- Output: relevant / irrelevant / unknown + CTA type
+Step 2: Lingua language gate + DeepSeek scoring (caption + transcript)
+        Only posts with relevance=NULL.
+        Non-Russian text (Lingua) → irrelevant without a DeepSeek call.
+        If the post has a fresh videoUrl from Step 1's in-memory map, transcribe
+        via Nexara; concatenate caption + transcript; single DeepSeek RELEVANCE_PROMPT.
+        IG video URLs expire in ~1-2 days — transcription only for posts from the
+        current run; older NULL leftovers are caption-only (or unknown if empty).
+        Posts scored is_real_estate=true may get an optional Telegram inline human
+        confirm (aiogram) when the bot is configured.
+        Output: relevant / irrelevant / unknown + CTA type
 
 Step 3: Fetch comments (with cost confirmation prompt)
         Posts where: relevant + CTA=comment + (never scanned OR
@@ -135,29 +143,24 @@ Step 3: Fetch comments (with cost confirmation prompt)
                0 items with status=SUCCEEDED. See "louisdeconinck input
                contract" above for the bisection.
         Fallback actor: apidojo/instagram-comments-scraper-api
-            -- triggers automatically when the primary returns 0 items
-               for the entire batch (with status=SUCCEEDED). Apidojo's
-               camelCase output is normalized to louisdeconinck's shape
-               via src.comment_normalizer.normalize_apidojo_api, so the
-               dedup / save loop stays agnostic to the source actor.
-            -- the fallback is kept as a safety net even though the
-               primary's known failure mode is now blocked by the
-               mandatory input fields above.
-            -- if BOTH primary and fallback return empty, posts stay
-               unscanned in the queue (don't mark last_scanned_at) so
-               the next pipeline run retries them.
-        Actor IDs are configurable via apify.actors.comments_primary /
-        apify.actors.comments_fallback in config.yaml.
+            -- when primary returns 0 items for the entire batch (SUCCEEDED).
+               Input: startUrls, proxy, maxItems = apidojo_comments_cap_per_post × N URLs.
+               Normalized via src.comment_normalizer.normalize_apidojo_api.
+            -- if BOTH return empty, posts stay unscanned (no last_scanned_at update).
+        Implemented in scripts/pipeline_lib/apify_runner.py.
+        Actor IDs: apify.actors.comments_primary / comments_fallback.
+        Cost confirm when pipeline.prompt_terminal_confirmation is true.
         Dedup leads by user_id (not username -- usernames can change)
 
-Step 4: Fetch profiles for new leads (batches of 50)
+Step 4: Fetch profiles for new leads (batches of profile_batch_size, default 50;
+        up to pipeline.step4.batch_limit leads per run)
+        Actor: apify/instagram-profile-scraper — input { usernames: [...] } only.
         Extract contacts from bio (phone, telegram, whatsapp, email)
         Save latest_media_urls for future face recognition
         Download avatar -> data/avatars/<user_id>.jpg
         Run SCRFD face detection -> faces_count
         If faces_count == 1: avatar becomes face_photo_path
         If faces_count != 1: fall back to last N post photos (face leader)
-        Actor: instagram-profile-scraper
 
 Step 5: Resolve Telegram contacts via Sherlock (parallel)
         For "naked" leads (profile fetched, bio gave no phone/telegram).
@@ -232,7 +235,7 @@ pipeline does **not** read it for Step 1; monitored usernames live in
 `config.yaml` under `search.realtor_accounts` when `discovery_mode` is `realtors`.
 The table remains for future features or manual experiments.
 
-**`processed_posts`** — all posts with 10+ comments
+**`processed_posts`** — posts that passed Step 1 (`comments_count >= min_comments_per_post`)
 - `post_id` PK (shortcode), `post_url`, `owner_username`, `comments_count`
 - `relevance` (relevant/irrelevant/unknown), `cta_type` (comment/direct/none)
 - `last_comments_count`, `last_scanned_at` — for 5% growth detection
@@ -248,7 +251,7 @@ The table remains for future features or manual experiments.
 - `sherlock_processed_at`, `sherlock_status`, `sherlock_link` — Step 5 outcome. `sherlock_processed_at IS NOT NULL` gates Step 6 cleanup AND excludes the lead from face-detection helper queries (so backfill scripts don't re-fetch via Apify after cleanup).
 
 **`lead_post_links`** — which lead commented on which post
-- `username`, `user_id`, `post_url`, `post_shortcode`, `comment_text`
+- `username`, `user_id`, `post_url`, `post_shortcode`, `comment_text`, `comment_pk`, `comment_at`
 
 **`apify_runs`** — cost tracking for every API call
 
@@ -274,6 +277,9 @@ python -m pytest tests/ -v
 
 # Run the daily pipeline
 python scripts/pipeline.py
+python scripts/pipeline.py --skip-sherlock   # Steps 1-4 + 6 only
+python scripts/pipeline.py --keep-photos     # skip Step 6 face cleanup
+python scripts/pipeline.py -y                # auto-confirm Step 5 cost prompt only
 
 # Individual test scripts (for exploration/debugging)
 python scripts/test_related_realtors.py    # Find realtor accounts via relatedProfiles
@@ -305,18 +311,31 @@ python scripts/test_face_leader.py --keep-photos
 - `config.yaml` — search parameters, Apify actor IDs, and per-step limits under `pipeline.stepN.*` (Step 1 post age and min-comments fallbacks live in `src.config` when those keys are omitted).
   - `pipeline.stepN.*` — per-step tuning knobs (post age, min comments,
     Step 1 `discovery_mode` (`realtors` | `hashtags` | `cookie_keywords`),
-    `hashtag_results_limit`, `search.realtor_accounts`, `search.cookie_search_keywords`, growth threshold,
-    batch sizes, Sherlock cap). Missing keys fall back to safe defaults (`pipeline.step1` post age / min comments via `src.config`; other steps still use `DEFAULT_*` constants in `scripts/pipeline.py`), so a fresh /
+    `hashtag_results_limit`, `pipeline.step1.cookie_search.*`, comment caps,
+    batch sizes, Sherlock cap, `prompt_terminal_confirmation`). Missing keys fall
+    back to safe defaults (`pipeline.step1` post age / min comments via `src.config`;
+    other steps use `DEFAULT_*` in `scripts/pipeline_lib/defaults.py`), so a fresh /
     partial config still boots.
-- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`;
-  optional `INSTAGRAM_SESSION_COOKIE` (or env from `search.cookie_search.session_cookie_env_var`)
-  when using Step 1 `discovery_mode=cookie_keywords`
+- `.env` — secrets: `APIFY_API_TOKEN`, `DEEPSEEK_API_KEY`, `NEXARA_API_KEY`,
+  `SHERLOCK_API_KEY`; optional `TELEGRAM_BOT_TOKEN` for notifications/confirmations;
+  optional `INSTAGRAM_SESSION_COOKIE` (or env from
+  `pipeline.step1.cookie_search.session_cookie_env_var`) for `discovery_mode=cookie_keywords`
 - Step 1 realtor usernames: `search.realtor_accounts` in `config.yaml` when
   `discovery_mode` is `realtors` (not the `tracked_realtors` table)
 
 ## Key Source Files
 
+- `scripts/pipeline.py` — daily pipeline orchestration (Steps 1–6)
+- `scripts/pipeline_lib/defaults.py` — `DEFAULT_*` fallbacks when config keys are missing
+- `scripts/pipeline_lib/apify_runner.py` — `_fetch_comments_with_fallback` (Step 3 Apify)
+- `scripts/pipeline_lib/scoring.py` — Step 2 Lingua gate, DeepSeek scoring, human confirm
+- `scripts/pipeline_lib/step4_faces.py` — avatar face area, post-photo leader helpers
+- `scripts/pipeline_lib/step5_sherlock.py` — Step 5 Sherlock worker pool
+- `scripts/pipeline_lib/step6_cleanup.py` — Step 6 face asset cleanup
 - `src/db.py` — SQLite DB with all tables, dedup logic, lead lifecycle methods
+- `src/sherlock_client.py` — Sherlock HTTP client (Step 5)
+- `src/telegram_notifier.py` — pipeline Telegram notifications (aiogram)
+- `src/telegram_inline_confirm.py` — inline yes/no confirm for Step 2/3
 - `src/apify_client_wrapper.py` — Apify wrapper with logging and cost tracking;
   dev defaults in `DEFAULT_APIFY_WRAPPER_LIMITS` when `limit=` is omitted (optional
   `apify.test_limits` in yaml overrides the same keys for legacy configs)
@@ -348,7 +367,7 @@ python scripts/test_face_leader.py --keep-photos
   filter + ArcFace + cluster)
 - `src/logger.py` — structlog configuration
 - `src/config.py` — config.yaml + .env loader
-- `docs/apify_api_schemas.md` — detailed API schemas for all actors
+- `docs/apify_api_schemas.md` — Apify actors used by the pipeline (inputs/outputs)
 - `models/` — vendored ML weights (InsightFace `buffalo_s` only);
   committed to the repo so Ubuntu deploys don't re-download ~155 MB on
   first use. See `models/README.md` for layout and Git LFS tips.
@@ -358,7 +377,7 @@ python scripts/test_face_leader.py --keep-photos
 
 - **Cost awareness:** Apify requests cost money. Always deduplicate — check DB before making API calls. Track and log costs per cycle.
 - **Dedup by user_id:** Instagram usernames can change. Always check `user_id` (numeric pk) for deduplication, not just username.
-- **Budget controls:** Pipeline shows estimated cost before expensive operations and asks for confirmation.
+- **Budget controls:** Step 3 (and Step 5) show estimated cost and ask for confirmation when `pipeline.prompt_terminal_confirmation` is true; set false for cron/unattended runs.
 - **Incremental:** Each pipeline run only processes new/changed data. Safe to run repeatedly.
 - **5% comment growth threshold:** Don't re-scan comments on a post unless comment count grew by at least 5% since last scan.
 - **Disk hygiene:** face photos (avatars + post-photo leaders) live on disk only between Step 4 and Step 6. After Sherlock finishes a lead with a non-error terminal status, Step 6 unlinks its files and NULLs the path columns. Face-detection helper queries gate on `sherlock_processed_at IS NULL` so cleaned leads aren't re-fetched via Apify.

@@ -53,15 +53,67 @@ search:
   # Instagram usernames (no @). Used by the daily pipeline when
   # ``pipeline.step1.discovery_mode`` is ``realtors`` (instagram-post-scraper).
   realtor_accounts:
-    - "goncharov_nedvizhimost"
-    - "annet_fokina"
+    - "tochno__partners"
+    - "tochno.life"
+    - "metriks_development"
+    - "1dogma"
+    - "sskuban"
+    - "incitydevelopment"
+    - "bauinvest_group"
+    - "gk.nvm.south"
+    - "darstroy.krasnodar"
+    - "gk_usi"
+    - "familia_dev"
+    - "garantiya.krasnodar"
+    - "avakrasnodar"
+    - "europeya.ru"
+    - "mooe_krasnodar"
+    - "novostroiki_krasnodara_"
+    - "valeria__pivovarova"
+    - "svoi.live"
+    - "smartrielt"
+    - "ayax.realty"
     - "sashaipoteka"
+    - "krasnodar_kvartiry"
+    - "krasnodar_regina"
+    - "goncharov_nedvizhimost"
+    - "svoya.vkrasnodare"
+    - "proipoteka.ru"
+    - "kamila_ipoteka"
+    - "annet_fokina"
+    - "volkova_top_estate"
+    - "group_etalon"
+    - "mrgroup_rus"
+    - "pioneergroup"
+    - "sminex_developer"
+    - "capitalgroupcorp"
+    - "whitewillestate"
+    - "brusnika.company"
+    - "vesper_moscow"
+    - "forma.russia"
+    - "homexpert.me"
+    - "andreyneginskiy"
+    - "lsr.petersburg"
+    - "strana_com"
+    - "pik"
+    - "i.love.msk"
+    - "bigcity_moscow_"
+    - "svetlana.nedvizka"
+    - "ks_makarenko"
+    - "bozhenko_marina"
+    - "sofi_lubimova"
+    - "vasilii_kholodnyak"
+    - "sk_10_official"
+    - "donneftestroi161"
+    - "sk_smu1"
+    - "donneftestroi161"
+    - "msk_rostov"
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -5255644193 #-1003909022341 #-1003926996735
-  result_chat_id: -5272096712 #-1003926996735 #Chat for clear results and confirmations only no logs
-  alert_chat_id: -5272096712 #-1003926996735 #Chat for alerts and notifications only no logs
+  report_chat_id: -1003909022341 #Chat for logs
+  result_chat_id: -5170924502 #Chat for clear results and confirmations only no logs
+  alert_chat_id: -1003926996735 #Chat for alerts and notifications only no logs
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
@@ -115,10 +167,10 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 20
+    louisdeconinck_comments_cap_per_post: 500
     # Step 3 fallback (apidojo-api): actor input maxItems is a run-wide
     # total, not per-post. Pipeline sends maxItems = cap * posts_in_batch.
-    apidojo_comments_cap_per_post: 1000
+    apidojo_comments_cap_per_post: 2000
 
   step4:
     # apify/instagram-profile-scraper batch size. Apify accepts up
@@ -128,14 +180,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 20
+    batch_limit: 500
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
     # photo). 1000 leads on a 3-account pool is already a multi-hour
     # run; bigger pools could safely raise this.
-    batch_limit: 5
+    batch_limit: 500
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to
     # restore parallel Step 5.
