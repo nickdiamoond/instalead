@@ -75,7 +75,55 @@ def test_nick_hit_still_runs_photo_and_does_not_set_found_nick_status(
     assert res["photo_search_ran"] is True
 
 
-def test_photo_exact_match_after_nick_miss(face_photo: Path) -> None:
+def test_photo_sherlock_exact_status_still_uses_deepseek(face_photo: Path) -> None:
+    sherlock = MagicMock()
+    sherlock.enqueue_nick.return_value = {"id": "nick-task-1"}
+    sherlock.enqueue_photo.return_value = {"id": "photo-task-1"}
+    sherlock.wait_for_task.side_effect = [
+        {"status": "completed", "result": {"results": []}},
+        {
+            "status": "completed",
+            "result": {
+                "results": [
+                    {
+                        "status": "точное совпадение",
+                        "phone": "+7999",
+                        "link": "https://t.me/bobtg",
+                        "person": "Bob",
+                    }
+                ]
+            },
+        },
+    ]
+    deepseek = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = "1"
+    deepseek.chat.completions.create.return_value = mock_resp
+
+    res = _resolve_one_lead_via_sherlock(
+        sherlock,
+        {
+            "username": "bob",
+            "full_name": "",
+            "face_photo_path": str(face_photo),
+        },
+        nick_cfg={},
+        photo_cfg={},
+        task_cfg={},
+        deepseek=deepseek,
+        usermatch_prompt="{username} {full_name} {candidates}",
+    )
+
+    deepseek.chat.completions.create.assert_called_once()
+    assert res["nick_hit"] is False
+    assert res["step5_deepseek_called"] is True
+    assert res["photo_match_kind"] == "deepseek"
+    assert res["status"] == SH_STATUS_FOUND_PHOTO
+    assert res["phone"] == "+7999"
+
+
+def test_photo_exact_status_without_deepseek_is_no_match(face_photo: Path) -> None:
     sherlock = MagicMock()
     sherlock.enqueue_nick.return_value = {"id": "nick-task-1"}
     sherlock.enqueue_photo.return_value = {"id": "photo-task-1"}
@@ -110,6 +158,5 @@ def test_photo_exact_match_after_nick_miss(face_photo: Path) -> None:
         usermatch_prompt="{username} {full_name} {candidates}",
     )
 
-    assert res["nick_hit"] is False
-    assert res["status"] == SH_STATUS_FOUND_PHOTO
-    assert res["phone"] == "+7999"
+    assert res["status"] == SH_STATUS_NO_MATCH
+    assert res.get("phone") is None

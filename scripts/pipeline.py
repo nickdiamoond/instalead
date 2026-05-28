@@ -7,7 +7,7 @@ Steps:
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
   5. Resolve Telegram contacts for naked leads via Sherlock
-     (nick search first, photo fallback with exact-match or DeepSeek pick)
+     (nick search first, photo fallback with DeepSeek disambiguation)
 
 Uses DB for deduplication — safe to run repeatedly.
 """

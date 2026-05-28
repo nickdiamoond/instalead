@@ -20,7 +20,6 @@ from src.telegram_notifier import PipelineTelegramNotifier
 from scripts.pipeline_lib.constants import (
     NICK_TASK_ETA_S,
     PHOTO_TASK_ETA_S,
-    SHERLOCK_EXACT_MATCH_SUBSTRING,
     SH_STATUS_ERROR,
     SH_STATUS_FOUND_PHOTO,
     SH_STATUS_NO_FACE_PHOTO,
@@ -253,25 +252,6 @@ def _resolve_one_lead_via_sherlock(
         if not results:
             out["status"] = SH_STATUS_NO_MATCH
             out["error"] = None
-            return out
-        first_raw = results[0]
-        first = first_raw if isinstance(first_raw, dict) else {}
-        first_status = str(first.get("status") or "")
-
-        if SHERLOCK_EXACT_MATCH_SUBSTRING in first_status:
-            out.update({
-                "status": SH_STATUS_FOUND_PHOTO,
-                "phone": first.get("phone"),
-                "sherlock_link": first.get("link"),
-                "error": None,
-                "photo_match_kind": "exact",
-                "sherlock_person": first.get("person"),
-            })
-            pipeline_log.info(
-                "step5_sherlock_photo_outcome",
-                username=username,
-                branch="exact_match",
-            )
             return out
 
         persons: list = []
