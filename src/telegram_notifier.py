@@ -95,11 +95,12 @@ def build_step1_date_filter_section_lines(
 ) -> list[str]:
     """Human-readable date / age filter lines for Step 1 (Telegram + terminal)."""
     mode = (discovery_mode or "realtors").strip().lower()
+    modes = [m.strip() for m in mode.split(",") if m.strip()]
     out: list[str] = [
         "Date filter",
         f"Config: pipeline.step1.posts_max_age_days = {posts_max_age_days}",
     ]
-    if mode == "realtors":
+    if "realtors" in modes:
         out.append(
             "Apify input: onlyPostsNewerThan "
             f"(posts newer than {posts_max_age_days} day(s))."
@@ -140,15 +141,19 @@ def build_step1_pipeline_summary_telegram_text(
     posts_max_age_days: int,
     age_dropped_client: int | None,
     age_kept_missing_ts: int | None,
+    searched_line: str | None = None,
 ) -> str:
     """Single Step 1 Telegram message: headline + run totals + gate breakdown (``\\n``-separated)."""
-    mode = (discovery_mode or "realtors").strip().lower()
-    if mode == "hashtags":
-        searched = f"Searched {source_count} hashtag(s)."
-    elif mode == "cookie_keywords":
-        searched = f"Searched {source_count} keyword(s)."
+    if searched_line is not None:
+        searched = searched_line
     else:
-        searched = f"Searched {source_count} active realtor(s)."
+        mode = (discovery_mode or "realtors").strip().lower()
+        if mode == "hashtags":
+            searched = f"Searched {source_count} hashtag(s)."
+        elif mode == "cookie_keywords":
+            searched = f"Searched {source_count} keyword(s)."
+        else:
+            searched = f"Searched {source_count} active realtor(s)."
 
     lines: list[str] = [
         "Step 1",

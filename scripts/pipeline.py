@@ -1,8 +1,8 @@
 """Daily lead collection pipeline.
 
 Steps:
-  1. Fetch recent posts/reels (realtor accounts from config, hashtags, or
-     cookie keyword search — ``pipeline.step1.discovery_mode``)
+  1. Fetch recent posts/reels (one or more of: realtor accounts, hashtags,
+     cookie keyword search — ``pipeline.step1.discovery_mode`` str or list)
   2. Score new posts via DeepSeek (relevance + CTA)
   3. Fetch comments for relevant posts (new + grown)
   4. Fetch profiles for new leads, extract contacts from bio
@@ -109,6 +109,12 @@ from scripts.pipeline_lib.step5_sherlock import (
     SHERLOCK_HEALTH_PROBE_MAX_ATTEMPTS,
     _step_5_resolve_contacts_via_sherlock,
 )
+from scripts.pipeline_lib.step1_discovery import (
+    VALID_STEP1_DISCOVERY_MODES,
+    build_step1_searched_summary,
+    format_step1_discovery_modes_label,
+    parse_step1_discovery_modes,
+)
 from scripts.pipeline_lib.step6_cleanup import _step_6_cleanup_spent_face_assets
 
 setup_logging()
@@ -196,9 +202,9 @@ def main():
             DEFAULT_POST_SCRAPER_RESULTS_LIMIT,
         )
     )
-    discovery_mode = str(
+    discovery_modes = parse_step1_discovery_modes(
         s1_cfg.get("discovery_mode", DEFAULT_STEP1_DISCOVERY_MODE)
-    ).strip().lower()
+    )
     hashtag_results_limit = int(
         s1_cfg.get("hashtag_results_limit", post_scraper_results_limit)
     )
@@ -255,325 +261,365 @@ def main():
         "cookie_search_posts", "crawlerbros/instagram-keyword-search-scraper"
     )
 
-    if discovery_mode not in ("realtors", "hashtags", "cookie_keywords"):
-        log.error("step1_invalid_discovery_mode", mode=discovery_mode)
+    invalid_modes = [m for m in discovery_modes if m not in VALID_STEP1_DISCOVERY_MODES]
+    if invalid_modes:
+        log.error("step1_invalid_discovery_mode", modes=invalid_modes)
         print(
-            "FAILED: pipeline.step1.discovery_mode must be 'realtors', "
-            f"'hashtags', or 'cookie_keywords', got {discovery_mode!r}."
+            "FAILED: pipeline.step1.discovery_mode entries must be "
+            "'realtors', 'hashtags', and/or 'cookie_keywords'; "
+            f"invalid: {invalid_modes!r}."
         )
-        issues.append(("Step 1", f"invalid discovery_mode: {discovery_mode}"))
+        issues.append(("Step 1", f"invalid discovery_mode: {invalid_modes}"))
         return
+
+    _banner(
+        f"STEP 1: Fetch posts (≤{posts_max_age_days}d) "
+        f"[{format_step1_discovery_modes_label(discovery_modes)}]"
+    )
 
     step1_cost_usd = 0.0
     posts_age_stats: dict[str, int] | None = None
     reels_age_stats: dict[str, int] | None = None
-    step1_empty_issue = "post-scraper returned 0 items"
-    notify_secondary_count = 0
+    step1_empty_issue = "Step 1 discovery returned 0 items after filters"
+    source_counts: dict[str, int] = {}
+    modes_ran: list[str] = []
     step1_age_dropped_client: int | None = None
     step1_age_kept_missing_ts: int | None = None
+    all_posts: list[dict] = []
 
-    if discovery_mode == "realtors":
-        _banner(
-            f"STEP 1: Fetch posts (last {posts_max_age_days} days, "
-            f"≤{posts_max_age_days}d client filter) [realtors]"
-        )
-        realtors = _realtor_usernames_from_cfg(cfg)
-        if not realtors:
-            log.error("step1_no_realtor_accounts")
-            print(
-                "FAILED: search.realtor_accounts is empty in config for "
-                "discovery_mode=realtors."
-            )
-            issues.append(("Step 1", "search.realtor_accounts empty"))
-            return
-
-        notify_secondary_count = len(realtors)
-        print(f"  Realtors:       {len(realtors)}")
-        log.info(
-            "step1_fetch_posts",
-            discovery_mode=discovery_mode,
-            realtors=len(realtors),
-            max_age_days=posts_max_age_days,
-            post_scraper_results_limit=post_scraper_results_limit,
-        )
-
-        run = _step1_apify_actor_call(
-            apify,
-            tg_notifier,
-            issues,
-            actor_id="apify/instagram-post-scraper",
-            run_input={
-                "username": realtors,
-                "resultsLimit": post_scraper_results_limit,
-                "onlyPostsNewerThan": f"{posts_max_age_days} days",
-                "dataDetailLevel": "basicData",
-                "proxy": {"useApifyProxy": True},
-            },
-        )
-        if run is None:
-            return
-        tg_notifier.maybe_notify_apify_run_failure(
-            run,
-            actor_id="apify/instagram-post-scraper",
-            step="Step 1",
-        )
-        detail = apify.run(run["id"]).get()
-        posts_fetched = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
-        all_posts, posts_age_stats = filter_items_within_max_age(
-            posts_fetched, posts_max_age_days
-        )
-        step1_age_dropped_client = int((posts_age_stats or {}).get("dropped_too_old") or 0)
-        step1_age_kept_missing_ts = int(
-            (posts_age_stats or {}).get("kept_missing_timestamp") or 0
-        )
-        step1_cost_usd = float(detail.get("usageTotalUsd") or 0)
-        step1_empty_issue = "post-scraper returned 0 items after age filter"
-
-        pipeline.log_run(
-            actor_id="apify/instagram-post-scraper",
-            run_id=run["id"],
-            status=run["status"],
-            input_params={
-                "realtors": len(realtors),
-                "resultsLimit": post_scraper_results_limit,
-                "max_age_days": posts_max_age_days,
-            },
-            items_count=len(posts_fetched),
-            cost_usd=detail.get("usageTotalUsd", 0),
-            duration_ms=detail.get("stats", {}).get("durationMillis"),
-        )
-        log.info(
-            "step1_realtor_age_filter",
-            raw=len(posts_fetched),
-            after_filter=len(all_posts),
-            posts_age_stats=posts_age_stats,
-        )
-    elif discovery_mode == "hashtags":
-        hashtags = list((cfg.get("search") or {}).get("hashtags") or [])
-        _banner(
-            f"STEP 1: Fetch posts via hashtags "
-            f"(≤{posts_max_age_days}d by timestamp) [hashtags]"
-        )
-        if not hashtags:
-            log.error("step1_no_hashtags")
-            print(
-                "FAILED: search.hashtags is empty in config for discovery_mode=hashtags."
-            )
-            issues.append(("Step 1", "search.hashtags empty"))
-            return
-
-        notify_secondary_count = len(hashtags)
-        print(f"  Hashtags:       {len(hashtags)}")
-        log.info(
-            "step1_fetch_posts",
-            discovery_mode=discovery_mode,
-            hashtags=len(hashtags),
-            hashtag_results_limit=hashtag_results_limit,
-            max_age_days=posts_max_age_days,
-        )
-
-        proxy_in = {"useApifyProxy": True}
-        run_base = {
-            "hashtags": hashtags,
-            "resultsLimit": hashtag_results_limit,
-            "proxy": proxy_in,
-        }
-
-        run_p = _step1_apify_actor_call(
-            apify,
-            tg_notifier,
-            issues,
-            actor_id=hashtag_actor_id,
-            run_input={**run_base, "resultsType": "posts"},
-        )
-        if run_p is None:
-            return
-        tg_notifier.maybe_notify_apify_run_failure(
-            run_p, actor_id=hashtag_actor_id, step="Step 1 (hashtag posts)"
-        )
-        detail_p = apify.run(run_p["id"]).get()
-        posts_fetched = list(apify.dataset(run_p["defaultDatasetId"]).iterate_items())
-        posts_filtered, posts_age_stats = filter_items_within_max_age(
-            posts_fetched, posts_max_age_days
-        )
-        cost_p = float(detail_p.get("usageTotalUsd") or 0)
-        step1_cost_usd += cost_p
-        pipeline.log_run(
-            actor_id=hashtag_actor_id,
-            run_id=run_p["id"],
-            status=run_p["status"],
-            input_params={
-                "hashtags": len(hashtags),
-                "resultsType": "posts",
-                "resultsLimit": hashtag_results_limit,
-            },
-            items_count=len(posts_fetched),
-            cost_usd=cost_p,
-            duration_ms=detail_p.get("stats", {}).get("durationMillis"),
-        )
-
-        run_r = _step1_apify_actor_call(
-            apify,
-            tg_notifier,
-            issues,
-            actor_id=hashtag_actor_id,
-            run_input={**run_base, "resultsType": "reels"},
-        )
-        if run_r is None:
-            return
-        tg_notifier.maybe_notify_apify_run_failure(
-            run_r, actor_id=hashtag_actor_id, step="Step 1 (hashtag reels)"
-        )
-        detail_r = apify.run(run_r["id"]).get()
-        reels_fetched = list(apify.dataset(run_r["defaultDatasetId"]).iterate_items())
-        reels_filtered, reels_age_stats = filter_items_within_max_age(
-            reels_fetched, posts_max_age_days
-        )
-        cost_r = float(detail_r.get("usageTotalUsd") or 0)
-        step1_cost_usd += cost_r
-        pipeline.log_run(
-            actor_id=hashtag_actor_id,
-            run_id=run_r["id"],
-            status=run_r["status"],
-            input_params={
-                "hashtags": len(hashtags),
-                "resultsType": "reels",
-                "resultsLimit": hashtag_results_limit,
-            },
-            items_count=len(reels_fetched),
-            cost_usd=cost_r,
-            duration_ms=detail_r.get("stats", {}).get("durationMillis"),
-        )
-
-        all_posts = merge_hashtag_items_by_shortcode(posts_filtered, reels_filtered)
-        step1_age_dropped_client = int(
-            (posts_age_stats or {}).get("dropped_too_old") or 0
-        ) + int((reels_age_stats or {}).get("dropped_too_old") or 0)
-        step1_age_kept_missing_ts = int(
-            (posts_age_stats or {}).get("kept_missing_timestamp") or 0
-        ) + int((reels_age_stats or {}).get("kept_missing_timestamp") or 0)
-        step1_empty_issue = "hashtag-scraper returned 0 items after merge/filter"
-        log.info(
-            "step1_hashtag_merge",
-            posts_raw=len(posts_fetched),
-            reels_raw=len(reels_fetched),
-            merged=len(all_posts),
-            posts_age_stats=posts_age_stats,
-            reels_age_stats=reels_age_stats,
-        )
-
-    elif discovery_mode == "cookie_keywords":
-        search_cfg = cfg.get("search") or {}
-        cs_cfg = step1_cookie_search_section(cfg)
-        keywords = [str(k).strip() for k in (search_cfg.get("cookie_search_keywords") or []) if str(k).strip()]
-        _banner(
-            f"STEP 1: Fetch posts via cookie keyword search "
-            f"(≤{posts_max_age_days}d by timestamp) [cookie_keywords]"
-        )
-        if not keywords:
-            log.error("step1_no_cookie_search_keywords")
-            print(
-                "FAILED: search.cookie_search_keywords is empty in config "
-                "for discovery_mode=cookie_keywords."
-            )
-            issues.append(("Step 1", "search.cookie_search_keywords empty"))
-            return
-
-        cookie_var = str(cs_cfg.get("session_cookie_env_var", "INSTAGRAM_SESSION_COOKIE"))
-        cookies_raw = (os.environ.get(cookie_var) or "").strip()
-        if not cookies_raw:
-            log.error("step1_missing_instagram_session_cookie", env_var=cookie_var)
-            print(
-                f"FAILED: {cookie_var} is empty or unset. "
-                "Paste Instagram cookies into .env (see .env.example)."
-            )
-            issues.append(("Step 1", f"missing env {cookie_var} for cookie keyword search"))
-            return
-
-        try:
-            cookies_payload = cookies_json_string_for_actor(cookies_raw)
-        except (json.JSONDecodeError, ValueError) as e:
-            log.error("step1_cookie_parse_failed", error=str(e))
-            print(f"FAILED: could not normalize cookies for the actor: {e}")
-            issues.append(("Step 1", f"cookie parse error: {e}"))
-            return
-
-        max_posts = int(cs_cfg.get("size_per_keyword", 5))
-        session_name = str(cs_cfg.get("session_name", "instalead_cookie_search"))
-
-        notify_secondary_count = len(keywords)
-        print(f"  Keywords:       {len(keywords)}")
-        log.info(
-            "step1_fetch_posts",
-            discovery_mode=discovery_mode,
-            keywords=len(keywords),
-            max_posts_per_keyword=max_posts,
-            max_age_days=posts_max_age_days,
-            cookie_env_var=cookie_var,
-        )
-
-        run_kw = _step1_apify_actor_call(
-            apify,
-            tg_notifier,
-            issues,
-            actor_id=cookie_search_actor_id,
-            run_input={
-                "keywords": keywords,
-                "maxPosts": max_posts,
-                "cookies": cookies_payload,
-                "sessionName": session_name,
-            },
-        )
-        if run_kw is None:
-            return
-        tg_notifier.maybe_notify_apify_run_failure(
-            run_kw, actor_id=cookie_search_actor_id, step="Step 1"
-        )
-        detail_kw = apify.run(run_kw["id"]).get()
-        raw_items = list(apify.dataset(run_kw["defaultDatasetId"]).iterate_items())
-        step1_cost_usd = float(detail_kw.get("usageTotalUsd") or 0)
-
-        normalized: list[dict] = []
-        for row in raw_items:
-            if not isinstance(row, dict):
+    for discovery_mode in discovery_modes:
+        if discovery_mode == "realtors":
+            print("\n  --- realtors ---")
+            realtors = _realtor_usernames_from_cfg(cfg)
+            if not realtors:
+                log.warning("step1_skip_realtors", reason="search.realtor_accounts empty")
+                print(
+                    "  SKIP realtors: search.realtor_accounts is empty in config."
+                )
+                issues.append(("Step 1", "search.realtor_accounts empty (skipped)"))
                 continue
-            n = normalize_keyword_search_item(row)
-            if n is not None:
-                normalized.append(n)
 
-        deduped = dedupe_keyword_items_by_shortcode(normalized)
-        all_posts, posts_age_stats = filter_items_within_max_age(
-            deduped, posts_max_age_days
-        )
-        step1_age_dropped_client = int((posts_age_stats or {}).get("dropped_too_old") or 0)
-        step1_age_kept_missing_ts = int(
-            (posts_age_stats or {}).get("kept_missing_timestamp") or 0
-        )
-        reels_age_stats = None
-        step1_empty_issue = (
-            "cookie keyword search returned 0 posts after normalize/dedupe/age-filter"
-        )
+            print(f"  Realtors:       {len(realtors)}")
+            log.info(
+                "step1_fetch_posts",
+                discovery_mode=discovery_mode,
+                realtors=len(realtors),
+                max_age_days=posts_max_age_days,
+                post_scraper_results_limit=post_scraper_results_limit,
+            )
 
-        pipeline.log_run(
-            actor_id=cookie_search_actor_id,
-            run_id=run_kw["id"],
-            status=run_kw["status"],
-            input_params={
-                "keywords": len(keywords),
-                "maxPosts": max_posts,
-            },
-            items_count=len(raw_items),
-            cost_usd=detail_kw.get("usageTotalUsd", 0),
-            duration_ms=detail_kw.get("stats", {}).get("durationMillis"),
+            run = _step1_apify_actor_call(
+                apify,
+                tg_notifier,
+                issues,
+                actor_id="apify/instagram-post-scraper",
+                run_input={
+                    "username": realtors,
+                    "resultsLimit": post_scraper_results_limit,
+                    "onlyPostsNewerThan": f"{posts_max_age_days} days",
+                    "dataDetailLevel": "basicData",
+                    "proxy": {"useApifyProxy": True},
+                },
+            )
+            if run is None:
+                return
+            tg_notifier.maybe_notify_apify_run_failure(
+                run,
+                actor_id="apify/instagram-post-scraper",
+                step="Step 1",
+            )
+            detail = apify.run(run["id"]).get()
+            posts_fetched = list(apify.dataset(run["defaultDatasetId"]).iterate_items())
+            mode_posts, mode_age_stats = filter_items_within_max_age(
+                posts_fetched, posts_max_age_days
+            )
+            mode_dropped = int((mode_age_stats or {}).get("dropped_too_old") or 0)
+            mode_kept_missing = int(
+                (mode_age_stats or {}).get("kept_missing_timestamp") or 0
+            )
+            step1_age_dropped_client = (step1_age_dropped_client or 0) + mode_dropped
+            step1_age_kept_missing_ts = (step1_age_kept_missing_ts or 0) + mode_kept_missing
+            posts_age_stats = mode_age_stats
+            step1_cost_usd += float(detail.get("usageTotalUsd") or 0)
+            all_posts = merge_hashtag_items_by_shortcode(all_posts, mode_posts)
+            source_counts["realtors"] = len(realtors)
+            modes_ran.append(discovery_mode)
+
+            pipeline.log_run(
+                actor_id="apify/instagram-post-scraper",
+                run_id=run["id"],
+                status=run["status"],
+                input_params={
+                    "realtors": len(realtors),
+                    "resultsLimit": post_scraper_results_limit,
+                    "max_age_days": posts_max_age_days,
+                },
+                items_count=len(posts_fetched),
+                cost_usd=detail.get("usageTotalUsd", 0),
+                duration_ms=detail.get("stats", {}).get("durationMillis"),
+            )
+            log.info(
+                "step1_realtor_age_filter",
+                raw=len(posts_fetched),
+                after_filter=len(mode_posts),
+                merged_total=len(all_posts),
+                posts_age_stats=posts_age_stats,
+            )
+
+        elif discovery_mode == "hashtags":
+            print("\n  --- hashtags ---")
+            hashtags = list((cfg.get("search") or {}).get("hashtags") or [])
+            if not hashtags:
+                log.warning("step1_skip_hashtags", reason="search.hashtags empty")
+                print("  SKIP hashtags: search.hashtags is empty in config.")
+                issues.append(("Step 1", "search.hashtags empty (skipped)"))
+                continue
+
+            print(f"  Hashtags:       {len(hashtags)}")
+            log.info(
+                "step1_fetch_posts",
+                discovery_mode=discovery_mode,
+                hashtags=len(hashtags),
+                hashtag_results_limit=hashtag_results_limit,
+                max_age_days=posts_max_age_days,
+            )
+
+            proxy_in = {"useApifyProxy": True}
+            run_base = {
+                "hashtags": hashtags,
+                "resultsLimit": hashtag_results_limit,
+                "proxy": proxy_in,
+            }
+
+            run_p = _step1_apify_actor_call(
+                apify,
+                tg_notifier,
+                issues,
+                actor_id=hashtag_actor_id,
+                run_input={**run_base, "resultsType": "posts"},
+            )
+            if run_p is None:
+                return
+            tg_notifier.maybe_notify_apify_run_failure(
+                run_p, actor_id=hashtag_actor_id, step="Step 1 (hashtag posts)"
+            )
+            detail_p = apify.run(run_p["id"]).get()
+            posts_fetched = list(apify.dataset(run_p["defaultDatasetId"]).iterate_items())
+            posts_filtered, posts_age_stats = filter_items_within_max_age(
+                posts_fetched, posts_max_age_days
+            )
+            cost_p = float(detail_p.get("usageTotalUsd") or 0)
+            step1_cost_usd += cost_p
+            pipeline.log_run(
+                actor_id=hashtag_actor_id,
+                run_id=run_p["id"],
+                status=run_p["status"],
+                input_params={
+                    "hashtags": len(hashtags),
+                    "resultsType": "posts",
+                    "resultsLimit": hashtag_results_limit,
+                },
+                items_count=len(posts_fetched),
+                cost_usd=cost_p,
+                duration_ms=detail_p.get("stats", {}).get("durationMillis"),
+            )
+
+            run_r = _step1_apify_actor_call(
+                apify,
+                tg_notifier,
+                issues,
+                actor_id=hashtag_actor_id,
+                run_input={**run_base, "resultsType": "reels"},
+            )
+            if run_r is None:
+                return
+            tg_notifier.maybe_notify_apify_run_failure(
+                run_r, actor_id=hashtag_actor_id, step="Step 1 (hashtag reels)"
+            )
+            detail_r = apify.run(run_r["id"]).get()
+            reels_fetched = list(apify.dataset(run_r["defaultDatasetId"]).iterate_items())
+            reels_filtered, reels_age_stats = filter_items_within_max_age(
+                reels_fetched, posts_max_age_days
+            )
+            cost_r = float(detail_r.get("usageTotalUsd") or 0)
+            step1_cost_usd += cost_r
+            pipeline.log_run(
+                actor_id=hashtag_actor_id,
+                run_id=run_r["id"],
+                status=run_r["status"],
+                input_params={
+                    "hashtags": len(hashtags),
+                    "resultsType": "reels",
+                    "resultsLimit": hashtag_results_limit,
+                },
+                items_count=len(reels_fetched),
+                cost_usd=cost_r,
+                duration_ms=detail_r.get("stats", {}).get("durationMillis"),
+            )
+
+            mode_posts = merge_hashtag_items_by_shortcode(posts_filtered, reels_filtered)
+            mode_dropped = int(
+                (posts_age_stats or {}).get("dropped_too_old") or 0
+            ) + int((reels_age_stats or {}).get("dropped_too_old") or 0)
+            mode_kept_missing = int(
+                (posts_age_stats or {}).get("kept_missing_timestamp") or 0
+            ) + int((reels_age_stats or {}).get("kept_missing_timestamp") or 0)
+            step1_age_dropped_client = (step1_age_dropped_client or 0) + mode_dropped
+            step1_age_kept_missing_ts = (step1_age_kept_missing_ts or 0) + mode_kept_missing
+            all_posts = merge_hashtag_items_by_shortcode(all_posts, mode_posts)
+            source_counts["hashtags"] = len(hashtags)
+            modes_ran.append(discovery_mode)
+            log.info(
+                "step1_hashtag_merge",
+                posts_raw=len(posts_fetched),
+                reels_raw=len(reels_fetched),
+                mode_posts=len(mode_posts),
+                merged_total=len(all_posts),
+                posts_age_stats=posts_age_stats,
+                reels_age_stats=reels_age_stats,
+            )
+
+        elif discovery_mode == "cookie_keywords":
+            print("\n  --- cookie_keywords ---")
+            search_cfg = cfg.get("search") or {}
+            cs_cfg = step1_cookie_search_section(cfg)
+            keywords = [
+                str(k).strip()
+                for k in (search_cfg.get("cookie_search_keywords") or [])
+                if str(k).strip()
+            ]
+            if not keywords:
+                log.warning(
+                    "step1_skip_cookie_keywords",
+                    reason="search.cookie_search_keywords empty",
+                )
+                print(
+                    "  SKIP cookie_keywords: search.cookie_search_keywords is empty."
+                )
+                issues.append(
+                    ("Step 1", "search.cookie_search_keywords empty (skipped)")
+                )
+                continue
+
+            cookie_var = str(
+                cs_cfg.get("session_cookie_env_var", "INSTAGRAM_SESSION_COOKIE")
+            )
+            cookies_raw = (os.environ.get(cookie_var) or "").strip()
+            if not cookies_raw:
+                log.warning(
+                    "step1_skip_cookie_keywords",
+                    reason="missing session cookie",
+                    env_var=cookie_var,
+                )
+                print(
+                    f"  SKIP cookie_keywords: {cookie_var} is empty or unset."
+                )
+                issues.append(
+                    (
+                        "Step 1",
+                        f"missing env {cookie_var} for cookie keyword search (skipped)",
+                    )
+                )
+                continue
+
+            try:
+                cookies_payload = cookies_json_string_for_actor(cookies_raw)
+            except (json.JSONDecodeError, ValueError) as e:
+                log.error("step1_cookie_parse_failed", error=str(e))
+                print(f"  SKIP cookie_keywords: could not normalize cookies: {e}")
+                issues.append(("Step 1", f"cookie parse error: {e}"))
+                continue
+
+            max_posts = int(cs_cfg.get("size_per_keyword", 5))
+            session_name = str(cs_cfg.get("session_name", "instalead_cookie_search"))
+
+            print(f"  Keywords:       {len(keywords)}")
+            log.info(
+                "step1_fetch_posts",
+                discovery_mode=discovery_mode,
+                keywords=len(keywords),
+                max_posts_per_keyword=max_posts,
+                max_age_days=posts_max_age_days,
+                cookie_env_var=cookie_var,
+            )
+
+            run_kw = _step1_apify_actor_call(
+                apify,
+                tg_notifier,
+                issues,
+                actor_id=cookie_search_actor_id,
+                run_input={
+                    "keywords": keywords,
+                    "maxPosts": max_posts,
+                    "cookies": cookies_payload,
+                    "sessionName": session_name,
+                },
+            )
+            if run_kw is None:
+                return
+            tg_notifier.maybe_notify_apify_run_failure(
+                run_kw, actor_id=cookie_search_actor_id, step="Step 1"
+            )
+            detail_kw = apify.run(run_kw["id"]).get()
+            raw_items = list(apify.dataset(run_kw["defaultDatasetId"]).iterate_items())
+            step1_cost_usd += float(detail_kw.get("usageTotalUsd") or 0)
+
+            normalized: list[dict] = []
+            for row in raw_items:
+                if not isinstance(row, dict):
+                    continue
+                n = normalize_keyword_search_item(row)
+                if n is not None:
+                    normalized.append(n)
+
+            deduped = dedupe_keyword_items_by_shortcode(normalized)
+            mode_posts, posts_age_stats = filter_items_within_max_age(
+                deduped, posts_max_age_days
+            )
+            mode_dropped = int((posts_age_stats or {}).get("dropped_too_old") or 0)
+            mode_kept_missing = int(
+                (posts_age_stats or {}).get("kept_missing_timestamp") or 0
+            )
+            step1_age_dropped_client = (step1_age_dropped_client or 0) + mode_dropped
+            step1_age_kept_missing_ts = (step1_age_kept_missing_ts or 0) + mode_kept_missing
+            reels_age_stats = None
+            all_posts = merge_hashtag_items_by_shortcode(all_posts, mode_posts)
+            source_counts["cookie_keywords"] = len(keywords)
+            modes_ran.append(discovery_mode)
+
+            pipeline.log_run(
+                actor_id=cookie_search_actor_id,
+                run_id=run_kw["id"],
+                status=run_kw["status"],
+                input_params={
+                    "keywords": len(keywords),
+                    "maxPosts": max_posts,
+                },
+                items_count=len(raw_items),
+                cost_usd=detail_kw.get("usageTotalUsd", 0),
+                duration_ms=detail_kw.get("stats", {}).get("durationMillis"),
+            )
+            log.info(
+                "step1_cookie_keyword_merge",
+                raw_dataset_rows=len(raw_items),
+                normalized=len(normalized),
+                deduped=len(deduped),
+                after_age_filter=len(mode_posts),
+                merged_total=len(all_posts),
+                posts_age_stats=posts_age_stats,
+            )
+
+    if not modes_ran:
+        print(
+            "FAILED: no Step 1 discovery modes ran "
+            f"(configured: {format_step1_discovery_modes_label(discovery_modes)})."
         )
-        log.info(
-            "step1_cookie_keyword_merge",
-            raw_dataset_rows=len(raw_items),
-            normalized=len(normalized),
-            deduped=len(deduped),
-            after_age_filter=len(all_posts),
-            posts_age_stats=posts_age_stats,
-        )
+        issues.append(("Step 1", "all discovery modes skipped or failed to start"))
+        return
+
+    discovery_mode_report = ",".join(modes_ran)
+    searched_summary = build_step1_searched_summary(source_counts)
+    notify_secondary_count = sum(source_counts.values())
 
     # Filter by min comments and register in DB
     new_posts = 0
@@ -640,7 +686,8 @@ def main():
 
     log.info(
         "step1_done",
-        discovery_mode=discovery_mode,
+        discovery_modes=discovery_modes,
+        modes_ran=modes_ran,
         total_posts=len(all_posts),
         new=new_posts,
         updated=updated_posts,
@@ -677,7 +724,7 @@ def main():
     print(f"    already in DB, comments_count updated: {updated_posts}")
     print("  Step 1 · date filter:")
     for df_line in build_step1_date_filter_section_lines(
-        discovery_mode=discovery_mode,
+        discovery_mode=discovery_mode_report,
         posts_max_age_days=posts_max_age_days,
         age_dropped_client=step1_age_dropped_client,
         age_kept_missing_ts=step1_age_kept_missing_ts,
@@ -689,11 +736,12 @@ def main():
     tg_notifier.notify_step1(
         new_posts,
         notify_secondary_count,
-        discovery_mode=discovery_mode,
+        discovery_mode=discovery_mode_report,
         full_message=build_step1_pipeline_summary_telegram_text(
             new_posts=new_posts,
             source_count=notify_secondary_count,
-            discovery_mode=discovery_mode,
+            discovery_mode=discovery_mode_report,
+            searched_line=searched_summary,
             min_comments=min_comments,
             fetched_total=len(all_posts),
             updated_posts=updated_posts,

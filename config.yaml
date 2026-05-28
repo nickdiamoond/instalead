@@ -128,13 +128,19 @@ pipeline:
   prompt_terminal_confirmation: false
 
   step1:
-    # Where Step 1 discovers posts: "realtors" (instagram-post-scraper on
-    # search.realtor_accounts), "hashtags" (instagram-hashtag-scraper on search.hashtags),
-    # or "cookie_keywords" (crawlerbros/instagram-keyword-search-scraper on
-    # search.cookie_search_keywords; requires INSTAGRAM_SESSION_COOKIE or env from
-    # pipeline.step1.cookie_search.session_cookie_env_var). For hashtags and cookie_keywords,
-    # posts_max_age_days is applied client-side after fetch (see src.ig_media_payload).
+    # Where Step 1 discovers posts. Single mode (string) or several (YAML list).
+    # Values: realtors | hashtags | cookie_keywords — all listed modes run each
+    # pipeline invocation; posts are merged by shortCode across modes.
+    # realtors: instagram-post-scraper on search.realtor_accounts
+    # hashtags: instagram-hashtag-scraper on search.hashtags
+    # cookie_keywords: crawlerbros keyword search on search.cookie_search_keywords
+    #   (requires INSTAGRAM_SESSION_COOKIE or pipeline.step1.cookie_search.session_cookie_env_var).
+    # For hashtags and cookie_keywords, posts_max_age_days is applied client-side
+    # after fetch (see src.ig_media_payload). A mode with empty sources is skipped.
     discovery_mode: realtors
+    # discovery_mode:
+    #   - realtors
+    #   - hashtags
     # crawlerbros keyword-search actor (``apify.actors.cookie_search_posts``): maxPosts per
     # keyword, cookie env var name, session label. Only used when discovery_mode=cookie_keywords.
     cookie_search:

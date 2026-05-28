@@ -14,8 +14,8 @@
 # ``apify/instagram-post-scraper`` input ``resultsLimit`` (per username).
 # Override via ``pipeline.step1.post_scraper_results_limit``.
 DEFAULT_POST_SCRAPER_RESULTS_LIMIT = 20
-# Step 1: ``pipeline.step1.discovery_mode`` — ``realtors`` | ``hashtags`` |
-# ``cookie_keywords``.
+# Step 1: ``pipeline.step1.discovery_mode`` — str or list of
+# ``realtors`` | ``hashtags`` | ``cookie_keywords``.
 DEFAULT_STEP1_DISCOVERY_MODE = "realtors"
 
 # Step 3: comment re-scan growth threshold + the displayed cost
