@@ -164,12 +164,14 @@ Step 4: Fetch profiles for new leads (batches of profile_batch_size, default 50;
 
 Step 5: Resolve Telegram contacts via Sherlock (parallel)
         For "naked" leads (profile fetched, bio gave no phone/telegram).
-        Stage 1: nick search (cheap, ~30s) -- POST /v1/search/nick.
-        Stage 2: photo search (slow, ~135s) if face_photo_path exists --
-                 POST /v1/search/photo. Skipped under --skip-sherlock or
-                 if SHERLOCK_API_KEY missing.
-        Sets sherlock_processed_at on every terminal outcome (found_nick,
-        found_photo, no_match, no_face_photo, error) so leads aren't
+        Stage 1: nick search (cheap, ~30s) -- POST /v1/search/nick; hits
+                 are logged to Telegram report_chat only (not saved to DB).
+        Stage 2: photo search (slow, ~135s) always runs when face_photo_path
+                 exists on disk -- POST /v1/search/photo; only this stage
+                 writes sherlock_status / phone / link. Skipped under
+                 --skip-sherlock or if SHERLOCK_API_KEY missing.
+        Sets sherlock_processed_at on every terminal photo outcome
+        (found_photo, no_match, no_face_photo, error) so leads aren't
         silently retried -- clear the column manually to re-process.
         Worker pool defaults to /v1/health pool.idle (override via
         --workers or sherlock.concurrency.workers).

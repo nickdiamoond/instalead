@@ -184,9 +184,9 @@ pipeline:
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
-    # Smaller than step4 because Sherlock is slow (~30s nick / ~135s
-    # photo). 1000 leads on a 3-account pool is already a multi-hour
-    # run; bigger pools could safely raise this.
+    # Smaller than step4 because Sherlock runs nick (~30s) then photo
+    # (~135s) per lead. 1000 leads on a 3-account pool is already a
+    # multi-hour run; bigger pools could safely raise this.
     batch_limit: 500
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to

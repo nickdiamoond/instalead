@@ -32,10 +32,13 @@ and at least one account in ``idle`` (= ready to take a search). The
 pipeline's Step 5 sizes its worker pool against that ``idle`` count.
 
 Usage:
-    python scripts/test_sherlock_health.py
-    python scripts/test_sherlock_health.py --base-url http://other.host:8000
-    python scripts/test_sherlock_health.py --timeout 30
-    python scripts/test_sherlock_health.py --json     # raw JSON dump only
+    python scripts/check_sherlock_health.py
+    python scripts/check_sherlock_health.py --base-url http://other.host:8000
+    python scripts/check_sherlock_health.py --timeout 30
+    python scripts/check_sherlock_health.py --json     # raw JSON dump only
+
+On success (``Verdict: OK``), prints ``(Ready for job - N accounts)`` where
+``N`` is ``pool.by_status.idle``.
 """
 
 from __future__ import annotations
@@ -68,6 +71,7 @@ from src.sherlock_client import (
     HEALTH_PATH,
     SherlockClient,
     SherlockError,
+    pool_idle_count,
 )
 
 DEFAULT_TIMEOUT = 15
@@ -191,6 +195,13 @@ def main() -> int:
     else:
         verdict = "REACHABLE (status field not 'ok' — inspect manually)"
     print(f"Verdict: {verdict}")
+    if verdict == "OK":
+        idle = pool_idle_count(pool if isinstance(pool, dict) else None)
+        if idle is not None:
+            noun = "account" if idle == 1 else "accounts"
+            print(f"(Ready for job - {idle} {noun})")
+        else:
+            print("(Ready for job - unknown)")
     return 0
 
 

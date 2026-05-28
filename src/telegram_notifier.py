@@ -2,8 +2,9 @@
 
 Uses Bot API ``sendMessage`` via aiogram. Disabled when ``TELEGRAM_BOT_TOKEN``
 is missing or ``telegram.report_chat_id`` is absent/invalid — the pipeline
-keeps running. Step 2 human inline confirmations and the per-lead Sherlock
-Russian summary (last ``notify_sherlock_lead`` message on nick/photo hit) goes to
+keeps running. Step 2 human inline confirmations go to ``telegram.result_chat_id``
+when set. Step 5: nick-hit Russian summaries and detailed logs go to
+``telegram.report_chat_id``; photo-hit Russian summaries go to
 ``telegram.result_chat_id`` only; misses stay in the report chat."""
 from __future__ import annotations
 
@@ -60,9 +61,9 @@ _TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 
 
 def sherlock_lead_found(res: dict) -> bool:
-    """True when Step 5 resolved a Telegram contact (nick or photo stage)."""
+    """True when Step 5 photo stage saved a contact (``found_photo`` only)."""
     st = str((res or {}).get("status") or "")
-    return st in (_SH_FOUND_NICK, _SH_FOUND_PHOTO)
+    return st == _SH_FOUND_PHOTO
 _TELEGRAM_PHOTO_CAPTION_LIMIT = 1024
 
 
@@ -188,12 +189,11 @@ def build_step5_sherlock_summary_telegram_text(
     step5_deepseek_api_ok: int = 0,
 ) -> str:
     """Single Step 5 Telegram message: run totals after Sherlock batch (``\\n``-separated)."""
-    found_nick = counters.get("found_nick", 0)
+    nick_hits = counters.get("nick_hits", 0)
     found_photo = counters.get("found_photo", 0)
     no_match = counters.get("no_match", 0)
     no_face = counters.get("no_face_photo", 0)
     errors = counters.get("error", 0)
-    found_total = found_nick + found_photo
     not_found = no_match + no_face
 
     lines: list[str] = [
@@ -201,9 +201,8 @@ def build_step5_sherlock_summary_telegram_text(
         "",
         "Sherlock summary",
         f"Leads pulled from DB (this run): {pulled} (batch limit {batch_limit})",
-        f"Contact found (total): {found_total}",
-        f"Found via nick: {found_nick}",
-        f"Found via photo: {found_photo}",
+        f"Contact found (photo, saved to DB): {found_photo}",
+        f"Nick hints (log only, not saved): {nick_hits}",
         f"Not found: {not_found}",
     ]
     if no_match or no_face:
@@ -514,22 +513,25 @@ def build_sherlock_lead_notification_text(lead: dict, res: dict) -> str:
         )
 
     if nick_hit:
-        tg_raw = str(res.get("telegram_username") or "").strip()
+        tg_raw = str(
+            res.get("nick_telegram_username") or res.get("telegram_username") or ""
+        ).strip()
         lines.append(f"Telegram match (nick search): {_telegram_handle(tg_raw)}")
-    elif photo_ran:
-        if nick_skipped:
-            lines.append(
-                f"Telegram nick not searched: Instagram username `{ig}` "
-                "contains '.' (Sherlock skips nick stage).\n"
-            )
-        elif nick_search_ran and nick_query:
-            lines.append(
-                f"Telegram nick not found for {nick_query}; photo search.\n"
-            )
+    if photo_ran:
+        if not nick_hit:
+            if nick_skipped:
+                lines.append(
+                    f"Telegram nick not searched: Instagram username `{ig}` "
+                    "contains '.' (Sherlock skips nick stage).\n"
+                )
+            elif nick_search_ran and nick_query:
+                lines.append(
+                    f"Telegram nick not found for {nick_query}; photo search.\n"
+                )
         lines.append("")
         lines.append("Photo search — full Sherlock task JSON:\n\n")
         lines.append(json.dumps(photo_task, ensure_ascii=False, indent=2, default=str))
-    else:
+    elif not nick_hit:
         st_face = str(res.get("status") or "")
         if st_face == "no_face_photo":
             lines.append(
@@ -711,6 +713,28 @@ def build_step4_apify_call_error_alert_text(*, error: str) -> str:
     return f"ошибка в шаге 4\n{err}"
 
 
+def build_sherlock_subscription_ended_alert_text() -> str:
+    """Alert when Step 5 pre-flight reports ``pool.by_status.idle == 0``."""
+    return "\n".join(
+        [
+            "Закончилась подписка на шерлок",
+            "Step: Step 5",
+            "Sherlock pre-flight skipped: no idle accounts in pool.",
+        ]
+    )
+
+
+def build_sherlock_api_unavailable_alert_text(*, health_probe_attempts: int) -> str:
+    """Alert when Step 5 pre-flight cannot reach ``GET /v1/health``."""
+    return "\n".join(
+        [
+            "АПИ шерлока не доступно",
+            "Step: Step 5",
+            f"Health probe failed after {health_probe_attempts} attempt(s).",
+        ]
+    )
+
+
 def build_sherlock_batch_all_failed_alert_text(*, leads_processed: int) -> str:
     """Alert when every lead in a Step 5 batch finished with ``sherlock_status=error``."""
     return "\n".join(
@@ -888,6 +912,31 @@ class PipelineTelegramNotifier:
             build_step4_apify_call_error_alert_text(error=err_text)
         )
         log.warning("step4_apify_call_error_alert", error=err_text)
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def notify_step5_sherlock_subscription_ended(self) -> None:
+        """Send to ``alert_chat_id`` when Sherlock pool has no idle accounts."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        text = truncate_for_telegram(build_sherlock_subscription_ended_alert_text())
+        log.warning("step5_sherlock_subscription_ended_alert")
+        self._send_sync(text, chat_id=self._alert_chat_id)
+
+    def notify_step5_sherlock_api_unavailable(
+        self, *, health_probe_attempts: int
+    ) -> None:
+        """Send to ``alert_chat_id`` when Sherlock health probe never succeeds."""
+        if not self._alerts_enabled or self._alert_chat_id is None:
+            return
+        text = truncate_for_telegram(
+            build_sherlock_api_unavailable_alert_text(
+                health_probe_attempts=health_probe_attempts,
+            )
+        )
+        log.warning(
+            "step5_sherlock_api_unavailable_alert",
+            health_probe_attempts=health_probe_attempts,
+        )
         self._send_sync(text, chat_id=self._alert_chat_id)
 
     def maybe_notify_sherlock_batch_all_failed(
@@ -1112,6 +1161,15 @@ class PipelineTelegramNotifier:
     ) -> None:
         if not self._enabled:
             return
+        if res.get("nick_hit"):
+            nick_res = {
+                "status": _SH_FOUND_NICK,
+                "telegram_username": res.get("nick_telegram_username"),
+            }
+            nick_summary = truncate_for_telegram(
+                build_sherlock_lead_result_summary_text(lead, nick_res)
+            )
+            self._send_sync(nick_summary)
         text2 = truncate_for_telegram(
             build_sherlock_lead_notification_text(lead, res)
         )

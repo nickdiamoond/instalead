@@ -79,6 +79,7 @@ INTERACTIONS_PATH = "/v1/tasks/{task_id}/interactions"
 DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_MAX_WAIT = 300.0
 DEFAULT_HTTP_TIMEOUT = 90.0
+DEFAULT_HEALTH_PROBE_MAX_ATTEMPTS = 3
 
 # Image content types Sherlock advertises (JPEG / PNG). Anything else
 # is sent as ``application/octet-stream`` -- the server still accepts
@@ -201,10 +202,9 @@ class SherlockClient:
             log.warning("sherlock_pool_idle_fallback", error=str(exc),
                         fallback=fallback)
             return fallback
-        pool = body.get("pool") or {}
-        by_status = pool.get("by_status") or {}
-        idle = by_status.get("idle")
-        if not isinstance(idle, int) or idle < 1:
+        pool = body.get("pool")
+        idle = pool_idle_count(pool if isinstance(pool, dict) else None)
+        if idle is None or idle < 1:
             log.warning("sherlock_pool_idle_unusable", pool=pool,
                         fallback=fallback)
             return fallback
@@ -409,3 +409,52 @@ def make_sherlock_client(
         poll_interval=poll_interval,
         max_wait=max_wait,
     )
+
+
+def pool_idle_count(pool: dict | None) -> int | None:
+    """Return ``pool.by_status.idle`` as int, or None if missing/unparseable."""
+    if not pool:
+        return None
+    idle = (pool.get("by_status") or {}).get("idle")
+    if isinstance(idle, int):
+        return idle
+    if idle is not None:
+        try:
+            return int(idle)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def probe_health_pool_idle(
+    client: SherlockClient,
+    *,
+    max_attempts: int = DEFAULT_HEALTH_PROBE_MAX_ATTEMPTS,
+) -> tuple[dict | None, int]:
+    """Probe ``GET /v1/health`` up to *max_attempts* times.
+
+    Returns ``(body, idle)`` when HTTP succeeds (``idle`` is 0 if the field is
+    absent). Returns ``(None, 0)`` when every attempt raises — callers should
+    treat ``body is None`` as API unavailable.
+    """
+    last_error: str | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            body = client.health()
+            pool = body.get("pool")
+            idle = pool_idle_count(pool if isinstance(pool, dict) else None)
+            return body, idle if idle is not None else 0
+        except (SherlockError, requests.RequestException) as exc:
+            last_error = str(exc)
+            log.warning(
+                "sherlock_health_probe_failed",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                error=last_error,
+            )
+    log.error(
+        "sherlock_health_probe_exhausted",
+        attempts=max_attempts,
+        last_error=last_error,
+    )
+    return None, 0

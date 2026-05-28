@@ -7,7 +7,14 @@ from pathlib import Path
 from openai import OpenAI
 
 from src.db import LeadDB
-from src.sherlock_client import SherlockError, make_sherlock_client
+from src.sherlock_client import (
+    DEFAULT_HEALTH_PROBE_MAX_ATTEMPTS,
+    SherlockError,
+    make_sherlock_client,
+    probe_health_pool_idle,
+)
+
+SHERLOCK_HEALTH_PROBE_MAX_ATTEMPTS = DEFAULT_HEALTH_PROBE_MAX_ATTEMPTS
 from src.telegram_notifier import PipelineTelegramNotifier
 
 from scripts.pipeline_lib.constants import (
@@ -15,7 +22,6 @@ from scripts.pipeline_lib.constants import (
     PHOTO_TASK_ETA_S,
     SHERLOCK_EXACT_MATCH_SUBSTRING,
     SH_STATUS_ERROR,
-    SH_STATUS_FOUND_NICK,
     SH_STATUS_FOUND_PHOTO,
     SH_STATUS_NO_FACE_PHOTO,
     SH_STATUS_NO_MATCH,
@@ -139,13 +145,15 @@ def _resolve_one_lead_via_sherlock(
     deepseek: OpenAI | None = None,
     usermatch_prompt: str,
 ) -> dict:
-    """Run the full nick->photo flow for one lead.
+    """Run nick (informational) then photo (authoritative) for one lead.
 
     Pure function w.r.t. the DB: returns a dict that the orchestrator
-    persists via :py:meth:`LeadDB.mark_lead_sherlock`. Never raises --
-    every exception path resolves to ``status=error`` with a populated
-    ``error`` message so a single misbehaving lead doesn't sink the
-    whole batch.
+    persists via :py:meth:`LeadDB.mark_lead_sherlock` using only the
+    photo-stage ``status`` and contact fields. Nick hits are exposed as
+    ``nick_hit`` / ``nick_telegram_username`` for Telegram logs only.
+    Never raises -- every exception path resolves to ``status=error``
+    with a populated ``error`` message so a single misbehaving lead
+    doesn't sink the whole batch.
     """
     username = lead["username"]
     out: dict = {
@@ -158,6 +166,8 @@ def _resolve_one_lead_via_sherlock(
         "nick_skipped_dot": "." in username,
         "nick_search_ran": False,
         "nick_hit": False,
+        "nick_telegram_username": None,
+        "nick_sherlock_link": None,
         "photo_search_ran": False,
         "photo_task": None,
         "nick_query": None if "." in username else f"@{username}",
@@ -197,13 +207,9 @@ def _resolve_one_lead_via_sherlock(
                         match.get("link")
                         or f"https://t.me/{tg_username}"
                     )
-                    out.update({
-                        "status": SH_STATUS_FOUND_NICK,
-                        "telegram_username": tg_username,
-                        "sherlock_link": tg_link,
-                        "nick_hit": True,
-                    })
-                    return out
+                    out["nick_hit"] = True
+                    out["nick_telegram_username"] = tg_username
+                    out["nick_sherlock_link"] = tg_link
         except (SherlockError, TimeoutError) as exc:
             out["error"] = f"nick: {exc}"
         except Exception as exc:  # noqa: BLE001
@@ -360,6 +366,7 @@ def _step_5_resolve_contacts_via_sherlock(
     tg_notifier: PipelineTelegramNotifier,
     deepseek: OpenAI | None,
     usermatch_prompt: str,
+    health_probe_max_attempts: int = SHERLOCK_HEALTH_PROBE_MAX_ATTEMPTS,
 ) -> None:
     """Run Sherlock contact resolution for naked leads (parallel or sequential)."""
     _banner("STEP 5: Resolve contacts via Sherlock")
@@ -379,6 +386,35 @@ def _step_5_resolve_contacts_via_sherlock(
         return
 
     try:
+        health_body, pool_idle = probe_health_pool_idle(
+            sherlock,
+            max_attempts=health_probe_max_attempts,
+        )
+        if health_body is None:
+            tg_notifier.notify_step5_sherlock_api_unavailable(
+                health_probe_attempts=health_probe_max_attempts,
+            )
+            print("  SKIPPED: Step 5 (Sherlock pre-flight).")
+            log.warning(
+                "step5_skip_api_unavailable",
+                attempts=health_probe_max_attempts,
+            )
+            issues.append((
+                "Step 5",
+                f"Sherlock API unavailable after {health_probe_max_attempts} "
+                "health probe(s)",
+            ))
+            return
+        if pool_idle < 1:
+            tg_notifier.notify_step5_sherlock_subscription_ended()
+            print("  SKIPPED: Step 5 (Sherlock pre-flight).")
+            log.warning("step5_skip_no_idle_accounts", pool_idle=pool_idle)
+            issues.append((
+                "Step 5",
+                "Sherlock pool has no idle accounts (subscription ended?)",
+            ))
+            return
+
         gap_s = max(0.0, float(request_gap_secs))
         if sequential:
             workers = 1
@@ -390,24 +426,20 @@ def _step_5_resolve_contacts_via_sherlock(
             workers = max(1, int(conc_cfg["workers"]))
             workers_source = "config.yaml sherlock.concurrency.workers"
         else:
-            workers = sherlock.get_pool_idle(fallback=3)
-            workers_source = "/v1/health pool.idle"
+            workers = max(1, pool_idle)
+            workers_source = "/v1/health pool.idle (pre-flight)"
 
         candidates = db.get_leads_for_sherlock(limit=batch_limit)
         with_face = sum(1 for c in candidates if c.get("face_photo_path"))
 
         n = len(candidates)
+        per_lead_s = NICK_TASK_ETA_S + PHOTO_TASK_ETA_S
         if sequential:
-            best_eta = n * NICK_TASK_ETA_S
-            worst_eta = n * NICK_TASK_ETA_S + with_face * PHOTO_TASK_ETA_S
+            eta = n * per_lead_s
             if gap_s > 0 and n > 1:
-                best_eta += gap_s * (n - 1)
-                worst_eta += gap_s * (n - 1)
+                eta += gap_s * (n - 1)
         else:
-            best_eta = (n * NICK_TASK_ETA_S) / max(workers, 1)
-            worst_eta = (
-                n * NICK_TASK_ETA_S + with_face * PHOTO_TASK_ETA_S
-            ) / max(workers, 1)
+            eta = (n * per_lead_s) / max(workers, 1)
 
         if not sequential and gap_s > 0:
             print(
@@ -420,16 +452,17 @@ def _step_5_resolve_contacts_via_sherlock(
             )
 
         print(f"  Candidates:        {n}")
-        print(f"  With face photo:   {with_face}  (eligible for photo fallback)")
+        print(
+            f"  With face photo:   {with_face}  "
+            "(all candidates require photo search)"
+        )
         print(f"  Workers:           {workers}  (from {workers_source})")
         if sequential and gap_s > 0:
             print(
                 f"  Gap between leads: {gap_s}s  (pipeline.step5.request_gap_secs)"
             )
-        print(f"  Best-case ETA:     {_format_eta(best_eta)}  "
-              f"(every nick search hits)")
-        print(f"  Worst-case ETA:    {_format_eta(worst_eta)}  "
-              f"(every photo fallback runs)")
+        print(f"  Estimated ETA:     {_format_eta(eta)}  "
+              f"(nick + photo per lead)")
 
         if n == 0:
             print("  SKIPPED: no candidates.")
@@ -454,7 +487,7 @@ def _step_5_resolve_contacts_via_sherlock(
         )
 
         counters: dict[str, int] = {
-            SH_STATUS_FOUND_NICK: 0,
+            "nick_hits": 0,
             SH_STATUS_FOUND_PHOTO: 0,
             SH_STATUS_NO_MATCH: 0,
             SH_STATUS_NO_FACE_PHOTO: 0,
@@ -474,6 +507,8 @@ def _step_5_resolve_contacts_via_sherlock(
                 "nick_skipped_dot": "." in username,
                 "nick_search_ran": False,
                 "nick_hit": False,
+                "nick_telegram_username": None,
+                "nick_sherlock_link": None,
                 "photo_search_ran": False,
                 "photo_task": None,
                 "nick_query": None if "." in username else f"@{username}",
@@ -490,6 +525,8 @@ def _step_5_resolve_contacts_via_sherlock(
                 sherlock_link=res.get("sherlock_link"),
             )
             tg_notifier.notify_sherlock_lead(lead, res, cfg=cfg)
+            if res.get("nick_hit"):
+                counters["nick_hits"] = counters.get("nick_hits", 0) + 1
             if res.get("step5_deepseek_called"):
                 step5_deepseek_calls += 1
                 if not res.get("step5_deepseek_api_failed"):

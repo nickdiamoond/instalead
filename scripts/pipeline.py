@@ -105,7 +105,10 @@ from scripts.pipeline_lib.step4_faces import (
     _reconcile_step4_ephemeral_avatar,
     face_bbox_percent_of_image,
 )
-from scripts.pipeline_lib.step5_sherlock import _step_5_resolve_contacts_via_sherlock
+from scripts.pipeline_lib.step5_sherlock import (
+    SHERLOCK_HEALTH_PROBE_MAX_ATTEMPTS,
+    _step_5_resolve_contacts_via_sherlock,
+)
 from scripts.pipeline_lib.step6_cleanup import _step_6_cleanup_spent_face_assets
 
 setup_logging()
@@ -1348,6 +1351,10 @@ def main():
     # no phone / telegram. Step 4's contact_extractor wins ties; we
     # don't overwrite anything it found. Skipped entirely under
     # --skip-sherlock or if the SHERLOCK_API_KEY is missing.
+    #
+    # Pre-flight: GET /v1/health (up to SHERLOCK_HEALTH_PROBE_MAX_ATTEMPTS
+    # retries). Skip Step 5 when pool.by_status.idle is 0 or the API never
+    # answers; alerts go to telegram.alert_chat_id (not the terminal).
     if args.skip_sherlock:
         _banner("STEP 5: Resolve contacts via Sherlock")
         print("  SKIPPED by --skip-sherlock.")
@@ -1366,6 +1373,7 @@ def main():
             tg_notifier=tg_notifier,
             deepseek=deepseek,
             usermatch_prompt=usermatch_prompt,
+            health_probe_max_attempts=SHERLOCK_HEALTH_PROBE_MAX_ATTEMPTS,
         )
 
     # ============================================================

@@ -25,18 +25,18 @@ def test_build_nick_hit_includes_prefixed_handle() -> None:
         "context_comment_pk": "123",
     }
     res = {
-        "status": "found_nick",
-        "telegram_username": "AliceTG",
+        "status": "no_match",
         "nick_hit": True,
+        "nick_telegram_username": "AliceTG",
         "nick_search_ran": True,
         "nick_skipped_dot": False,
-        "photo_search_ran": False,
-        "photo_task": None,
+        "photo_search_ran": True,
+        "photo_task": {"status": "completed", "id": "tid", "result": {"results": []}},
         "nick_query": "@alice",
     }
     txt = build_sherlock_lead_notification_text(lead, res)
     assert "Telegram match (nick search): @AliceTG" in txt
-    assert "Photo search — full Sherlock task JSON" not in txt
+    assert "Photo search — full Sherlock task JSON" in txt
     assert "Comment: https://www.instagram.com/p/ABC/c/123/" in txt
     assert "Sherlock contact saved to DB" not in txt
 
@@ -63,16 +63,36 @@ def test_build_nick_saved_normalizes_without_at_prefix() -> None:
     txt = build_sherlock_lead_notification_text(
         {"username": "carol"},
         {
-            "status": "found_nick",
-            "telegram_username": "@carolk",
+            "status": "no_match",
             "nick_hit": True,
+            "nick_telegram_username": "@carolk",
             "nick_search_ran": True,
             "nick_skipped_dot": False,
-            "photo_search_ran": False,
+            "photo_search_ran": True,
+            "photo_task": {"id": "t"},
             "nick_query": "@carol",
         },
     )
     assert "Telegram match (nick search): @carolk" in txt
+
+
+def test_build_nick_hit_and_photo_json_both_present() -> None:
+    txt = build_sherlock_lead_notification_text(
+        {"username": "dana"},
+        {
+            "status": "no_match",
+            "nick_hit": True,
+            "nick_telegram_username": "DanaTG",
+            "nick_search_ran": True,
+            "nick_skipped_dot": False,
+            "photo_search_ran": True,
+            "photo_task": {"status": "completed", "id": "photo-1"},
+            "nick_query": "@dana",
+        },
+    )
+    assert "Telegram match (nick search): @DanaTG" in txt
+    assert "Photo search — full Sherlock task JSON" in txt
+    assert '"id": "photo-1"' in txt
 
 
 def test_truncate_for_long_payload() -> None:
@@ -114,16 +134,19 @@ def test_notify_sherlock_lead_dispatches(mock_bot_class: MagicMock) -> None:
     n.notify_sherlock_lead(
         {"username": "eve"},
         {
-            "status": "found_nick",
-            "telegram_username": "EveTG",
+            "status": "no_match",
             "nick_hit": True,
+            "nick_telegram_username": "EveTG",
             "nick_search_ran": True,
             "nick_skipped_dot": False,
-            "photo_search_ran": False,
+            "photo_search_ran": True,
+            "photo_task": {"id": "t"},
             "nick_query": "@eve",
         },
     )
     assert mock_bot.send_message.await_count == 2
+    calls = mock_bot.send_message.await_args_list
+    assert all(c.kwargs["chat_id"] == -1 for c in calls)
 
 
 def test_build_sherlock_result_summary_nick_hit() -> None:
@@ -158,7 +181,7 @@ def test_build_sherlock_result_summary_photo_exact() -> None:
     s = build_sherlock_lead_result_summary_text(lead, res)
     assert 'Результат по "bobtg"' in s
     assert "Профиль: https://www.instagram.com/bob/" in s
-    assert "person: Иван Иванов" in s
+    assert "person: Иван" in s
     assert "Телефон: +7999" in s
     assert "совпадение: точное совпадение" in s
 
