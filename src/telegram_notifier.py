@@ -2,10 +2,11 @@
 
 Uses Bot API ``sendMessage`` via aiogram. Disabled when ``TELEGRAM_BOT_TOKEN``
 is missing or ``telegram.report_chat_id`` is absent/invalid — the pipeline
-keeps running. Step 2 human inline confirmations go to ``telegram.result_chat_id``
-when set. Step 5: nick-hit Russian summaries and detailed logs go to
-``telegram.report_chat_id``; photo-hit Russian summaries go to
-``telegram.result_chat_id`` only; misses stay in the report chat."""
+keeps running. Step 2 human inline confirmations and Step 5 photo-hit Russian
+summaries are routed to the lead's *region* result chat
+(``region_definitions.<region>.result_chat_id``), falling back to
+``telegram.report_chat_id`` when the region has none. Step 5 nick-hit
+summaries and detailed logs always go to ``telegram.report_chat_id``."""
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +23,7 @@ from aiogram.types import FSInputFile
 
 from src.ig_media_payload import parse_item_timestamp_utc
 from src.logger import get_logger
+from src.regions import region_result_chat_id
 
 log = get_logger("telegram_notifier")
 
@@ -553,6 +555,12 @@ def build_sherlock_lead_notification_text(lead: dict, res: dict) -> str:
                 "a Telegram profile; photo stage did not run or did not finish."
             )
 
+    if res.get("skipped_ban_keywords"):
+        lines.append(
+            "Лид пропущен - содержит слова из категории недвижимость "
+            "в био или имени"
+        )
+
     return "\n".join(lines)
 
 
@@ -644,18 +652,6 @@ def _parse_report_chat_id(cfg: dict[str, Any]) -> int | None:
         return int(raw)
     except (TypeError, ValueError):
         log.warning("telegram_invalid_report_chat_id", raw=raw)
-        return None
-
-
-def _parse_result_chat_id(cfg: dict[str, Any]) -> int | None:
-    tg = cfg.get("telegram") or {}
-    raw = tg.get("result_chat_id")
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        log.warning("telegram_invalid_result_chat_id", raw=raw)
         return None
 
 
@@ -802,13 +798,11 @@ class PipelineTelegramNotifier:
         token: str | None,
         chat_id: int | None,
         *,
-        result_chat_id: int | None = None,
         alert_chat_id: int | None = None,
         enabled: bool = True,
     ) -> None:
         self._token = (token or "").strip() or None
         self._chat_id = chat_id
-        self._result_chat_id = result_chat_id
         self._alert_chat_id = alert_chat_id
         has_pair = bool(self._token and self._chat_id is not None)
         self._enabled = bool(enabled and has_pair)
@@ -832,26 +826,25 @@ class PipelineTelegramNotifier:
                 )
 
     def inline_confirm_token_and_chat(self) -> tuple[str, int] | None:
-        """``(token, chat_id)`` for Step 2 inline polling; chat is ``result_chat_id`` if set."""
+        """``(token, chat_id)`` for Step 2 inline polling.
+
+        The returned chat is the report chat -- it's only the *fallback*
+        destination for confirmations. Step 2 resolves each post's region
+        chat via ``region_result_chat_id`` and only uses this when a post
+        has no region chat (region=NULL or undefined).
+        """
         if not self._enabled or self._token is None or self._chat_id is None:
             return None
-        confirm_chat = (
-            self._result_chat_id
-            if self._result_chat_id is not None
-            else self._chat_id
-        )
-        return (self._token, confirm_chat)
+        return (self._token, self._chat_id)
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> PipelineTelegramNotifier:
         token = os.environ.get(TOKEN_ENV_VAR)
         chat_id = _parse_report_chat_id(cfg)
-        result_chat_id = _parse_result_chat_id(cfg)
         alert_chat_id = _parse_alert_chat_id(cfg)
         return cls(
             token,
             chat_id,
-            result_chat_id=result_chat_id,
             alert_chat_id=alert_chat_id,
         )
 
@@ -1161,11 +1154,37 @@ class PipelineTelegramNotifier:
         )
         self._send_sync(text)
 
+    def _resolve_result_chat(
+        self, region: str | None, cfg: dict[str, Any] | None
+    ) -> int | None:
+        """Per-region result chat, falling back to the report chat.
+
+        When ``region`` and ``cfg`` are both supplied, route to that region's
+        ``result_chat_id`` (resolved via :func:`region_result_chat_id`). When
+        the region has no chat (region=NULL / undefined) fall back to the
+        report chat -- there is no global result chat anymore.
+        """
+        if region and cfg is not None:
+            chat = region_result_chat_id(cfg, region)
+            if chat is not None:
+                return chat
+        return self._chat_id
+
     def notify_sherlock_lead(
-        self, lead: dict, res: dict, *, cfg: dict[str, Any] | None = None
+        self,
+        lead: dict,
+        res: dict,
+        *,
+        cfg: dict[str, Any] | None = None,
+        region: str | None = None,
     ) -> None:
         if not self._enabled:
             return
+        # Region drives the destination result chat. Caller may pass it
+        # explicitly; otherwise derive from the lead row (context link's
+        # region first, then the lead's denormalized region).
+        if region is None:
+            region = lead.get("context_region") or lead.get("region")
         if res.get("nick_hit"):
             nick_res = {
                 "status": _SH_FOUND_NICK,
@@ -1184,11 +1203,7 @@ class PipelineTelegramNotifier:
             text3 = truncate_for_telegram(
                 build_sherlock_lead_result_summary_text(lead, res)
             )
-            summary_chat = (
-                self._result_chat_id
-                if self._result_chat_id is not None
-                else self._chat_id
-            )
+            summary_chat = self._resolve_result_chat(region, cfg)
         if (
             bool(res.get("photo_search_ran"))
             and cfg is not None

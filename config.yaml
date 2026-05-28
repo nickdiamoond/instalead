@@ -30,90 +30,67 @@ apify:
     cookie_search_posts: "crawlerbros/instagram-keyword-search-scraper"
     posts: "apify/instagram-post-scraper"       # посты конкретного аккаунта
 
-search:
-  # Method 1: поиск по хештегам (через instagram-hashtag-scraper)
-  hashtags:
-    - "квартирапитер"
-    - "недвижимостьпитер"
-    - "спбнедвижимость"
-    - "спбквартира"
-    - "квартираспб"
-    - "недвижимостьспб"
-    - "недвижимостьпетербург"
-    - "новостройкиспб"
-    - "купитьквартируспб"
-    - "жильеспб"
-
-  # Same topics as ``search.hashtags`` but for keyword search (no leading ``#``).
-  # Used when ``pipeline.step1.discovery_mode`` is ``cookie_keywords`` and by
-  # ``scripts/test_cookie_keyword_search.py``.
-  cookie_search_keywords:
-    - "новостройки"
-
-  # Instagram usernames (no @). Used by the daily pipeline when
-  # ``pipeline.step1.discovery_mode`` is ``realtors`` (instagram-post-scraper).
-  realtor_accounts:
-    - "tochno__partners"
-    - "tochno.life"
-    - "metriks_development"
-    - "1dogma"
-    - "sskuban"
-    - "incitydevelopment"
-    - "bauinvest_group"
-    - "gk.nvm.south"
-    - "darstroy.krasnodar"
-    - "gk_usi"
-    - "familia_dev"
-    - "garantiya.krasnodar"
-    - "avakrasnodar"
-    - "europeya.ru"
-    - "mooe_krasnodar"
-    - "novostroiki_krasnodara_"
-    - "valeria__pivovarova"
-    - "svoi.live"
-    - "smartrielt"
-    - "ayax.realty"
-    - "sashaipoteka"
-    - "krasnodar_kvartiry"
-    - "krasnodar_regina"
-    - "goncharov_nedvizhimost"
-    - "svoya.vkrasnodare"
-    - "proipoteka.ru"
-    - "kamila_ipoteka"
-    - "annet_fokina"
-    - "volkova_top_estate"
-    - "group_etalon"
-    - "mrgroup_rus"
-    - "pioneergroup"
-    - "sminex_developer"
-    - "capitalgroupcorp"
-    - "whitewillestate"
-    - "brusnika.company"
-    - "vesper_moscow"
-    - "forma.russia"
-    - "homexpert.me"
-    - "andreyneginskiy"
-    - "lsr.petersburg"
-    - "strana_com"
-    - "pik"
-    - "i.love.msk"
-    - "bigcity_moscow_"
-    - "svetlana.nedvizka"
-    - "ks_makarenko"
-    - "bozhenko_marina"
-    - "sofi_lubimova"
-    - "vasilii_kholodnyak"
-    - "sk_10_official"
-    - "donneftestroi161"
-    - "sk_smu1"
-    - "donneftestroi161"
-    - "msk_rostov"
+# Region catalog. Each region bundles its own discovery sources
+# (realtor_accounts / hashtags / cookie_search_keywords) and the Telegram
+# ``result_chat_id`` that Step 2 human confirmations and Step 5 lead results
+# for that region are routed to.
+#
+# Source *content* lives here per region. Source *type* selection
+# (realtors / hashtags / cookie_keywords) stays global in
+# ``pipeline.step1.discovery_mode``; cookie actor tuning stays in
+# ``pipeline.step1.cookie_search``. Active regions for a run are chosen via
+# ``pipeline.regions`` (analogous to ``discovery_mode``). A region whose
+# corresponding source list is empty is simply skipped for that mode.
+#
+# Each active region MUST define its own ``result_chat_id``. There is no
+# global result chat anymore -- if a region omits it (or a legacy DB row has
+# ``region = NULL``), Step 2/Step 5 messages fall back to ``telegram.report_chat_id``.
+region_definitions:
+  moscow:
+    # TODO(nick): replace with the real Moscow result chat id.
+    result_chat_id: -5272096712 #-5170924502
+    realtor_accounts:
+      - "tochno__partners"
+      - "tochno.life"
+      - "metriks_development"
+      - "1dogma"
+      - "sskuban"
+      - "incitydevelopment"
+      - "bauinvest_group"
+      - "gk.nvm.south"
+      - "darstroy.krasnodar"
+      - "gk_usi"
+    hashtags:
+      - "квартирамск"
+      - "недвижимостьмск"
+    cookie_search_keywords:
+      - "новостройки москва"
+      - "квартиры москва"
+  rostov:
+    # TODO(nick): replace with the real Rostov result chat id.
+    result_chat_id: -5296829601 #-5170924502
+    realtor_accounts:
+      - "volkova_top_estate"
+      - "group_etalon"
+      - "mrgroup_rus"
+      - "pioneergroup"
+      - "sminex_developer"
+      - "capitalgroupcorp"
+      - "whitewillestate"
+      - "brusnika.company"
+      - "vesper_moscow"
+      - "forma.russia"
+    hashtags:
+      - "квартираростов"
+      - "недвижимостьростов"
+    cookie_search_keywords:
+      - "новостройки ростов"
+      - "квартиры ростов"
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -1003909022341 #Chat for logs
-  result_chat_id: -5170924502 #Chat for clear results and confirmations only no logs
-  alert_chat_id: -1003926996735 #Chat for alerts and notifications only no logs
+  report_chat_id: -5255644193 #-1003909022341 #Chat for logs (also the fallback when a region has no result_chat_id)
+  alert_chat_id: -5255644193 #-1003926996735 #Chat for alerts and notifications only no logs
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
@@ -127,20 +104,31 @@ pipeline:
   # unattended runs (no terminal prompts; expensive steps always run).
   prompt_terminal_confirmation: false
 
+  # Active regions for this run (analogous to step1.discovery_mode). Each name
+  # must exist under top-level ``region_definitions``. Single region (string)
+  # or several (YAML list) — Step 1 runs per-region discovery, and the region
+  # tag is carried through posts -> leads so Step 2 / Step 5 route results to
+  # each region's ``result_chat_id``.
+  regions:
+    - moscow
+    - rostov
+
   step1:
     # Where Step 1 discovers posts. Single mode (string) or several (YAML list).
     # Values: realtors | hashtags | cookie_keywords — all listed modes run each
     # pipeline invocation; posts are merged by shortCode across modes.
-    # realtors: instagram-post-scraper on search.realtor_accounts
-    # hashtags: instagram-hashtag-scraper on search.hashtags
-    # cookie_keywords: crawlerbros keyword search on search.cookie_search_keywords
+    # realtors: instagram-post-scraper on region_definitions.<region>.realtor_accounts
+    # hashtags: instagram-hashtag-scraper on region_definitions.<region>.hashtags
+    # cookie_keywords: crawlerbros keyword search on region_definitions.<region>.cookie_search_keywords
     #   (requires INSTAGRAM_SESSION_COOKIE or pipeline.step1.cookie_search.session_cookie_env_var).
-    # For hashtags and cookie_keywords, posts_max_age_days is applied client-side
-    # after fetch (see src.ig_media_payload). A mode with empty sources is skipped.
-    discovery_mode: realtors
-    # discovery_mode:
-    #   - realtors
-    #   - hashtags
+    # Each active region (pipeline.regions) supplies its own source lists; Step 1
+    # loops regions x modes. For hashtags and cookie_keywords, posts_max_age_days
+    # is applied client-side after fetch (see src.ig_media_payload). A region/mode
+    # pair with an empty source list is skipped.
+    #discovery_mode: realtors
+    discovery_mode:
+       - realtors
+       - cookie_keywords
     # crawlerbros keyword-search actor (``apify.actors.cookie_search_posts``): maxPosts per
     # keyword, cookie env var name, session label. Only used when discovery_mode=cookie_keywords.
     cookie_search:
@@ -173,7 +161,7 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 500
+    louisdeconinck_comments_cap_per_post: 20
     # Step 3 fallback (apidojo-api): actor input maxItems is a run-wide
     # total, not per-post. Pipeline sends maxItems = cap * posts_in_batch.
     apidojo_comments_cap_per_post: 2000
@@ -186,14 +174,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 500
+    batch_limit: 50
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock runs nick (~30s) then photo
     # (~135s) per lead. 1000 leads on a 3-account pool is already a
     # multi-hour run; bigger pools could safely raise this.
-    batch_limit: 500
+    batch_limit: 10
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to
     # restore parallel Step 5.

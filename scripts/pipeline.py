@@ -62,6 +62,13 @@ from src.instagram_cookie_search import (
 )
 from src.logger import setup_logging
 from src.pipeline_logger import PipelineLogger
+from src.regions import (
+    parse_active_regions,
+    region_cookie_keywords,
+    region_hashtags,
+    region_realtor_accounts,
+    region_result_chat_id,
+)
 from src.telegram_notifier import (
     PipelineTelegramNotifier,
     build_step1_date_filter_section_lines,
@@ -90,7 +97,7 @@ from scripts.pipeline_lib.defaults import (
     DEFAULT_STEP4_BATCH_LIMIT,
 )
 from scripts.pipeline_lib.ig_shortcode import caption_is_empty, shortcode_to_id
-from scripts.pipeline_lib.io_utils import _banner, _realtor_usernames_from_cfg
+from scripts.pipeline_lib.io_utils import _banner
 from scripts.pipeline_lib.logging import log
 from scripts.pipeline_lib.scoring import (
     _apply_language_gate_irrelevant,
@@ -205,6 +212,7 @@ def main():
     discovery_modes = parse_step1_discovery_modes(
         s1_cfg.get("discovery_mode", DEFAULT_STEP1_DISCOVERY_MODE)
     )
+    active_regions = parse_active_regions(cfg)
     hashtag_results_limit = int(
         s1_cfg.get("hashtag_results_limit", post_scraper_results_limit)
     )
@@ -272,9 +280,30 @@ def main():
         issues.append(("Step 1", f"invalid discovery_mode: {invalid_modes}"))
         return
 
+    if not active_regions:
+        log.error("step1_no_active_regions")
+        print(
+            "FAILED: pipeline.regions is empty -- list at least one region "
+            "defined under region_definitions (e.g. moscow, rostov)."
+        )
+        issues.append(("Step 1", "pipeline.regions empty"))
+        return
+
+    region_catalog = cfg.get("region_definitions") or {}
+    unknown_regions = [r for r in active_regions if r not in region_catalog]
+    if unknown_regions:
+        log.error("step1_unknown_regions", regions=unknown_regions)
+        print(
+            "FAILED: pipeline.regions references region(s) absent from "
+            f"region_definitions: {unknown_regions!r}."
+        )
+        issues.append(("Step 1", f"unknown region(s): {unknown_regions}"))
+        return
+
     _banner(
         f"STEP 1: Fetch posts (≤{posts_max_age_days}d) "
-        f"[{format_step1_discovery_modes_label(discovery_modes)}]"
+        f"[{format_step1_discovery_modes_label(discovery_modes)}] "
+        f"regions=[{', '.join(active_regions)}]"
     )
 
     step1_cost_usd = 0.0
@@ -283,25 +312,40 @@ def main():
     step1_empty_issue = "Step 1 discovery returned 0 items after filters"
     source_counts: dict[str, int] = {}
     modes_ran: list[str] = []
+    regions_ran: list[str] = []
     step1_age_dropped_client: int | None = None
     step1_age_kept_missing_ts: int | None = None
     all_posts: list[dict] = []
+    # shortCode -> first region that discovered it (authoritative region tag).
+    # Decoupled from merge_hashtag_items_by_shortcode (whose tie-break can swap
+    # the in-memory item) so a shortcode seen in two regions keeps the first.
+    shortcode_region: dict[str, str] = {}
 
-    for discovery_mode in discovery_modes:
+    # Step 1 loops region x discovery_mode: each region supplies its own source
+    # content; region tag flows to processed_posts (first region wins).
+    region_mode_pairs = [
+        (region, mode) for region in active_regions for mode in discovery_modes
+    ]
+    for region, discovery_mode in region_mode_pairs:
         if discovery_mode == "realtors":
-            print("\n  --- realtors ---")
-            realtors = _realtor_usernames_from_cfg(cfg)
+            print(f"\n  --- {region} / realtors ---")
+            realtors = region_realtor_accounts(cfg, region)
             if not realtors:
-                log.warning("step1_skip_realtors", reason="search.realtor_accounts empty")
-                print(
-                    "  SKIP realtors: search.realtor_accounts is empty in config."
+                log.warning(
+                    "step1_skip_realtors",
+                    region=region,
+                    reason="region_definitions realtor_accounts empty",
                 )
-                issues.append(("Step 1", "search.realtor_accounts empty (skipped)"))
+                print(
+                    f"  SKIP {region}/realtors: region_definitions.{region}."
+                    "realtor_accounts is empty."
+                )
                 continue
 
             print(f"  Realtors:       {len(realtors)}")
             log.info(
                 "step1_fetch_posts",
+                region=region,
                 discovery_mode=discovery_mode,
                 realtors=len(realtors),
                 max_age_days=posts_max_age_days,
@@ -341,9 +385,14 @@ def main():
             step1_age_kept_missing_ts = (step1_age_kept_missing_ts or 0) + mode_kept_missing
             posts_age_stats = mode_age_stats
             step1_cost_usd += float(detail.get("usageTotalUsd") or 0)
+            for _it in mode_posts:
+                _sc = (_it.get("shortCode") or "").strip()
+                if _sc:
+                    shortcode_region.setdefault(_sc, region)
             all_posts = merge_hashtag_items_by_shortcode(all_posts, mode_posts)
-            source_counts["realtors"] = len(realtors)
+            source_counts["realtors"] = source_counts.get("realtors", 0) + len(realtors)
             modes_ran.append(discovery_mode)
+            regions_ran.append(region)
 
             pipeline.log_run(
                 actor_id="apify/instagram-post-scraper",
@@ -360,6 +409,7 @@ def main():
             )
             log.info(
                 "step1_realtor_age_filter",
+                region=region,
                 raw=len(posts_fetched),
                 after_filter=len(mode_posts),
                 merged_total=len(all_posts),
@@ -367,17 +417,24 @@ def main():
             )
 
         elif discovery_mode == "hashtags":
-            print("\n  --- hashtags ---")
-            hashtags = list((cfg.get("search") or {}).get("hashtags") or [])
+            print(f"\n  --- {region} / hashtags ---")
+            hashtags = region_hashtags(cfg, region)
             if not hashtags:
-                log.warning("step1_skip_hashtags", reason="search.hashtags empty")
-                print("  SKIP hashtags: search.hashtags is empty in config.")
-                issues.append(("Step 1", "search.hashtags empty (skipped)"))
+                log.warning(
+                    "step1_skip_hashtags",
+                    region=region,
+                    reason="region_definitions hashtags empty",
+                )
+                print(
+                    f"  SKIP {region}/hashtags: region_definitions.{region}."
+                    "hashtags is empty."
+                )
                 continue
 
             print(f"  Hashtags:       {len(hashtags)}")
             log.info(
                 "step1_fetch_posts",
+                region=region,
                 discovery_mode=discovery_mode,
                 hashtags=len(hashtags),
                 hashtag_results_limit=hashtag_results_limit,
@@ -466,11 +523,17 @@ def main():
             ) + int((reels_age_stats or {}).get("kept_missing_timestamp") or 0)
             step1_age_dropped_client = (step1_age_dropped_client or 0) + mode_dropped
             step1_age_kept_missing_ts = (step1_age_kept_missing_ts or 0) + mode_kept_missing
+            for _it in mode_posts:
+                _sc = (_it.get("shortCode") or "").strip()
+                if _sc:
+                    shortcode_region.setdefault(_sc, region)
             all_posts = merge_hashtag_items_by_shortcode(all_posts, mode_posts)
-            source_counts["hashtags"] = len(hashtags)
+            source_counts["hashtags"] = source_counts.get("hashtags", 0) + len(hashtags)
             modes_ran.append(discovery_mode)
+            regions_ran.append(region)
             log.info(
                 "step1_hashtag_merge",
+                region=region,
                 posts_raw=len(posts_fetched),
                 reels_raw=len(reels_fetched),
                 mode_posts=len(mode_posts),
@@ -480,24 +543,18 @@ def main():
             )
 
         elif discovery_mode == "cookie_keywords":
-            print("\n  --- cookie_keywords ---")
-            search_cfg = cfg.get("search") or {}
+            print(f"\n  --- {region} / cookie_keywords ---")
             cs_cfg = step1_cookie_search_section(cfg)
-            keywords = [
-                str(k).strip()
-                for k in (search_cfg.get("cookie_search_keywords") or [])
-                if str(k).strip()
-            ]
+            keywords = region_cookie_keywords(cfg, region)
             if not keywords:
                 log.warning(
                     "step1_skip_cookie_keywords",
-                    reason="search.cookie_search_keywords empty",
+                    region=region,
+                    reason="region_definitions cookie_search_keywords empty",
                 )
                 print(
-                    "  SKIP cookie_keywords: search.cookie_search_keywords is empty."
-                )
-                issues.append(
-                    ("Step 1", "search.cookie_search_keywords empty (skipped)")
+                    f"  SKIP {region}/cookie_keywords: region_definitions."
+                    f"{region}.cookie_search_keywords is empty."
                 )
                 continue
 
@@ -536,6 +593,7 @@ def main():
             print(f"  Keywords:       {len(keywords)}")
             log.info(
                 "step1_fetch_posts",
+                region=region,
                 discovery_mode=discovery_mode,
                 keywords=len(keywords),
                 max_posts_per_keyword=max_posts,
@@ -583,9 +641,16 @@ def main():
             step1_age_dropped_client = (step1_age_dropped_client or 0) + mode_dropped
             step1_age_kept_missing_ts = (step1_age_kept_missing_ts or 0) + mode_kept_missing
             reels_age_stats = None
+            for _it in mode_posts:
+                _sc = (_it.get("shortCode") or "").strip()
+                if _sc:
+                    shortcode_region.setdefault(_sc, region)
             all_posts = merge_hashtag_items_by_shortcode(all_posts, mode_posts)
-            source_counts["cookie_keywords"] = len(keywords)
+            source_counts["cookie_keywords"] = (
+                source_counts.get("cookie_keywords", 0) + len(keywords)
+            )
             modes_ran.append(discovery_mode)
+            regions_ran.append(region)
 
             pipeline.log_run(
                 actor_id=cookie_search_actor_id,
@@ -601,6 +666,7 @@ def main():
             )
             log.info(
                 "step1_cookie_keyword_merge",
+                region=region,
                 raw_dataset_rows=len(raw_items),
                 normalized=len(normalized),
                 deduped=len(deduped),
@@ -617,7 +683,8 @@ def main():
         issues.append(("Step 1", "all discovery modes skipped or failed to start"))
         return
 
-    discovery_mode_report = ",".join(modes_ran)
+    discovery_mode_report = ",".join(dict.fromkeys(modes_ran))
+    regions_ran_unique = list(dict.fromkeys(regions_ran))
     searched_summary = build_step1_searched_summary(source_counts)
     notify_secondary_count = sum(source_counts.values())
 
@@ -668,6 +735,7 @@ def main():
             else:
                 step1_existing_unchanged += 1
         else:
+            post_region = shortcode_region.get(shortcode)
             db.upsert_post(
                 shortcode,
                 post_url=p.get("url", ""),
@@ -680,6 +748,7 @@ def main():
                 caption=p.get("caption"),
                 timestamp=p.get("timestamp"),
                 **({"location": loc_label} if loc_label is not None else {}),
+                **({"region": post_region} if post_region is not None else {}),
             )
             new_posts += 1
             step1_new_post_items.append(p)
@@ -688,6 +757,8 @@ def main():
         "step1_done",
         discovery_modes=discovery_modes,
         modes_ran=modes_ran,
+        active_regions=active_regions,
+        regions_ran=regions_ran_unique,
         total_posts=len(all_posts),
         new=new_posts,
         updated=updated_posts,
@@ -708,6 +779,9 @@ def main():
         f"(new={new_posts}, updated={updated_posts}, "
         f"with_video={len(post_videos)}, skipped_no_video_url={skipped_no_video_url}) "
         f"cost=${step1_cost_usd:.4f}"
+    )
+    print(
+        f"  Regions ran: {', '.join(regions_ran_unique) if regions_ran_unique else '(none)'}"
     )
     print("  Step 1 · gate breakdown:")
     print(
@@ -764,7 +838,8 @@ def main():
     _banner("STEP 2: Score new posts (Lingua gate + DeepSeek)")
     with db._conn() as conn:
         unscored = conn.execute(
-            "SELECT post_id, caption, post_url, location FROM processed_posts "
+            "SELECT post_id, caption, post_url, location, region "
+            "FROM processed_posts "
             "WHERE relevance IS NULL"
         ).fetchall()
         unscored = [dict(r) for r in unscored]
@@ -883,6 +958,7 @@ def main():
                     "combined": combined,
                     "raw_score": dict(raw_score),
                     "location": p.get("location"),
+                    "region": p.get("region"),
                 }
             )
 
@@ -890,12 +966,24 @@ def main():
     human_stats = {"approved": 0, "denied": 0, "timeout": 0}
     creds = tg_notifier.inline_confirm_token_and_chat()
     if human_confirm_queue and creds:
-        token, chat_id = creds
-        human_stats = asyncio.run(
-            _run_step2_human_confirmations(
-                db, human_confirm_queue, token, chat_id
+        token, fallback_chat_id = creds  # fallback = report chat
+        # Route each post's confirmation to its region's result_chat
+        # (falling back to the report chat for region=NULL or a region
+        # without its own result_chat_id). Group by destination chat
+        # so posts sharing a chat keep their original sequential ordering.
+        chat_groups: dict[int, list[dict]] = {}
+        for item in human_confirm_queue:
+            chat = (
+                region_result_chat_id(cfg, item.get("region"))
+                or fallback_chat_id
             )
-        )
+            chat_groups.setdefault(chat, []).append(item)
+        for chat_id, group in chat_groups.items():
+            group_stats = asyncio.run(
+                _run_step2_human_confirmations(db, group, token, chat_id)
+            )
+            for k in human_stats:
+                human_stats[k] += group_stats[k]
     elif human_confirm_queue and not creds:
         log.warning(
             "step2_human_confirm_skipped",
@@ -1108,12 +1196,19 @@ def main():
                     if pk and pk not in unique:
                         unique[pk] = c
 
-                # Build media_id -> post mapping via shortcode
+                # Build media_id -> post mapping via shortcode. Each post
+                # carries its region (from processed_posts) so the lead and
+                # lead_post_link rows inherit it -- this is what lets Step 5
+                # route a lead's result to the right per-region chat.
                 post_lookup = {}
                 for p in posts_to_scan:
                     sc = p.get("shortcode")
                     if sc:
-                        post_lookup[shortcode_to_id(sc)] = (p["post_url"], sc)
+                        post_lookup[shortcode_to_id(sc)] = (
+                            p["post_url"],
+                            sc,
+                            p.get("region"),
+                        )
 
                 media_to_post = {}
                 for c in unique.values():
@@ -1123,9 +1218,9 @@ def main():
                     mid_str = str(mid)
                     if mid_str in media_to_post:
                         continue
-                    for real_id, (url, sc) in post_lookup.items():
+                    for real_id, (url, sc, reg) in post_lookup.items():
                         if abs(real_id - mid) < 1000:
-                            media_to_post[mid_str] = (url, sc)
+                            media_to_post[mid_str] = (url, sc, reg)
                             break
 
                 # Save leads
@@ -1137,6 +1232,10 @@ def main():
                         continue
                     uid = str(user.get("pk", ""))
 
+                    mid_str = str(c.get("media_id", ""))
+                    post_info = media_to_post.get(mid_str)
+                    lead_region = post_info[2] if post_info else None
+
                     is_new = db.add_lead_account(
                         username=username,
                         user_id=uid,
@@ -1144,12 +1243,11 @@ def main():
                         profile_pic_url=user.get("profile_pic_url", ""),
                         is_private=1 if user.get("is_private") else 0,
                         is_verified=1 if user.get("is_verified") else 0,
+                        **({"region": lead_region} if lead_region is not None else {}),
                     )
                     if is_new:
                         new_leads += 1
 
-                    mid_str = str(c.get("media_id", ""))
-                    post_info = media_to_post.get(mid_str)
                     if post_info:
                         db.add_lead_post_link(
                             username=username,
@@ -1159,6 +1257,11 @@ def main():
                             comment_pk=str(c.get("pk") or ""),
                             comment_text=c.get("text", "")[:500],
                             comment_at=str(c.get("created_at_utc", "")),
+                            **(
+                                {"region": lead_region}
+                                if lead_region is not None
+                                else {}
+                            ),
                         )
 
                 # Mark posts as scanned only on a non-empty dataset --
@@ -1449,9 +1552,12 @@ def main():
     ps = pipeline.summary()
 
     _banner("PIPELINE COMPLETE")
+    realtor_total = sum(
+        len(region_realtor_accounts(cfg, r)) for r in active_regions
+    )
     print(
-        "Realtor accounts (config): "
-        f"{len(_realtor_usernames_from_cfg(cfg))}"
+        "Realtor accounts (config, active regions): "
+        f"{realtor_total}"
     )
     print(f"Leads total:          {stats_after['leads_total']} (+{stats_after['leads_total'] - stats_before['leads_total']})")
     print(f"  with profile:       {stats_after['leads_with_profile']}")

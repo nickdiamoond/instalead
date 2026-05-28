@@ -1,7 +1,6 @@
 """Send a message with inline confirm/deny buttons; first click wins, then edit text.
 
-Reads ``telegram.result_chat_id`` (fallback: ``report_chat_id``) from ``config.yaml``
-and ``TELEGRAM_BOT_TOKEN``
+Reads ``telegram.report_chat_id`` from ``config.yaml`` and ``TELEGRAM_BOT_TOKEN``
 from the environment (same as ``src.telegram_notifier``). Run from repo root:
 
     python scripts/test_telegram_callback_buttons.py
@@ -29,7 +28,6 @@ from dotenv import load_dotenv
 from src.telegram_notifier import (
     TOKEN_ENV_VAR,
     _parse_report_chat_id,
-    _parse_result_chat_id,
 )
 
 # Hardcoded body shown before any answer (suffix added after first click).
@@ -68,11 +66,10 @@ async def main() -> None:
         raise SystemExit(f"Set {TOKEN_ENV_VAR} in the environment or .env")
 
     cfg = _load_cfg()
-    chat_id = _parse_result_chat_id(cfg) or _parse_report_chat_id(cfg)
+    chat_id = _parse_report_chat_id(cfg)
     if chat_id is None:
         raise SystemExit(
-            "config.yaml: telegram.result_chat_id and telegram.report_chat_id "
-            "missing or invalid"
+            "config.yaml: telegram.report_chat_id missing or invalid"
         )
 
     bot = Bot(token=token)

@@ -100,3 +100,62 @@ def test_get_leads_needing_avatar_includes_never_detected(db):
     rows = db.get_leads_needing_avatar(limit=10)
     assert len(rows) == 1
     assert rows[0]["username"] == "fresh"
+
+
+def test_post_region_round_trip(db):
+    db.upsert_post("p1", post_url="u1", region="moscow")
+    assert db.get_post("p1")["region"] == "moscow"
+
+
+def test_post_region_first_wins(db):
+    db.upsert_post("p1", post_url="u1", region="moscow")
+    # Second discovery (different region) must NOT overwrite the region,
+    # but other fields still update.
+    db.upsert_post("p1", region="rostov", comments_count=42)
+    row = db.get_post("p1")
+    assert row["region"] == "moscow"
+    assert row["comments_count"] == 42
+
+
+def test_post_region_set_when_initially_null(db):
+    db.upsert_post("p1", post_url="u1")
+    assert db.get_post("p1")["region"] is None
+    # A later upsert may set the region if it was never assigned.
+    db.upsert_post("p1", region="rostov")
+    assert db.get_post("p1")["region"] == "rostov"
+
+
+def test_lead_account_region_round_trip(db):
+    db.add_lead_account("user1", user_id="1", region="moscow")
+    with db._conn() as conn:
+        row = conn.execute(
+            "SELECT region FROM lead_accounts WHERE username = ?", ("user1",)
+        ).fetchone()
+    assert row["region"] == "moscow"
+
+
+def test_lead_post_link_region_round_trip(db):
+    db.add_lead_account("user1", user_id="1", region="moscow")
+    db.add_lead_post_link(
+        "user1", "https://ex/p/1/", user_id="1", region="moscow"
+    )
+    with db._conn() as conn:
+        row = conn.execute(
+            "SELECT region FROM lead_post_links WHERE username = ?", ("user1",)
+        ).fetchone()
+    assert row["region"] == "moscow"
+
+
+def test_get_leads_for_sherlock_exposes_region(db, tmp_path):
+    face = tmp_path / "f.jpg"
+    face.write_bytes(b"x")
+    db.add_lead_account("naked", user_id="7", region="rostov")
+    db.update_lead_profile("naked", full_name="N", is_private=0)
+    db.update_lead_face("naked", str(face))
+    db.add_lead_post_link(
+        "naked", "https://ex/p/9/", user_id="7", region="rostov"
+    )
+    rows = db.get_leads_for_sherlock(limit=10)
+    assert len(rows) == 1
+    assert rows[0]["region"] == "rostov"
+    assert rows[0]["context_region"] == "rostov"

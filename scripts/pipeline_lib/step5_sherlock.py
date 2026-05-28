@@ -543,7 +543,10 @@ def _step_5_resolve_contacts_via_sherlock(
                 phone=res.get("phone"),
                 sherlock_link=res.get("sherlock_link"),
             )
-            tg_notifier.notify_sherlock_lead(lead, res, cfg=cfg)
+            lead_region = lead.get("context_region") or lead.get("region")
+            tg_notifier.notify_sherlock_lead(
+                lead, res, cfg=cfg, region=lead_region
+            )
             if res.get("nick_hit"):
                 counters["nick_hits"] = counters.get("nick_hits", 0) + 1
             if res.get("step5_deepseek_called"):

@@ -80,6 +80,10 @@ DEFAULT_POLL_INTERVAL = 3.0
 DEFAULT_MAX_WAIT = 300.0
 DEFAULT_HTTP_TIMEOUT = 90.0
 DEFAULT_HEALTH_PROBE_MAX_ATTEMPTS = 3
+# Pause between failed ``GET /v1/health`` probes. The API often needs a
+# moment to recover (restart / transient network), so back off a full
+# minute before retrying rather than hammering it instantly.
+DEFAULT_HEALTH_PROBE_RETRY_DELAY_SECS = 60.0
 
 # Image content types Sherlock advertises (JPEG / PNG). Anything else
 # is sent as ``application/octet-stream`` -- the server still accepts
@@ -430,14 +434,20 @@ def probe_health_pool_idle(
     client: SherlockClient,
     *,
     max_attempts: int = DEFAULT_HEALTH_PROBE_MAX_ATTEMPTS,
+    retry_delay_secs: float = DEFAULT_HEALTH_PROBE_RETRY_DELAY_SECS,
 ) -> tuple[dict | None, int]:
     """Probe ``GET /v1/health`` up to *max_attempts* times.
 
     Returns ``(body, idle)`` when HTTP succeeds (``idle`` is 0 if the field is
     absent). Returns ``(None, 0)`` when every attempt raises — callers should
     treat ``body is None`` as API unavailable.
+
+    After a failed attempt (and only if more attempts remain) the probe sleeps
+    ``retry_delay_secs`` (default 60s) before retrying, giving the API time to
+    recover instead of hammering it back-to-back.
     """
     last_error: str | None = None
+    delay = max(0.0, float(retry_delay_secs))
     for attempt in range(1, max_attempts + 1):
         try:
             body = client.health()
@@ -451,7 +461,10 @@ def probe_health_pool_idle(
                 attempt=attempt,
                 max_attempts=max_attempts,
                 error=last_error,
+                retry_delay_secs=delay if attempt < max_attempts else 0.0,
             )
+            if attempt < max_attempts and delay > 0:
+                time.sleep(delay)
     log.error(
         "sherlock_health_probe_exhausted",
         attempts=max_attempts,

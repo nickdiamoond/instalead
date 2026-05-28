@@ -671,11 +671,6 @@ def test_build_step2_human_confirm_body_missing_location() -> None:
     assert "Локация - отсутствует" in body
 
 
-def test_inline_confirm_token_and_chat_uses_result_chat_id() -> None:
-    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
-    assert n.inline_confirm_token_and_chat() == ("fake-token", -999)
-
-
 def test_inline_confirm_token_and_chat_falls_back_to_report() -> None:
     n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
     assert n.inline_confirm_token_and_chat() == ("fake-token", -42)
@@ -687,7 +682,7 @@ def test_inline_confirm_token_and_chat_disabled() -> None:
 
 
 @patch("src.telegram_notifier.Bot")
-def test_notify_sherlock_lead_sends_summary_to_result_chat_on_hit(
+def test_notify_sherlock_lead_routes_summary_to_region_chat_on_hit(
     mock_bot_class: MagicMock,
 ) -> None:
     mock_bot = MagicMock()
@@ -695,7 +690,35 @@ def test_notify_sherlock_lead_sends_summary_to_result_chat_on_hit(
     mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
     mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
 
-    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
+    cfg = {"region_definitions": {"moscow": {"result_chat_id": -999}}}
+    n.notify_sherlock_lead(
+        {"username": "someuser", "region": "moscow"},
+        {
+            "status": "found_photo",
+            "phone": "+1",
+            "sherlock_link": "https://t.me/someuser",
+            "photo_match_kind": "exact",
+            "sherlock_person": "Name",
+        },
+        cfg=cfg,
+    )
+    assert mock_bot.send_message.await_count == 2
+    calls = mock_bot.send_message.await_args_list
+    assert calls[0].kwargs["chat_id"] == -42
+    assert calls[1].kwargs["chat_id"] == -999
+
+
+@patch("src.telegram_notifier.Bot")
+def test_notify_sherlock_lead_hit_falls_back_to_report_without_region(
+    mock_bot_class: MagicMock,
+) -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock()
+    mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
+    mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
     n.notify_sherlock_lead(
         {"username": "someuser"},
         {
@@ -709,8 +732,7 @@ def test_notify_sherlock_lead_sends_summary_to_result_chat_on_hit(
     )
     assert mock_bot.send_message.await_count == 2
     calls = mock_bot.send_message.await_args_list
-    assert calls[0].kwargs["chat_id"] == -42
-    assert calls[1].kwargs["chat_id"] == -999
+    assert all(c.kwargs["chat_id"] == -42 for c in calls)
 
 
 @patch("src.telegram_notifier.Bot")
@@ -722,7 +744,7 @@ def test_notify_sherlock_lead_nick_hit_summary_stays_on_report_chat(
     mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
     mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
 
-    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
     n.notify_sherlock_lead(
         {"username": "someuser"},
         {
@@ -750,7 +772,7 @@ def test_notify_sherlock_lead_no_match_skips_result_chat(
     mock_bot_class.return_value.__aenter__ = AsyncMock(return_value=mock_bot)
     mock_bot_class.return_value.__aexit__ = AsyncMock(return_value=False)
 
-    n = PipelineTelegramNotifier("fake-token", -42, result_chat_id=-999, enabled=True)
+    n = PipelineTelegramNotifier("fake-token", -42, enabled=True)
     n.notify_sherlock_lead(
         {"username": "someuser"},
         {"status": "no_match"},

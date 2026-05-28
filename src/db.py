@@ -104,6 +104,12 @@ class LeadDB:
                     sherlock_processed_at   TEXT,
                     sherlock_status         TEXT,
 
+                    -- region (Москва/Ростов/...) the lead belongs to,
+                    -- denormalized from the first post they commented on.
+                    -- First-seen region wins; routes Step 5 results to the
+                    -- matching telegram result_chat. NULL for legacy rows.
+                    region              TEXT,
+
                     -- processing state
                     profile_fetched     INTEGER DEFAULT 0,
                     contact_found       INTEGER DEFAULT 0,
@@ -121,6 +127,7 @@ class LeadDB:
                     comment_pk      TEXT,
                     comment_text    TEXT,
                     comment_at      TEXT,
+                    region          TEXT,
                     UNIQUE(username, post_url)
                 );
 
@@ -141,6 +148,11 @@ class LeadDB:
                     location            TEXT,
                     last_comments_count INTEGER,
                     last_scanned_at     TEXT,
+                    -- region (Москва/Ростов/...) that discovered this post in
+                    -- Step 1. Authoritative source of a lead's region (copied
+                    -- to lead_post_links/lead_accounts in Step 3). First region
+                    -- to discover a shortcode wins; NULL for legacy rows.
+                    region              TEXT,
                     processed_at        TEXT NOT NULL
                 );
 
@@ -174,12 +186,16 @@ class LeadDB:
                 ("sherlock_link", "TEXT"),
                 ("sherlock_processed_at", "TEXT"),
                 ("sherlock_status", "TEXT"),
+                # Region routing (Москва/Ростов/...). First-seen region wins.
+                ("region", "TEXT"),
             ],
             "lead_post_links": [
                 ("comment_pk", "TEXT"),
+                ("region", "TEXT"),
             ],
             "processed_posts": [
                 ("location", "TEXT"),
+                ("region", "TEXT"),
             ],
         }
         for table, columns in required.items():
@@ -394,9 +410,11 @@ class LeadDB:
             "la.full_name AS full_name, "
             "la.biography AS biography, "
             "la.face_photo_path AS face_photo_path, "
+            "la.region AS region, "
             "lpl.post_url AS context_post_url, "
             "lpl.post_shortcode AS context_post_shortcode, "
-            "lpl.comment_pk AS context_comment_pk "
+            "lpl.comment_pk AS context_comment_pk, "
+            "lpl.region AS context_region "
             "FROM lead_accounts la "
             "LEFT JOIN lead_post_links lpl ON lpl.id = ("
             "  SELECT MAX(id) FROM lead_post_links l2 "
@@ -751,9 +769,19 @@ class LeadDB:
             return dict(row) if row else None
 
     def upsert_post(self, post_id: str, **kwargs) -> None:
-        """Insert or update a processed post."""
+        """Insert or update a processed post.
+
+        First-region-wins: ``region`` is only set on INSERT. If the post
+        already exists with a non-NULL ``region``, an incoming ``region``
+        is dropped so a shortcode discovered in a second region keeps the
+        region that found it first.
+        """
         existing = self.get_post(post_id)
         if existing:
+            if "region" in kwargs and existing.get("region") is not None:
+                kwargs = {k: v for k, v in kwargs.items() if k != "region"}
+            if not kwargs:
+                return
             set_clause = ", ".join(f"{k} = ?" for k in kwargs)
             vals = list(kwargs.values()) + [post_id]
             with self._conn() as conn:
@@ -784,7 +812,8 @@ class LeadDB:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT post_id, post_url, shortcode, owner_username, "
-                "       comments_count, last_comments_count, last_scanned_at "
+                "       comments_count, last_comments_count, last_scanned_at, "
+                "       region "
                 "FROM processed_posts "
                 "WHERE relevance = 'relevant' AND cta_type = 'comment' "
                 "  AND ("
