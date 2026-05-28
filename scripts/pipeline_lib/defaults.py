@@ -41,6 +41,30 @@ DEFAULT_MIN_AVATAR_FACE_AREA_PCT = 2.0
 DEFAULT_SHERLOCK_BATCH_LIMIT = 1000
 DEFAULT_SHERLOCK_SEQUENTIAL = True
 DEFAULT_SHERLOCK_REQUEST_GAP_SECS = 5.0
+# Step 5: skip Sherlock when ``full_name`` or ``biography`` contains any
+# keyword (case-insensitive substring). Override via
+# ``sherlock.ban_keywords`` in config.yaml.
+DEFAULT_SHERLOCK_BAN_KEYWORDS: tuple[str, ...] = (
+    "риелтор",
+    "риэлтор",
+    "недвижимост",
+    "квартир",
+    "ипотек",
+    "ипотеч",
+)
+
+
+def sherlock_ban_keywords_from_cfg(sh_cfg: dict | None) -> tuple[str, ...]:
+    """Resolve ``sherlock.ban_keywords`` from config with module defaults."""
+    if not sh_cfg:
+        return DEFAULT_SHERLOCK_BAN_KEYWORDS
+    raw = sh_cfg.get("ban_keywords")
+    if raw is None:
+        return DEFAULT_SHERLOCK_BAN_KEYWORDS
+    if not isinstance(raw, (list, tuple)):
+        return DEFAULT_SHERLOCK_BAN_KEYWORDS
+    out = [str(k).strip() for k in raw if str(k).strip()]
+    return tuple(out) if out else DEFAULT_SHERLOCK_BAN_KEYWORDS
 
 # Step 3 comment scrapers. louisdeconinck is the primary because its
 # snake_case Instagram-raw output maps 1:1 to ``lead_accounts`` columns

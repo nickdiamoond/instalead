@@ -25,6 +25,7 @@ from scripts.pipeline_lib.constants import (
     SH_STATUS_NO_FACE_PHOTO,
     SH_STATUS_NO_MATCH,
 )
+from scripts.pipeline_lib.defaults import sherlock_ban_keywords_from_cfg
 from scripts.pipeline_lib.io_utils import _banner, _format_eta
 from scripts.pipeline_lib.logging import log as pipeline_log
 
@@ -55,6 +56,26 @@ def _person_for_digest_list(person: object) -> object:
 def _format_candidates_for_prompt(persons: list) -> str:
     """``1) `` + name + ``\\n`` for each entry (1-based)."""
     return "".join(f"{i}) {p}\n" for i, p in enumerate(persons, start=1))
+
+
+def _lead_profile_matches_ban_keywords(
+    full_name: str | None,
+    biography: str | None,
+    ban_keywords: tuple[str, ...],
+) -> bool:
+    """True when IG display name or bio contains a configured stop-word."""
+    if not ban_keywords:
+        return False
+    needles = tuple(k.casefold() for k in ban_keywords if k)
+    if not needles:
+        return False
+    for text in (full_name, biography):
+        if not text:
+            continue
+        folded = text.casefold()
+        if any(needle in folded for needle in needles):
+            return True
+    return False
 
 
 def _parse_usermatch_digit(raw: str) -> int | None:
@@ -141,6 +162,7 @@ def _resolve_one_lead_via_sherlock(
     nick_cfg: dict,
     photo_cfg: dict,
     task_cfg: dict,
+    ban_keywords: tuple[str, ...],
     deepseek: OpenAI | None = None,
     usermatch_prompt: str,
 ) -> dict:
@@ -170,7 +192,22 @@ def _resolve_one_lead_via_sherlock(
         "photo_search_ran": False,
         "photo_task": None,
         "nick_query": None if "." in username else f"@{username}",
+        "skipped_ban_keywords": False,
     }
+    if _lead_profile_matches_ban_keywords(
+        lead.get("full_name"),
+        lead.get("biography"),
+        ban_keywords,
+    ):
+        out["status"] = SH_STATUS_NO_MATCH
+        out["error"] = None
+        out["skipped_ban_keywords"] = True
+        pipeline_log.info(
+            "step5_sherlock_skipped_ban_keywords",
+            username=username,
+        )
+        return out
+
     poll_interval = float(task_cfg.get("poll_interval_secs", 3))
     max_wait = float(task_cfg.get("max_wait_secs", 300))
 
@@ -356,6 +393,7 @@ def _step_5_resolve_contacts_via_sherlock(
     photo_cfg = sh_cfg.get("photo_search") or {}
     task_cfg = sh_cfg.get("task") or {}
     conc_cfg = sh_cfg.get("concurrency") or {}
+    ban_keywords = sherlock_ban_keywords_from_cfg(sh_cfg)
 
     try:
         sherlock = make_sherlock_client(cfg)
@@ -432,6 +470,7 @@ def _step_5_resolve_contacts_via_sherlock(
             )
 
         print(f"  Candidates:        {n}")
+        print(f"  Ban keywords:      {len(ban_keywords)}  ({', '.join(ban_keywords)})")
         print(
             f"  With face photo:   {with_face}  "
             "(all candidates require photo search)"
@@ -522,6 +561,8 @@ def _step_5_resolve_contacts_via_sherlock(
                 detail_bits.append(f"link={res['sherlock_link']}")
             if res.get("error") and res["status"] == SH_STATUS_ERROR:
                 detail_bits.append(f"err={res['error'][:80]}")
+            if res.get("skipped_ban_keywords"):
+                detail_bits.append("skip=ban_keywords")
             detail = "  " + " ".join(detail_bits) if detail_bits else ""
             print(f"  [{progress_i:>4}/{n}] @{username:<25} -> {tag}{detail}")
             log.info(
@@ -545,6 +586,7 @@ def _step_5_resolve_contacts_via_sherlock(
                         nick_cfg=nick_cfg,
                         photo_cfg=photo_cfg,
                         task_cfg=task_cfg,
+                        ban_keywords=ban_keywords,
                         deepseek=deepseek,
                         usermatch_prompt=usermatch_prompt,
                     )
@@ -563,6 +605,7 @@ def _step_5_resolve_contacts_via_sherlock(
                         nick_cfg=nick_cfg,
                         photo_cfg=photo_cfg,
                         task_cfg=task_cfg,
+                        ban_keywords=ban_keywords,
                         deepseek=deepseek,
                         usermatch_prompt=usermatch_prompt,
                     ): lead

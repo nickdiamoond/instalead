@@ -335,6 +335,15 @@ deepseek:
 sherlock:
   base_url: "http://94.131.9.237:8000"
   api_key_env_var: "SHERLOCK_API_KEY"
+  # Step 5: skip nick/photo search when IG display name or bio contains
+  # any keyword (case-insensitive substring match).
+  ban_keywords:
+    - "риелтор"
+    - "риэлтор"
+    - "недвижимост"
+    - "квартир"
+    - "ипотек"
+    - "ипотеч"
   nick_search:
     # 1 page is enough to confirm a Telegram handle exists / doesn't.
     # We don't paginate further because Step 5 only needs a yes/no answer.

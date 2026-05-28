@@ -14,6 +14,7 @@ from scripts.pipeline_lib.constants import (  # noqa: E402
     SH_STATUS_FOUND_PHOTO,
     SH_STATUS_NO_MATCH,
 )
+from scripts.pipeline_lib.defaults import DEFAULT_SHERLOCK_BAN_KEYWORDS  # noqa: E402
 from scripts.pipeline_lib.step5_sherlock import (  # noqa: E402
     _resolve_one_lead_via_sherlock,
 )
@@ -24,6 +25,128 @@ def face_photo(tmp_path: Path) -> Path:
     p = tmp_path / "face.jpg"
     p.write_bytes(b"x")
     return p
+
+
+def test_realtor_in_bio_skips_sherlock_as_no_match(face_photo: Path) -> None:
+    sherlock = MagicMock()
+    lead = {
+        "username": "buyer_maybe",
+        "full_name": "Иван",
+        "biography": "Риелтор СПб, новостройки",
+        "face_photo_path": str(face_photo),
+    }
+    res = _resolve_one_lead_via_sherlock(
+        sherlock,
+        lead,
+        nick_cfg={},
+        photo_cfg={},
+        task_cfg={},
+        ban_keywords=DEFAULT_SHERLOCK_BAN_KEYWORDS,
+        deepseek=None,
+        usermatch_prompt="{username} {full_name} {candidates}",
+    )
+
+    sherlock.enqueue_nick.assert_not_called()
+    sherlock.enqueue_photo.assert_not_called()
+    assert res["status"] == SH_STATUS_NO_MATCH
+    assert res["skipped_ban_keywords"] is True
+    assert res["nick_search_ran"] is False
+    assert res["photo_search_ran"] is False
+
+
+def test_realtor_in_full_name_skips_sherlock(face_photo: Path) -> None:
+    sherlock = MagicMock()
+    res = _resolve_one_lead_via_sherlock(
+        sherlock,
+        {
+            "username": "agent_anna",
+            "full_name": "Анна | Риелтор",
+            "biography": "Помогу с квартирой",
+            "face_photo_path": str(face_photo),
+        },
+        nick_cfg={},
+        photo_cfg={},
+        task_cfg={},
+        ban_keywords=DEFAULT_SHERLOCK_BAN_KEYWORDS,
+        deepseek=None,
+        usermatch_prompt="{username} {full_name} {candidates}",
+    )
+
+    sherlock.enqueue_nick.assert_not_called()
+    assert res["status"] == SH_STATUS_NO_MATCH
+    assert res["skipped_ban_keywords"] is True
+
+
+def test_mixed_case_ban_keyword_in_bio_skips(face_photo: Path) -> None:
+    sherlock = MagicMock()
+    res = _resolve_one_lead_via_sherlock(
+        sherlock,
+        {
+            "username": "mixed_case",
+            "full_name": "Иван",
+            "biography": "я риЭлтор в спб",
+            "face_photo_path": str(face_photo),
+        },
+        nick_cfg={},
+        photo_cfg={},
+        task_cfg={},
+        ban_keywords=DEFAULT_SHERLOCK_BAN_KEYWORDS,
+        deepseek=None,
+        usermatch_prompt="{username} {full_name} {candidates}",
+    )
+
+    sherlock.enqueue_nick.assert_not_called()
+    assert res["skipped_ban_keywords"] is True
+
+
+def test_ipoteka_in_bio_skips(face_photo: Path) -> None:
+    sherlock = MagicMock()
+    res = _resolve_one_lead_via_sherlock(
+        sherlock,
+        {
+            "username": "buyer_ok",
+            "full_name": "Петр",
+            "biography": "Помогу с ипотекой",
+            "face_photo_path": str(face_photo),
+        },
+        nick_cfg={},
+        photo_cfg={},
+        task_cfg={},
+        ban_keywords=DEFAULT_SHERLOCK_BAN_KEYWORDS,
+        deepseek=None,
+        usermatch_prompt="{username} {full_name} {candidates}",
+    )
+
+    sherlock.enqueue_nick.assert_not_called()
+    assert res["skipped_ban_keywords"] is True
+
+
+def test_clean_profile_not_skipped(face_photo: Path) -> None:
+    sherlock = MagicMock()
+    sherlock.enqueue_nick.return_value = {"id": "nick-task-1"}
+    sherlock.enqueue_photo.return_value = {"id": "photo-task-1"}
+    sherlock.wait_for_task.side_effect = [
+        {"status": "completed", "result": {"results": []}},
+        {"status": "completed", "result": {"results": []}},
+    ]
+    res = _resolve_one_lead_via_sherlock(
+        sherlock,
+        {
+            "username": "clean_buyer",
+            "full_name": "Мария",
+            "biography": "Ищу двушку в центре",
+            "face_photo_path": str(face_photo),
+        },
+        nick_cfg={},
+        photo_cfg={},
+        task_cfg={},
+        ban_keywords=DEFAULT_SHERLOCK_BAN_KEYWORDS,
+        deepseek=None,
+        usermatch_prompt="{username} {full_name} {candidates}",
+    )
+
+    assert res["skipped_ban_keywords"] is False
+    sherlock.enqueue_nick.assert_called_once()
 
 
 def test_nick_hit_still_runs_photo_and_does_not_set_found_nick_status(
@@ -62,6 +185,7 @@ def test_nick_hit_still_runs_photo_and_does_not_set_found_nick_status(
         nick_cfg={},
         photo_cfg={},
         task_cfg={},
+        ban_keywords=(),
         deepseek=None,
         usermatch_prompt="{username} {full_name} {candidates}",
     )
@@ -111,6 +235,7 @@ def test_photo_sherlock_exact_status_still_uses_deepseek(face_photo: Path) -> No
         nick_cfg={},
         photo_cfg={},
         task_cfg={},
+        ban_keywords=(),
         deepseek=deepseek,
         usermatch_prompt="{username} {full_name} {candidates}",
     )
@@ -154,6 +279,7 @@ def test_photo_exact_status_without_deepseek_is_no_match(face_photo: Path) -> No
         nick_cfg={},
         photo_cfg={},
         task_cfg={},
+        ban_keywords=(),
         deepseek=None,
         usermatch_prompt="{username} {full_name} {candidates}",
     )

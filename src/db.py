@@ -392,6 +392,7 @@ class LeadDB:
             "la.username AS username, "
             "la.user_id AS user_id, "
             "la.full_name AS full_name, "
+            "la.biography AS biography, "
             "la.face_photo_path AS face_photo_path, "
             "lpl.post_url AS context_post_url, "
             "lpl.post_shortcode AS context_post_shortcode, "
