@@ -46,51 +46,47 @@ apify:
 # global result chat anymore -- if a region omits it (or a legacy DB row has
 # ``region = NULL``), Step 2/Step 5 messages fall back to ``telegram.report_chat_id``.
 region_definitions:
-  moscow:
-    # TODO(nick): replace with the real Moscow result chat id.
-    result_chat_id: -5272096712 #-5170924502
-    realtor_accounts:
-      - "tochno__partners"
-      - "tochno.life"
-      - "metriks_development"
-      - "1dogma"
-      - "sskuban"
-      - "incitydevelopment"
-      - "bauinvest_group"
-      - "gk.nvm.south"
-      - "darstroy.krasnodar"
-      - "gk_usi"
-    hashtags:
-      - "квартирамск"
-      - "недвижимостьмск"
-    cookie_search_keywords:
-      - "новостройки москва"
-      - "квартиры москва"
   rostov:
     # TODO(nick): replace with the real Rostov result chat id.
-    result_chat_id: -5296829601 #-5170924502
+    result_chat_id: -5170924502
     realtor_accounts:
-      - "volkova_top_estate"
-      - "group_etalon"
-      - "mrgroup_rus"
-      - "pioneergroup"
-      - "sminex_developer"
-      - "capitalgroupcorp"
-      - "whitewillestate"
-      - "brusnika.company"
-      - "vesper_moscow"
-      - "forma.russia"
+      - "ks_makarenko"
+      - "bozhenko_marina"
+      - "sofi_lubimova"
+      - "vasilii_kholodnyak"
+      - "sk_10_official"
+      - "donneftestroi161"
+      - "sk_smu1"
+      - "donneftestroi161"
+      - "msk_rostov"
+      - "tatarkina_e"
+      - "alex_ryashenko"
+      - "nik.kovalev29"
     hashtags:
-      - "квартираростов"
-      - "недвижимостьростов"
+      - "#ипотекаростов"
+      - "#ипотекаростовнадону"
+      - "#недвижимостьростов"
+      - "#квартираростов"
+      - "#жкростова"
+      - "#риелторростов"
+      - "#риэлторростов"
+      - "#новостройкиростов"
+      - "#новостройкиростова"
     cookie_search_keywords:
+      - "ипотека ростов"
+      - "ипотека ростовнадону"
+      - "недвижимость ростов"
+      - "квартира ростов"
+      - "жк ростова"
+      - "риелтор ростов"
+      - "риэлтор ростов"
       - "новостройки ростов"
-      - "квартиры ростов"
+      - "новостройки ростова"
 
 telegram:
   # Target supergroup/channel chat id for bot notifications (e.g. CSV export).
-  report_chat_id: -5255644193 #-1003909022341 #Chat for logs (also the fallback when a region has no result_chat_id)
-  alert_chat_id: -5255644193 #-1003926996735 #Chat for alerts and notifications only no logs
+  report_chat_id: -1003909022341 #Chat for logs (also the fallback when a region has no result_chat_id)
+  alert_chat_id: -1003926996735 #Chat for alerts and notifications only no logs
 
 # Daily pipeline tuning. Each subsection corresponds to a step in
 # scripts/pipeline.py. Most keys fall back to DEFAULT_* constants in that
@@ -110,7 +106,6 @@ pipeline:
   # tag is carried through posts -> leads so Step 2 / Step 5 route results to
   # each region's ``result_chat_id``.
   regions:
-    - moscow
     - rostov
 
   step1:
@@ -128,22 +123,23 @@ pipeline:
     #discovery_mode: realtors
     discovery_mode:
        - realtors
+       - hashtags
        - cookie_keywords
     # crawlerbros keyword-search actor (``apify.actors.cookie_search_posts``): maxPosts per
     # keyword, cookie env var name, session label. Only used when discovery_mode=cookie_keywords.
     cookie_search:
-      size_per_keyword: 20
+      size_per_keyword: 30
       session_cookie_env_var: "INSTAGRAM_SESSION_COOKIE"
       session_name: "instalead_cookie_search"
     # apify/instagram-post-scraper: resultsLimit per username (realtors mode).
     post_scraper_results_limit: 20
     # instagram-hashtag-scraper: resultsLimit per hashtag per resultsType (posts vs reels).
     # Defaults to post_scraper_results_limit above when omitted.
-    hashtag_results_limit: 10
+    hashtag_results_limit: 20
     # apify/instagram-post-scraper input "onlyPostsNewerThan = N days".
     # Realtors don't update old posts, so this both bounds the dataset
     # and keeps comments fresh enough for Step 3 to find new commenters.
-    posts_max_age_days: 7
+    posts_max_age_days: 14
     # Filter for processed_posts: posts with fewer than this many
     # comments aren't worth scoring (DeepSeek $) or scanning (Apify $).
     min_comments_per_post: 10
@@ -161,7 +157,7 @@ pipeline:
     # 10000 is a paranoia ceiling, NOT a real cap (max observed ~2200).
     # Bumping it does not raise the bill -- the actor returns only
     # comments that actually exist on the post.
-    louisdeconinck_comments_cap_per_post: 20
+    louisdeconinck_comments_cap_per_post: 500
     # Step 3 fallback (apidojo-api): actor input maxItems is a run-wide
     # total, not per-post. Pipeline sends maxItems = cap * posts_in_batch.
     apidojo_comments_cap_per_post: 2000
@@ -174,14 +170,14 @@ pipeline:
     # Max leads pulled per pipeline run from get_leads_without_profile.
     # Bigger = more new contacts/run but a longer run; smaller =
     # backlog grows across runs.
-    batch_limit: 50
+    batch_limit: 500
 
   step5:
     # Max leads pulled per pipeline run from get_leads_for_sherlock.
     # Smaller than step4 because Sherlock runs nick (~30s) then photo
     # (~135s) per lead. 1000 leads on a 3-account pool is already a
     # multi-hour run; bigger pools could safely raise this.
-    batch_limit: 10
+    batch_limit: 500
     # Temporary throttle: one lead fully resolved before the next; pause
     # (seconds) between leads after the first. Set sequential: false to
     # restore parallel Step 5.
